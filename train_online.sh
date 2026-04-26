@@ -20,17 +20,24 @@ PLOT_WINDOW_SECONDS=${PLOT_WINDOW_SECONDS:-240}
 NO_OBJECT_WEIGHT=${NO_OBJECT_WEIGHT:-0.05}
 PLOT_OBJECTNESS_THRESHOLD=${PLOT_OBJECTNESS_THRESHOLD:-0.35}
 PLOT_VISIBILITY_THRESHOLD=${PLOT_VISIBILITY_THRESHOLD:-0.5}
-PLOT_TOP_K=${PLOT_TOP_K:-20}
+PLOT_TOP_K=${PLOT_TOP_K:-64}
 PLOT_DISPLAY_FLOOR=${PLOT_DISPLAY_FLOOR:-0.08}
 LOG_EVERY=${LOG_EVERY:-0}
-VEHICLES_MIN=${VEHICLES_MIN:-1}
-VEHICLES_MAX=${VEHICLES_MAX:-8}
+VEHICLES_MIN=${VEHICLES_MIN:-32}
+VEHICLES_MAX=${VEHICLES_MAX:-48}
 NOISE_STD=${NOISE_STD:-0.0}
+SPEED_MIN_KMH=${SPEED_MIN_KMH:-70}
+SPEED_MAX_KMH=${SPEED_MAX_KMH:-85}
+SPEED_OUTLIER_RATIO=${SPEED_OUTLIER_RATIO:-0.12}
+SLOW_SPEED_MIN_KMH=${SLOW_SPEED_MIN_KMH:-45}
+SLOW_SPEED_MAX_KMH=${SLOW_SPEED_MAX_KMH:-60}
+FAST_SPEED_MIN_KMH=${FAST_SPEED_MIN_KMH:-95}
+FAST_SPEED_MAX_KMH=${FAST_SPEED_MAX_KMH:-120}
 
 # Mirrors the main offline dataset distribution:
-# - 360 vehicles/hour = about 6 vehicles/minute on average.
-# - Start with a simpler 1-8 vehicle/window curriculum. After the model predicts
-#   visible tracks, increase VEHICLES_MAX toward 24 for dense-window finetuning.
+# - 240 s windows use about 40 visible vehicles by default.
+# - Most vehicles are nearly constant-speed in a narrow typical range; a small
+#   fraction are sampled from slow/fast outlier speed ranges.
 # - Current online generator is constant-speed only; use offline finetuning for
 #   accel/decel/stop-go after this fast pretraining.
 uv run python train_trajectory_online.py \
@@ -55,8 +62,13 @@ uv run python train_trajectory_online.py \
   --dx-m 100 \
   --vehicles-min "$VEHICLES_MIN" \
   --vehicles-max "$VEHICLES_MAX" \
-  --speed-min-kmh 60 \
-  --speed-max-kmh 90 \
+  --speed-min-kmh "$SPEED_MIN_KMH" \
+  --speed-max-kmh "$SPEED_MAX_KMH" \
+  --speed-outlier-ratio "$SPEED_OUTLIER_RATIO" \
+  --slow-speed-min-kmh "$SLOW_SPEED_MIN_KMH" \
+  --slow-speed-max-kmh "$SLOW_SPEED_MAX_KMH" \
+  --fast-speed-min-kmh "$FAST_SPEED_MIN_KMH" \
+  --fast-speed-max-kmh "$FAST_SPEED_MAX_KMH" \
   --noise-std "$NOISE_STD" \
   --amp-min 6.0 \
   --amp-max 6.0 \

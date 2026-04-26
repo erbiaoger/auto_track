@@ -72,6 +72,11 @@ class OnlineSyntheticTrajectoryDataset(Dataset):
         vehicles_max: int,
         speed_min_kmh: float,
         speed_max_kmh: float,
+        speed_outlier_ratio: float,
+        slow_speed_min_kmh: float,
+        slow_speed_max_kmh: float,
+        fast_speed_min_kmh: float,
+        fast_speed_max_kmh: float,
         noise_std: float,
         amp_min: float,
         amp_max: float,
@@ -94,6 +99,11 @@ class OnlineSyntheticTrajectoryDataset(Dataset):
         self.vehicles_max = int(max(vehicles_min, vehicles_max))
         self.speed_min_kmh = float(speed_min_kmh)
         self.speed_max_kmh = float(speed_max_kmh)
+        self.speed_outlier_ratio = float(min(1.0, max(0.0, speed_outlier_ratio)))
+        self.slow_speed_min_kmh = float(slow_speed_min_kmh)
+        self.slow_speed_max_kmh = float(max(slow_speed_min_kmh, slow_speed_max_kmh))
+        self.fast_speed_min_kmh = float(fast_speed_min_kmh)
+        self.fast_speed_max_kmh = float(max(fast_speed_min_kmh, fast_speed_max_kmh))
         self.noise_std = float(noise_std)
         self.amp_min = float(amp_min)
         self.amp_max = float(max(amp_min, amp_max))
@@ -134,10 +144,17 @@ class OnlineSyntheticTrajectoryDataset(Dataset):
             attempts += 1
             is_primary = bool(torch.rand((), generator=gen).item() < self.primary_ratio)
             direction_label = 0 if is_primary else 1
-            speed_kmh = float(
-                self.speed_min_kmh
-                + torch.rand((), generator=gen).item() * (self.speed_max_kmh - self.speed_min_kmh)
-            )
+            if torch.rand((), generator=gen).item() < self.speed_outlier_ratio:
+                if torch.rand((), generator=gen).item() < 0.5:
+                    speed_lo = self.slow_speed_min_kmh
+                    speed_hi = self.slow_speed_max_kmh
+                else:
+                    speed_lo = self.fast_speed_min_kmh
+                    speed_hi = self.fast_speed_max_kmh
+            else:
+                speed_lo = self.speed_min_kmh
+                speed_hi = self.speed_max_kmh
+            speed_kmh = float(speed_lo + torch.rand((), generator=gen).item() * (speed_hi - speed_lo))
             speed_mps = speed_kmh / 3.6
             sigma_s = float(
                 self.sigma_min_s
@@ -239,8 +256,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--time-downsample", type=int, default=20, help="Time-axis input stride.")
     parser.add_argument("--vehicles-min", type=int, default=0, help="Minimum vehicles per window.")
     parser.add_argument("--vehicles-max", type=int, default=32, help="Maximum vehicles per window.")
-    parser.add_argument("--speed-min-kmh", type=float, default=50.0, help="Minimum speed.")
-    parser.add_argument("--speed-max-kmh", type=float, default=130.0, help="Maximum speed.")
+    parser.add_argument("--speed-min-kmh", type=float, default=70.0, help="Typical minimum speed.")
+    parser.add_argument("--speed-max-kmh", type=float, default=85.0, help="Typical maximum speed.")
+    parser.add_argument("--speed-outlier-ratio", type=float, default=0.12, help="Fraction of vehicles sampled from slow/fast outlier speed ranges.")
+    parser.add_argument("--slow-speed-min-kmh", type=float, default=45.0, help="Slow outlier minimum speed.")
+    parser.add_argument("--slow-speed-max-kmh", type=float, default=60.0, help="Slow outlier maximum speed.")
+    parser.add_argument("--fast-speed-min-kmh", type=float, default=95.0, help="Fast outlier minimum speed.")
+    parser.add_argument("--fast-speed-max-kmh", type=float, default=120.0, help="Fast outlier maximum speed.")
     parser.add_argument("--noise-std", type=float, default=0.3, help="Gaussian noise std.")
     parser.add_argument("--amp-min", type=float, default=4.0, help="Minimum vehicle pulse amplitude.")
     parser.add_argument("--amp-max", type=float, default=8.0, help="Maximum vehicle pulse amplitude.")
@@ -289,6 +311,11 @@ def _build_online_dataset(args: argparse.Namespace, *, length: int, seed: int) -
         vehicles_max=int(args.vehicles_max),
         speed_min_kmh=float(args.speed_min_kmh),
         speed_max_kmh=float(args.speed_max_kmh),
+        speed_outlier_ratio=float(args.speed_outlier_ratio),
+        slow_speed_min_kmh=float(args.slow_speed_min_kmh),
+        slow_speed_max_kmh=float(args.slow_speed_max_kmh),
+        fast_speed_min_kmh=float(args.fast_speed_min_kmh),
+        fast_speed_max_kmh=float(args.fast_speed_max_kmh),
         noise_std=float(args.noise_std),
         amp_min=float(args.amp_min),
         amp_max=float(args.amp_max),
@@ -426,6 +453,11 @@ def _save_prediction_plot(
         vehicles_max=int(args.vehicles_max),
         speed_min_kmh=float(args.speed_min_kmh),
         speed_max_kmh=float(args.speed_max_kmh),
+        speed_outlier_ratio=float(args.speed_outlier_ratio),
+        slow_speed_min_kmh=float(args.slow_speed_min_kmh),
+        slow_speed_max_kmh=float(args.slow_speed_max_kmh),
+        fast_speed_min_kmh=float(args.fast_speed_min_kmh),
+        fast_speed_max_kmh=float(args.fast_speed_max_kmh),
         noise_std=float(args.noise_std),
         amp_min=float(args.amp_min),
         amp_max=float(args.amp_max),
