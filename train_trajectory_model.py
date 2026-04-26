@@ -3,7 +3,8 @@
 用途：
     使用 `simulate_vehicle_sac.py` 生成的 SAC 文件和 `tracks.json` 真值轨迹，
     训练一个 CNN/FPN + Transformer query 模型。模型输入一个 `[channel, time]`
-    窗口，输出不定数量车辆轨迹，每条轨迹包含各通道上的时间坐标点。
+    窗口，输出不定数量车辆轨迹；每个 query 以 MapTR 风格输出一组
+    `(channel, time)` polyline 点，代表一辆车。
 
 用例：
     uv run python KF/auto_track/train_trajectory_model.py \
@@ -18,6 +19,7 @@
     --data-folder 可重复传入多个模拟数据目录，每个目录必须包含 CH*.sac 和 tracks.json。
     --window-seconds 是训练裁窗长度；--time-downsample 是模型输入的时间降采样倍率。
     --max-queries 是每个窗口最多候选车辆数，实际车辆数由 objectness 自动决定。
+    --trajectory-points 是每辆候选车输出的固定 polyline 点数，valid mask 决定哪些点有效。
 
 输出：
     - <out-dir>/checkpoint_last.pt：最近一个 epoch 的模型。
@@ -76,6 +78,7 @@ def parse_args() -> argparse.Namespace:
         help="Backbone feature height after pooling. Keep <= 8 on MPS for 50-channel data.",
     )
     parser.add_argument("--pooled-time", type=int, default=128, help="Backbone feature time length after pooling.")
+    parser.add_argument("--trajectory-points", type=int, default=32, help="Polyline points predicted per trajectory query.")
     parser.add_argument("--device", default="", help="Torch device: cuda, mps, cpu, or empty for auto.")
     parser.add_argument("--num-workers", type=int, default=0, help="DataLoader workers.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
@@ -120,6 +123,7 @@ def main() -> int:
         decoder_layers=int(args.decoder_layers),
         pooled_channels=int(args.pooled_channels),
         pooled_time=int(args.pooled_time),
+        trajectory_points=int(args.trajectory_points),
     )
     model = TrajectorySetPredictor(model_config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
@@ -152,7 +156,8 @@ def main() -> int:
     print(
         "Model: "
         f"queries={model_config.max_queries}, hidden_dim={model_config.hidden_dim}, "
-        f"decoder_layers={model_config.decoder_layers}, pooled=({model_config.pooled_channels}, {model_config.pooled_time})"
+        f"decoder_layers={model_config.decoder_layers}, pooled=({model_config.pooled_channels}, {model_config.pooled_time}), "
+        f"trajectory_points={model_config.trajectory_points}"
     )
     print(f"Writing checkpoints to: {args.out_dir}")
 

@@ -3,8 +3,7 @@
 This module implements the deep-learning path planned for the auto-track GUI:
 it learns to predict a variable-size set of vehicle trajectories from one
 `[channel, time]` DAS window. Each transformer query represents one possible
-vehicle and directly regresses one time coordinate per channel plus a channel
-visibility mask.
+vehicle and directly regresses a polyline-like point set for that vehicle.
 """
 
 from __future__ import annotations
@@ -50,13 +49,14 @@ class ModelConfig:
     decoder_layers: int = 2
     pooled_channels: int = 8
     pooled_time: int = 128
+    trajectory_points: int = 32
     dropout: float = 0.1
 
 
 @dataclass
 class InferenceConfig:
     time_downsample: int = 10
-    objectness_threshold: float = 0.5
+    objectness_threshold: float = 0.35
     visibility_threshold: float = 0.5
     min_visible_channels: int = 3
     refine_radius_samples: int = 120
@@ -303,6 +303,15 @@ class TrajectorySetPredictor(nn.Module):
         self.objectness_head = nn.Sequential(nn.LayerNorm(hidden), nn.Linear(hidden, 1))
         self.direction_head = nn.Sequential(nn.LayerNorm(hidden), nn.Linear(hidden, 2))
         self.speed_head = nn.Sequential(nn.LayerNorm(hidden), nn.Linear(hidden, 1))
+        self.point_head = nn.Sequential(
+            nn.LayerNorm(hidden),
+            nn.Linear(hidden, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, int(c.trajectory_points) * 2),
+        )
+        self.point_valid_head = nn.Sequential(nn.LayerNorm(hidden), nn.Linear(hidden, int(c.trajectory_points)))
+        # Legacy dense channel heads are kept as auxiliary outputs and for
+        # compatibility with checkpoints/tools created before the polyline head.
         self.visibility_head = nn.Sequential(nn.LayerNorm(hidden), nn.Linear(hidden, int(c.n_channels)))
         self.time_head = nn.Sequential(
             nn.LayerNorm(hidden),
@@ -321,15 +330,53 @@ class TrajectorySetPredictor(nn.Module):
         memory = feat.flatten(2).transpose(1, 2)
         memory = memory + self.pos_embed[:, : memory.shape[1], :]
         query = self.query_embed.weight.unsqueeze(0).expand(x.shape[0], -1, -1)
-        tgt = torch.zeros_like(query)
-        hs = self.decoder(tgt=tgt, memory=memory)
+        hs = self.decoder(tgt=query, memory=memory)
         return {
             "objectness_logits": self.objectness_head(hs).squeeze(-1),
             "direction_logits": self.direction_head(hs),
             "speed": self.speed_head(hs).squeeze(-1),
+            "points": torch.sigmoid(self.point_head(hs)).view(
+                x.shape[0],
+                int(self.config.max_queries),
+                int(self.config.trajectory_points),
+                2,
+            ),
+            "point_valid_logits": self.point_valid_head(hs),
             "visibility_logits": self.visibility_head(hs),
             "time": torch.sigmoid(self.time_head(hs)),
         }
+
+
+def _target_to_polyline(
+    target: dict[str, torch.Tensor],
+    n_channels: int,
+    trajectory_points: int,
+    device: torch.device | str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert dense channel labels to fixed-size MapTR-style polyline labels."""
+    gt_time = target["time"].to(device)
+    gt_vis = target["visibility"].to(device)
+    n_gt = int(gt_time.shape[0])
+    n_points = int(max(1, trajectory_points))
+    points = torch.zeros((n_gt, n_points, 2), dtype=torch.float32, device=device)
+    valid = torch.zeros((n_gt, n_points), dtype=torch.float32, device=device)
+    if n_gt == 0:
+        return points, valid
+
+    denom_ch = float(max(1, int(n_channels) - 1))
+    for i in range(n_gt):
+        chs = torch.where(gt_vis[i] > 0.5)[0]
+        if chs.numel() == 0:
+            continue
+        if int(chs.numel()) > n_points:
+            sample_idx = torch.linspace(0, int(chs.numel()) - 1, n_points, device=device).round().long()
+            chs = chs[sample_idx]
+        count = int(min(int(chs.numel()), n_points))
+        chosen = chs[:count]
+        points[i, :count, 0] = chosen.to(torch.float32) / denom_ch
+        points[i, :count, 1] = gt_time[i, chosen].clamp(0.0, 1.0)
+        valid[i, :count] = 1.0
+    return points, valid
 
 
 def _match_single(
@@ -337,7 +384,7 @@ def _match_single(
     target: dict[str, torch.Tensor],
     batch_idx: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    device = outputs["time"].device
+    device = outputs["objectness_logits"].device
     gt_time = target["time"].to(device)
     gt_vis = target["visibility"].to(device)
     gt_dir = target["direction"].to(device)
@@ -348,20 +395,26 @@ def _match_single(
         return empty, empty
 
     with torch.no_grad():
-        pred_time = outputs["time"][batch_idx]
-        pred_vis = torch.sigmoid(outputs["visibility_logits"][batch_idx])
+        pred_points = outputs["points"][batch_idx]
+        pred_valid = torch.sigmoid(outputs["point_valid_logits"][batch_idx])
+        gt_points, gt_point_valid = _target_to_polyline(
+            target,
+            n_channels=int(outputs["time"].shape[-1]),
+            trajectory_points=int(pred_points.shape[1]),
+            device=device,
+        )
         pred_obj = torch.sigmoid(outputs["objectness_logits"][batch_idx])
         pred_dir = torch.softmax(outputs["direction_logits"][batch_idx], dim=-1)
         pred_speed = outputs["speed"][batch_idx]
 
-        diff = torch.abs(pred_time[:, None, :] - gt_time[None, :, :])
-        denom = torch.clamp(gt_vis.sum(dim=-1), min=1.0)[None, :]
-        time_cost = (diff * gt_vis[None, :, :]).sum(dim=-1) / denom
-        vis_cost = torch.mean(torch.abs(pred_vis[:, None, :] - gt_vis[None, :, :]), dim=-1)
+        diff = torch.abs(pred_points[:, None, :, :] - gt_points[None, :, :, :]).sum(dim=-1)
+        denom = torch.clamp(gt_point_valid.sum(dim=-1), min=1.0)[None, :]
+        point_cost = (diff * gt_point_valid[None, :, :]).sum(dim=-1) / denom
+        valid_cost = torch.mean(torch.abs(pred_valid[:, None, :] - gt_point_valid[None, :, :]), dim=-1)
         dir_cost = -pred_dir[:, gt_dir]
         speed_cost = torch.abs(pred_speed[:, None] - gt_speed[None, :])
         obj_cost = -pred_obj[:, None]
-        cost = 4.0 * time_cost + 1.0 * vis_cost + 0.5 * dir_cost + 0.25 * speed_cost + 0.75 * obj_cost
+        cost = 5.0 * point_cost + 1.0 * valid_cost + 0.5 * dir_cost + 0.25 * speed_cost + 0.75 * obj_cost
         rows, cols = linear_sum_assignment(cost.detach().cpu().numpy())
     return (
         torch.as_tensor(rows, dtype=torch.long, device=device),
@@ -372,13 +425,13 @@ def _match_single(
 def trajectory_set_loss(
     outputs: dict[str, torch.Tensor],
     targets: Sequence[dict[str, torch.Tensor]],
-    no_object_weight: float = 0.02,
+    no_object_weight: float = 0.05,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    device = outputs["time"].device
+    device = outputs["objectness_logits"].device
     batch_size, max_queries = outputs["objectness_logits"].shape
     loss_obj_terms: list[torch.Tensor] = []
-    loss_time_terms: list[torch.Tensor] = []
-    loss_vis_terms: list[torch.Tensor] = []
+    loss_point_terms: list[torch.Tensor] = []
+    loss_valid_terms: list[torch.Tensor] = []
     loss_dir_terms: list[torch.Tensor] = []
     loss_speed_terms: list[torch.Tensor] = []
     matched_total = 0
@@ -413,34 +466,44 @@ def trajectory_set_loss(
         if src_idx.numel() == 0:
             continue
 
-        gt_time = target["time"].to(device)[tgt_idx]
-        gt_vis = target["visibility"].to(device)[tgt_idx]
+        gt_points_all, gt_point_valid_all = _target_to_polyline(
+            target,
+            n_channels=int(outputs["time"].shape[-1]),
+            trajectory_points=int(outputs["points"].shape[2]),
+            device=device,
+        )
+        gt_points = gt_points_all[tgt_idx]
+        gt_point_valid = gt_point_valid_all[tgt_idx]
         gt_dir = target["direction"].to(device)[tgt_idx]
         gt_speed = target["speed"].to(device)[tgt_idx]
-        pred_time = outputs["time"][b, src_idx]
-        pred_vis_logits = outputs["visibility_logits"][b, src_idx]
+        pred_points = outputs["points"][b, src_idx]
+        pred_valid_logits = outputs["point_valid_logits"][b, src_idx]
         pred_dir_logits = outputs["direction_logits"][b, src_idx]
         pred_speed = outputs["speed"][b, src_idx]
 
-        vis_mask = gt_vis > 0.5
-        if torch.any(vis_mask):
-            loss_time_terms.append(F.smooth_l1_loss(pred_time[vis_mask], gt_time[vis_mask], reduction="mean"))
-        loss_vis_terms.append(F.binary_cross_entropy_with_logits(pred_vis_logits, gt_vis, reduction="mean"))
+        point_mask = gt_point_valid > 0.5
+        if torch.any(point_mask):
+            loss_point_terms.append(
+                F.smooth_l1_loss(pred_points[point_mask], gt_points[point_mask], reduction="mean")
+            )
+        loss_valid_terms.append(F.binary_cross_entropy_with_logits(pred_valid_logits, gt_point_valid, reduction="mean"))
         loss_dir_terms.append(F.cross_entropy(pred_dir_logits, gt_dir, reduction="mean"))
         loss_speed_terms.append(F.smooth_l1_loss(pred_speed, gt_speed, reduction="mean"))
 
     zero = torch.zeros((), dtype=torch.float32, device=device)
     loss_obj = torch.stack(loss_obj_terms).mean() if loss_obj_terms else zero
-    loss_time = torch.stack(loss_time_terms).mean() if loss_time_terms else zero
-    loss_vis = torch.stack(loss_vis_terms).mean() if loss_vis_terms else zero
+    loss_point = torch.stack(loss_point_terms).mean() if loss_point_terms else zero
+    loss_valid = torch.stack(loss_valid_terms).mean() if loss_valid_terms else zero
     loss_dir = torch.stack(loss_dir_terms).mean() if loss_dir_terms else zero
     loss_speed = torch.stack(loss_speed_terms).mean() if loss_speed_terms else zero
-    total = loss_obj + 5.0 * loss_time + 1.0 * loss_vis + 0.5 * loss_dir + 0.5 * loss_speed
+    total = loss_obj + 8.0 * loss_point + 1.0 * loss_valid + 0.5 * loss_dir + 0.5 * loss_speed
     metrics = {
         "loss": float(total.detach().cpu()),
         "loss_obj": float(loss_obj.detach().cpu()),
-        "loss_time": float(loss_time.detach().cpu()),
-        "loss_vis": float(loss_vis.detach().cpu()),
+        "loss_time": float(loss_point.detach().cpu()),
+        "loss_vis": float(loss_valid.detach().cpu()),
+        "loss_point": float(loss_point.detach().cpu()),
+        "loss_valid": float(loss_valid.detach().cpu()),
         "loss_dir": float(loss_dir.detach().cpu()),
         "loss_speed": float(loss_speed.detach().cpu()),
         "matched": float(matched_total),
@@ -489,9 +552,12 @@ def load_checkpoint_model(
     # CUDA and later used on MPS/CPU, and direct cross-backend map_location can
     # hit backend-specific restore bugs.
     checkpoint = torch.load(str(Path(checkpoint_path).expanduser()), map_location="cpu", weights_only=False)
-    model_config = ModelConfig(**checkpoint.get("model_config", {}))
+    raw_model_config = dict(checkpoint.get("model_config", {}))
+    has_polyline_head = "trajectory_points" in raw_model_config
+    model_config = ModelConfig(**raw_model_config)
     model = TrajectorySetPredictor(model_config).to(resolved_device)
-    model.load_state_dict(checkpoint["model_state"])
+    missing, _unexpected = model.load_state_dict(checkpoint["model_state"], strict=False)
+    model.prefer_dense_output = bool(not has_polyline_head or any(key.startswith("point_") for key in missing))
     model.eval()
     return model, checkpoint
 
@@ -566,26 +632,66 @@ def _deduplicate_tracks(tracks: list[Track], tol_samples: int) -> list[Track]:
     return [_track_stats(i, tr.direction, tr.points) for i, tr in enumerate(kept)]
 
 
-def predict_tracks_from_window(
-    model: TrajectorySetPredictor,
-    data_window: np.ndarray,
+def _predict_tracks_from_polyline_outputs(
+    outputs: dict[str, torch.Tensor],
+    arr: np.ndarray,
     fs: float,
     x_axis_m: np.ndarray,
-    config: Optional[InferenceConfig] = None,
-    device: Optional[str] = None,
+    cfg: InferenceConfig,
 ) -> list[Track]:
-    cfg = config or InferenceConfig()
-    arr = np.asarray(data_window, dtype=np.float32)
-    if arr.ndim != 2:
-        raise ValueError("data_window must have shape [n_channel, n_sample]")
-    if arr.shape[0] != int(model.config.n_channels):
-        raise ValueError(
-            f"Model expects {model.config.n_channels} channels, but input has {arr.shape[0]} channels"
-        )
-    resolved_device = device or next(model.parameters()).device
-    x = prepare_window_input(arr, int(cfg.time_downsample), float(cfg.clip_ratio)).unsqueeze(0).to(resolved_device)
-    with torch.inference_mode():
-        outputs = model(x)
+    obj = torch.sigmoid(outputs["objectness_logits"][0]).detach().cpu().numpy()
+    point_valid = torch.sigmoid(outputs["point_valid_logits"][0]).detach().cpu().numpy()
+    point_coords = outputs["points"][0].detach().cpu().numpy()
+    direction_label = torch.argmax(outputs["direction_logits"][0], dim=-1).detach().cpu().numpy()
+
+    order = np.argsort(obj)[::-1]
+    tracks: list[Track] = []
+    n_channels = int(arr.shape[0])
+    n_samples = int(arr.shape[1])
+    for q_idx in order[: int(max(1, cfg.max_tracks))]:
+        if float(obj[q_idx]) < float(cfg.objectness_threshold):
+            continue
+        valid = point_valid[q_idx] >= float(cfg.visibility_threshold)
+        if int(np.sum(valid)) < int(cfg.min_visible_channels):
+            continue
+
+        point_by_channel: dict[int, TrackPoint] = {}
+        for p_idx in np.where(valid)[0].tolist():
+            ch_float = float(np.clip(point_coords[q_idx, p_idx, 0], 0.0, 1.0))
+            t_float = float(np.clip(point_coords[q_idx, p_idx, 1], 0.0, 1.0))
+            ch = int(round(ch_float * float(max(1, n_channels - 1))))
+            ch = int(max(0, min(n_channels - 1, ch)))
+            t_idx_raw = int(round(t_float * float(max(1, n_samples - 1))))
+            t_idx = _refine_t_idx(arr, ch, t_idx_raw, int(cfg.refine_radius_samples))
+            amp = float(abs(arr[ch, t_idx]))
+            score = float(obj[q_idx] * point_valid[q_idx, p_idx])
+            point = TrackPoint(
+                ch_idx=ch,
+                t_idx=int(t_idx),
+                time_s=float(t_idx) / float(fs),
+                offset_m=float(x_axis_m[ch]),
+                amp=amp,
+                score=score,
+            )
+            old = point_by_channel.get(ch)
+            if old is None or point.score > old.score:
+                point_by_channel[ch] = point
+
+        points = sorted(point_by_channel.values(), key=lambda p: p.ch_idx)
+        if len(points) < int(cfg.min_visible_channels):
+            continue
+        direction = LABEL_TO_DIRECTION.get(int(direction_label[q_idx]), "forward")
+        tracks.append(_track_stats(len(tracks), direction, points))
+    return tracks
+
+
+def _predict_tracks_from_dense_outputs(
+    outputs: dict[str, torch.Tensor],
+    arr: np.ndarray,
+    fs: float,
+    x_axis_m: np.ndarray,
+    cfg: InferenceConfig,
+) -> list[Track]:
     obj = torch.sigmoid(outputs["objectness_logits"][0]).detach().cpu().numpy()
     vis_prob = torch.sigmoid(outputs["visibility_logits"][0]).detach().cpu().numpy()
     time_norm = outputs["time"][0].detach().cpu().numpy()
@@ -620,4 +726,31 @@ def predict_tracks_from_window(
             continue
         direction = LABEL_TO_DIRECTION.get(int(direction_label[q_idx]), "forward")
         tracks.append(_track_stats(len(tracks), direction, points))
+    return tracks
+
+
+def predict_tracks_from_window(
+    model: TrajectorySetPredictor,
+    data_window: np.ndarray,
+    fs: float,
+    x_axis_m: np.ndarray,
+    config: Optional[InferenceConfig] = None,
+    device: Optional[str] = None,
+) -> list[Track]:
+    cfg = config or InferenceConfig()
+    arr = np.asarray(data_window, dtype=np.float32)
+    if arr.ndim != 2:
+        raise ValueError("data_window must have shape [n_channel, n_sample]")
+    if arr.shape[0] != int(model.config.n_channels):
+        raise ValueError(
+            f"Model expects {model.config.n_channels} channels, but input has {arr.shape[0]} channels"
+        )
+    resolved_device = device or next(model.parameters()).device
+    x = prepare_window_input(arr, int(cfg.time_downsample), float(cfg.clip_ratio)).unsqueeze(0).to(resolved_device)
+    with torch.inference_mode():
+        outputs = model(x)
+    if "points" in outputs and "point_valid_logits" in outputs and not bool(getattr(model, "prefer_dense_output", False)):
+        tracks = _predict_tracks_from_polyline_outputs(outputs, arr, float(fs), x_axis_m, cfg)
+    else:
+        tracks = _predict_tracks_from_dense_outputs(outputs, arr, float(fs), x_axis_m, cfg)
     return _deduplicate_tracks(tracks, int(cfg.dedup_tolerance_samples))

@@ -2,8 +2,8 @@
 
 用途：
     训练时直接在内存中合成 `[channel, time]` 窗口和车辆轨迹标签，不写 SAC，
-    也不从磁盘读取 SAC。适合在 NVIDIA GPU 上快速预训练轨迹 query 模型，
-    避免训练集制作和训练读取的 IO 瓶颈。
+    也不从磁盘读取 SAC。适合在 NVIDIA GPU 上快速预训练 MapTR-style
+    轨迹 query 模型，避免训练集制作和训练读取的 IO 瓶颈。
 
 用例：
     uv run python train_trajectory_online.py \
@@ -19,7 +19,8 @@
 参数说明：
     每个 batch 会随机生成不同车流密度、方向、速度、脉宽、噪声和窗口边界
     截断情况。`--vehicles-min/--vehicles-max` 控制单窗口车辆数范围；模型的
-    `--max-queries` 应大于 `vehicles-max`。
+    `--max-queries` 应大于 `vehicles-max`。`--trajectory-points` 控制每个
+    query 输出多少个 `(channel, time)` polyline 点。
 
 输出：
     - <out-dir>/checkpoint_last.pt
@@ -212,9 +213,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--plot-every", type=int, default=10, help="Save prediction plot every N epochs; 0 disables.")
     parser.add_argument("--plot-window-seconds", type=float, default=240.0, help="Window length for periodic prediction plots.")
     parser.add_argument("--plot-seed", type=int, default=987654, help="Fixed seed for periodic prediction plots.")
-    parser.add_argument("--plot-objectness-threshold", type=float, default=0.1, help="Objectness threshold for periodic plots.")
-    parser.add_argument("--plot-visibility-threshold", type=float, default=0.2, help="Visibility threshold for periodic plots.")
-    parser.add_argument("--no-object-weight", type=float, default=0.02, help="Loss weight for unmatched/no-object queries.")
+    parser.add_argument("--plot-objectness-threshold", type=float, default=0.35, help="Objectness threshold for periodic plots.")
+    parser.add_argument("--plot-visibility-threshold", type=float, default=0.5, help="Visibility threshold for periodic plots.")
+    parser.add_argument("--plot-top-k", type=int, default=20, help="Maximum predicted trajectories to draw in periodic plots.")
+    parser.add_argument("--no-object-weight", type=float, default=0.05, help="Loss weight for unmatched/no-object queries.")
     parser.add_argument("--batch-size", type=int, default=8, help="Batch size.")
     parser.add_argument("--lr", type=float, default=2e-4, help="AdamW learning rate.")
     parser.add_argument("--weight-decay", type=float, default=1e-4, help="AdamW weight decay.")
@@ -240,6 +242,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-heads", type=int, default=4, help="Transformer attention heads.")
     parser.add_argument("--pooled-channels", type=int, default=8, help="Pooled feature channel dimension.")
     parser.add_argument("--pooled-time", type=int, default=128, help="Pooled feature time dimension.")
+    parser.add_argument("--trajectory-points", type=int, default=32, help="Polyline points predicted per trajectory query.")
     parser.add_argument("--device", default="", help="Torch device: cuda, mps, cpu, or empty for auto.")
     parser.add_argument("--num-workers", type=int, default=0, help="DataLoader workers.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
@@ -330,32 +333,57 @@ def _predict_plot_tracks(
     device: str,
     objectness_threshold: float,
     visibility_threshold: float,
+    top_k: int,
 ) -> tuple[list[dict], dict[str, float]]:
     model.eval()
     with torch.no_grad():
         outputs = model(x.unsqueeze(0).to(device))
     obj = torch.sigmoid(outputs["objectness_logits"][0]).detach().cpu()
-    vis = torch.sigmoid(outputs["visibility_logits"][0]).detach().cpu()
-    times = outputs["time"][0].detach().cpu()
     dirs = torch.argmax(outputs["direction_logits"][0], dim=-1).detach().cpu()
+    if "points" in outputs and "point_valid_logits" in outputs:
+        valid_prob = torch.sigmoid(outputs["point_valid_logits"][0]).detach().cpu()
+        point_coords = outputs["points"][0].detach().cpu()
+        visibility_source = valid_prob
+    else:
+        valid_prob = torch.sigmoid(outputs["visibility_logits"][0]).detach().cpu()
+        point_coords = outputs["time"][0].detach().cpu()
+        visibility_source = valid_prob
     order = torch.argsort(obj, descending=True).tolist()
     stats = {
         "max_objectness": float(torch.max(obj).item()) if obj.numel() else 0.0,
         "mean_objectness": float(torch.mean(obj).item()) if obj.numel() else 0.0,
-        "max_visibility": float(torch.max(vis).item()) if vis.numel() else 0.0,
-        "mean_visibility": float(torch.mean(vis).item()) if vis.numel() else 0.0,
+        "max_visibility": float(torch.max(visibility_source).item()) if visibility_source.numel() else 0.0,
+        "mean_visibility": float(torch.mean(visibility_source).item()) if visibility_source.numel() else 0.0,
     }
     tracks = []
     for q_idx in order:
+        if len(tracks) >= int(top_k):
+            break
         if float(obj[q_idx]) < float(objectness_threshold):
             continue
-        chs = torch.where(vis[q_idx] >= float(visibility_threshold))[0].tolist()
-        if len(chs) < 2:
-            continue
         pts = []
-        for ch in chs:
-            t_idx = int(round(float(times[q_idx, ch].clamp(0, 1)) * float(max(1, window_samples - 1))))
-            pts.append((float(ch) * float(dx_m) * 1e-3, float(t_idx) / float(fs), int(ch), int(t_idx)))
+        if point_coords.ndim == 3:
+            keep = torch.where(valid_prob[q_idx] >= float(visibility_threshold))[0].tolist()
+            if len(keep) < 2:
+                continue
+            by_ch = {}
+            for p_idx in keep:
+                ch = int(round(float(point_coords[q_idx, p_idx, 0].clamp(0, 1)) * float(model.config.n_channels - 1)))
+                t_idx = int(round(float(point_coords[q_idx, p_idx, 1].clamp(0, 1)) * float(max(1, window_samples - 1))))
+                score = float(obj[q_idx] * valid_prob[q_idx, p_idx])
+                old = by_ch.get(ch)
+                if old is None or score > old[-1]:
+                    by_ch[ch] = (float(ch) * float(dx_m) * 1e-3, float(t_idx) / float(fs), int(ch), int(t_idx), score)
+            pts = [item[:4] for item in sorted(by_ch.values(), key=lambda item: item[2])]
+        else:
+            chs = torch.where(valid_prob[q_idx] >= float(visibility_threshold))[0].tolist()
+            if len(chs) < 2:
+                continue
+            for ch in chs:
+                t_idx = int(round(float(point_coords[q_idx, ch].clamp(0, 1)) * float(max(1, window_samples - 1))))
+                pts.append((float(ch) * float(dx_m) * 1e-3, float(t_idx) / float(fs), int(ch), int(t_idx)))
+        if len(pts) < 2:
+            continue
         tracks.append(
             {
                 "track_id": len(tracks),
@@ -409,6 +437,7 @@ def _save_prediction_plot(
         device=device,
         objectness_threshold=float(args.plot_objectness_threshold),
         visibility_threshold=float(args.plot_visibility_threshold),
+        top_k=int(args.plot_top_k),
     )
 
     shown = x[1].detach().cpu().numpy()
@@ -484,6 +513,7 @@ def main() -> int:
         decoder_layers=int(args.decoder_layers),
         pooled_channels=int(args.pooled_channels),
         pooled_time=int(args.pooled_time),
+        trajectory_points=int(args.trajectory_points),
     )
     model = TrajectorySetPredictor(model_config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
@@ -533,7 +563,8 @@ def main() -> int:
     print(
         "Model: "
         f"queries={model_config.max_queries}, hidden_dim={model_config.hidden_dim}, "
-        f"decoder_layers={model_config.decoder_layers}, pooled=({model_config.pooled_channels}, {model_config.pooled_time})"
+        f"decoder_layers={model_config.decoder_layers}, pooled=({model_config.pooled_channels}, {model_config.pooled_time}), "
+        f"trajectory_points={model_config.trajectory_points}"
     )
 
     best_loss = float("inf")

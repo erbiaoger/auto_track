@@ -11,6 +11,7 @@ uv run python train_trajectory_model.py \
   --num-heads 4 \
   --pooled-channels 8 \
   --pooled-time 128 \
+  --trajectory-points 32 \
   --device mps \
-  --no-object-weight 0.02 \
+  --no-object-weight 0.05 \
   --log-every 5
