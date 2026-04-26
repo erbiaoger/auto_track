@@ -1,0 +1,29 @@
+# Local Python/uv environment
+.venv/
+__pycache__/
+*.py[cod]
+
+# macOS/editor files
+.DS_Store
+*.swp
+*.swo
+
+# Generated / large data
+data/
+datasets/
+models/
+*.sac
+*.mseed
+*.npz
+*.npy
+*.pt
+*.pth
+*.ckpt
+auto_tracks*.csv
+summary.json
+
+# Generated previews / reports
+preview.png
+preview_abs.png
+prediction_plots/
+eval*.json

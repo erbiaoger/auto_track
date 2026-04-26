@@ -1,0 +1,15 @@
+uvr simulate_vehicle_sac.py \
+  --out-dir ./data \
+  --primary-count 200 \
+  --secondary-count 20 \
+  --speed-range-kmh 60 90 \
+  --speed-jitter-kmh-range -1 1 \
+  --speed-jitter-channel-count 3 \
+  --accel-count 10 \
+  --decel-count 10 \
+  --stop-go-count 10 \
+  --accel-mps2 0.9 \
+  --decel-mps2 1.1 \
+  --stop-brake-mps2 1.5 \
+  --restart-accel-mps2 0.8 \
+  --no-noise

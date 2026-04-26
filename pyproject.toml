@@ -1,0 +1,17 @@
+[project]
+name = "bafang-auto-track"
+version = "0.1.0"
+description = "DAS vehicle trajectory extraction, training data visualization, and trajectory-query model training."
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "matplotlib>=3.10.8",
+    "numpy>=2.4.2",
+    "obspy>=1.4.2",
+    "pyqt6>=6.10.2",
+    "scipy>=1.17.0",
+    "setuptools==79.0.0",
+    "torch>=2.10.0",
+]
+
+[tool.uv]
+package = false
