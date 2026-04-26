@@ -50,6 +50,8 @@ class ModelConfig:
     pooled_channels: int = 8
     pooled_time: int = 128
     trajectory_points: int = 32
+    denoising_queries: int = 0
+    dn_point_noise: float = 0.04
     dropout: float = 0.1
 
 
@@ -299,6 +301,13 @@ class TrajectorySetPredictor(nn.Module):
         )
         self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=int(c.decoder_layers))
         self.query_embed = nn.Embedding(int(c.max_queries), hidden)
+        dn_input_dim = int(c.trajectory_points) * 3 + 3
+        self.dn_query_mlp = nn.Sequential(
+            nn.LayerNorm(dn_input_dim),
+            nn.Linear(dn_input_dim, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, hidden),
+        )
 
         self.objectness_head = nn.Sequential(nn.LayerNorm(hidden), nn.Linear(hidden, 1))
         self.direction_head = nn.Sequential(nn.LayerNorm(hidden), nn.Linear(hidden, 2))
@@ -320,7 +329,63 @@ class TrajectorySetPredictor(nn.Module):
             nn.Linear(hidden, int(c.n_channels)),
         )
 
-    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+    def _build_denoising_queries(
+        self,
+        targets: Optional[Sequence[dict[str, torch.Tensor]]],
+        batch_size: int,
+        device: torch.device,
+    ) -> tuple[Optional[torch.Tensor], Optional[dict[str, torch.Tensor]]]:
+        if targets is None or not self.training or int(self.config.denoising_queries) <= 0:
+            return None, None
+        max_dn = min(int(self.config.denoising_queries), max((int(t["time"].shape[0]) for t in targets), default=0))
+        if max_dn <= 0:
+            return None, None
+
+        feat_dim = int(self.config.trajectory_points) * 3 + 3
+        dn_features = torch.zeros((batch_size, max_dn, feat_dim), dtype=torch.float32, device=device)
+        target_indices = torch.full((batch_size, max_dn), -1, dtype=torch.long, device=device)
+        dn_valid = torch.zeros((batch_size, max_dn), dtype=torch.bool, device=device)
+        noise_scale = float(max(0.0, self.config.dn_point_noise))
+
+        for b, target in enumerate(targets):
+            n_gt = int(target["time"].shape[0])
+            if n_gt <= 0:
+                continue
+            count = min(max_dn, n_gt)
+            perm = torch.randperm(n_gt, device=device)[:count]
+            gt_points, gt_point_valid = _target_to_polyline(
+                target,
+                n_channels=int(self.config.n_channels),
+                trajectory_points=int(self.config.trajectory_points),
+                device=device,
+            )
+            noisy_points = gt_points[perm]
+            if noise_scale > 0.0:
+                noisy_points = (noisy_points + torch.randn_like(noisy_points) * noise_scale).clamp(0.0, 1.0)
+            point_valid = gt_point_valid[perm]
+            direction = F.one_hot(target["direction"].to(device)[perm].clamp(0, 1), num_classes=2).to(torch.float32)
+            speed = target["speed"].to(device)[perm].unsqueeze(-1)
+            dn_features[b, :count] = torch.cat(
+                [
+                    noisy_points.flatten(1),
+                    point_valid,
+                    direction,
+                    speed,
+                ],
+                dim=-1,
+            )
+            target_indices[b, :count] = perm
+            dn_valid[b, :count] = True
+
+        if not torch.any(dn_valid):
+            return None, None
+        return self.dn_query_mlp(dn_features), {"target_indices": target_indices, "valid": dn_valid}
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        targets: Optional[Sequence[dict[str, torch.Tensor]]] = None,
+    ) -> dict[str, torch.Tensor]:
         feat = F.interpolate(
             self.backbone(x),
             size=self.pool_size,
@@ -330,14 +395,19 @@ class TrajectorySetPredictor(nn.Module):
         memory = feat.flatten(2).transpose(1, 2)
         memory = memory + self.pos_embed[:, : memory.shape[1], :]
         query = self.query_embed.weight.unsqueeze(0).expand(x.shape[0], -1, -1)
+        dn_query, dn_meta = self._build_denoising_queries(targets, int(x.shape[0]), x.device)
+        if dn_query is not None:
+            query = torch.cat([query, dn_query], dim=1)
         hs = self.decoder(tgt=query, memory=memory)
         return {
+            "num_regular_queries": int(self.config.max_queries),
+            "dn_meta": dn_meta,
             "objectness_logits": self.objectness_head(hs).squeeze(-1),
             "direction_logits": self.direction_head(hs),
             "speed": self.speed_head(hs).squeeze(-1),
             "points": torch.sigmoid(self.point_head(hs)).view(
                 x.shape[0],
-                int(self.config.max_queries),
+                int(hs.shape[1]),
                 int(self.config.trajectory_points),
                 2,
             ),
@@ -379,6 +449,10 @@ def _target_to_polyline(
     return points, valid
 
 
+def _regular_query_count(outputs: dict[str, Any]) -> int:
+    return int(outputs.get("num_regular_queries", int(outputs["objectness_logits"].shape[1])))
+
+
 def _match_single(
     outputs: dict[str, torch.Tensor],
     target: dict[str, torch.Tensor],
@@ -395,17 +469,18 @@ def _match_single(
         return empty, empty
 
     with torch.no_grad():
-        pred_points = outputs["points"][batch_idx]
-        pred_valid = torch.sigmoid(outputs["point_valid_logits"][batch_idx])
+        regular_q = _regular_query_count(outputs)
+        pred_points = outputs["points"][batch_idx, :regular_q]
+        pred_valid = torch.sigmoid(outputs["point_valid_logits"][batch_idx, :regular_q])
         gt_points, gt_point_valid = _target_to_polyline(
             target,
             n_channels=int(outputs["time"].shape[-1]),
             trajectory_points=int(pred_points.shape[1]),
             device=device,
         )
-        pred_obj = torch.sigmoid(outputs["objectness_logits"][batch_idx])
-        pred_dir = torch.softmax(outputs["direction_logits"][batch_idx], dim=-1)
-        pred_speed = outputs["speed"][batch_idx]
+        pred_obj = torch.sigmoid(outputs["objectness_logits"][batch_idx, :regular_q])
+        pred_dir = torch.softmax(outputs["direction_logits"][batch_idx, :regular_q], dim=-1)
+        pred_speed = outputs["speed"][batch_idx, :regular_q]
 
         diff = torch.abs(pred_points[:, None, :, :] - gt_points[None, :, :, :]).sum(dim=-1)
         denom = torch.clamp(gt_point_valid.sum(dim=-1), min=1.0)[None, :]
@@ -422,13 +497,106 @@ def _match_single(
     )
 
 
+def _duplicate_query_loss(
+    outputs: dict[str, torch.Tensor],
+    regular_q: int,
+    distance_tau: float = 0.04,
+) -> torch.Tensor:
+    device = outputs["objectness_logits"].device
+    q_count = int(max(0, min(regular_q, int(outputs["objectness_logits"].shape[1]))))
+    if q_count <= 1:
+        return torch.zeros((), dtype=torch.float32, device=device)
+
+    obj = torch.sigmoid(outputs["objectness_logits"][:, :q_count])
+    points = outputs["points"][:, :q_count]
+    valid = torch.sigmoid(outputs["point_valid_logits"][:, :q_count]).detach()
+    tau = float(max(1e-6, distance_tau))
+    losses: list[torch.Tensor] = []
+    pair_mask = torch.triu(torch.ones((q_count, q_count), dtype=torch.bool, device=device), diagonal=1)
+
+    for b in range(int(points.shape[0])):
+        pair_valid = valid[b, :, None, :] * valid[b, None, :, :]
+        denom = torch.clamp(pair_valid.sum(dim=-1), min=1.0)
+        distance = (torch.abs(points[b, :, None, :, :] - points[b, None, :, :, :]).sum(dim=-1) * pair_valid).sum(dim=-1) / denom
+        similarity = torch.exp(-distance.detach() / tau)
+        pair_obj = obj[b, :, None] * obj[b, None, :]
+        losses.append((pair_obj[pair_mask] * similarity[pair_mask]).mean())
+
+    return torch.stack(losses).mean() if losses else torch.zeros((), dtype=torch.float32, device=device)
+
+
+def _denoising_query_loss(
+    outputs: dict[str, torch.Tensor],
+    targets: Sequence[dict[str, torch.Tensor]],
+) -> torch.Tensor:
+    device = outputs["objectness_logits"].device
+    dn_meta = outputs.get("dn_meta")
+    if not dn_meta:
+        return torch.zeros((), dtype=torch.float32, device=device)
+    target_indices = dn_meta["target_indices"].to(device)
+    dn_valid = dn_meta["valid"].to(device)
+    if target_indices.numel() == 0 or not torch.any(dn_valid):
+        return torch.zeros((), dtype=torch.float32, device=device)
+
+    regular_q = _regular_query_count(outputs)
+    dn_count = int(target_indices.shape[1])
+    dn_slice = slice(regular_q, regular_q + dn_count)
+    obj_logits = outputs["objectness_logits"][:, dn_slice]
+    pred_points = outputs["points"][:, dn_slice]
+    pred_valid_logits = outputs["point_valid_logits"][:, dn_slice]
+    pred_dir_logits = outputs["direction_logits"][:, dn_slice]
+    pred_speed = outputs["speed"][:, dn_slice]
+
+    point_terms: list[torch.Tensor] = []
+    valid_terms: list[torch.Tensor] = []
+    dir_terms: list[torch.Tensor] = []
+    speed_terms: list[torch.Tensor] = []
+    obj_terms: list[torch.Tensor] = []
+
+    for b, target in enumerate(targets):
+        keep = torch.where(dn_valid[b] & (target_indices[b] >= 0))[0]
+        if keep.numel() == 0:
+            continue
+        gt_idx = target_indices[b, keep]
+        gt_points_all, gt_point_valid_all = _target_to_polyline(
+            target,
+            n_channels=int(outputs["time"].shape[-1]),
+            trajectory_points=int(outputs["points"].shape[2]),
+            device=device,
+        )
+        gt_points = gt_points_all[gt_idx]
+        gt_point_valid = gt_point_valid_all[gt_idx]
+        gt_dir = target["direction"].to(device)[gt_idx]
+        gt_speed = target["speed"].to(device)[gt_idx]
+
+        point_mask = gt_point_valid > 0.5
+        if torch.any(point_mask):
+            point_terms.append(F.smooth_l1_loss(pred_points[b, keep][point_mask], gt_points[point_mask], reduction="mean"))
+        valid_terms.append(F.binary_cross_entropy_with_logits(pred_valid_logits[b, keep], gt_point_valid, reduction="mean"))
+        dir_terms.append(F.cross_entropy(pred_dir_logits[b, keep], gt_dir, reduction="mean"))
+        speed_terms.append(F.smooth_l1_loss(pred_speed[b, keep], gt_speed, reduction="mean"))
+        obj_terms.append(F.binary_cross_entropy_with_logits(obj_logits[b, keep], torch.ones_like(obj_logits[b, keep]), reduction="mean"))
+
+    zero = torch.zeros((), dtype=torch.float32, device=device)
+    loss_point = torch.stack(point_terms).mean() if point_terms else zero
+    loss_valid = torch.stack(valid_terms).mean() if valid_terms else zero
+    loss_dir = torch.stack(dir_terms).mean() if dir_terms else zero
+    loss_speed = torch.stack(speed_terms).mean() if speed_terms else zero
+    loss_obj = torch.stack(obj_terms).mean() if obj_terms else zero
+    return loss_obj + 8.0 * loss_point + loss_valid + 0.5 * loss_dir + 0.5 * loss_speed
+
+
 def trajectory_set_loss(
     outputs: dict[str, torch.Tensor],
     targets: Sequence[dict[str, torch.Tensor]],
     no_object_weight: float = 0.05,
+    duplicate_loss_weight: float = 0.0,
+    duplicate_distance_tau: float = 0.04,
+    denoising_loss_weight: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     device = outputs["objectness_logits"].device
-    batch_size, max_queries = outputs["objectness_logits"].shape
+    batch_size = int(outputs["objectness_logits"].shape[0])
+    max_queries = _regular_query_count(outputs)
     loss_obj_terms: list[torch.Tensor] = []
     loss_point_terms: list[torch.Tensor] = []
     loss_valid_terms: list[torch.Tensor] = []
@@ -445,7 +613,7 @@ def trajectory_set_loss(
         src_idx, tgt_idx = _match_single(outputs, target, b)
         matched_total += int(src_idx.numel())
         with torch.no_grad():
-            obj_prob = torch.sigmoid(outputs["objectness_logits"][b])
+            obj_prob = torch.sigmoid(outputs["objectness_logits"][b, :max_queries])
             max_objectness = max(max_objectness, float(torch.max(obj_prob).detach().cpu()))
             mean_objectness += float(torch.mean(obj_prob).detach().cpu())
 
@@ -456,7 +624,7 @@ def trajectory_set_loss(
             obj_weight[src_idx] = 1.0
         loss_obj_terms.append(
             F.binary_cross_entropy_with_logits(
-                outputs["objectness_logits"][b],
+                outputs["objectness_logits"][b, :max_queries],
                 obj_target,
                 weight=obj_weight,
                 reduction="mean",
@@ -496,7 +664,21 @@ def trajectory_set_loss(
     loss_valid = torch.stack(loss_valid_terms).mean() if loss_valid_terms else zero
     loss_dir = torch.stack(loss_dir_terms).mean() if loss_dir_terms else zero
     loss_speed = torch.stack(loss_speed_terms).mean() if loss_speed_terms else zero
-    total = loss_obj + 8.0 * loss_point + 1.0 * loss_valid + 0.5 * loss_dir + 0.5 * loss_speed
+    loss_duplicate = _duplicate_query_loss(
+        outputs,
+        regular_q=max_queries,
+        distance_tau=float(duplicate_distance_tau),
+    ) if float(duplicate_loss_weight) > 0.0 else zero
+    loss_dn = _denoising_query_loss(outputs, targets) if float(denoising_loss_weight) > 0.0 else zero
+    total = (
+        loss_obj
+        + 8.0 * loss_point
+        + 1.0 * loss_valid
+        + 0.5 * loss_dir
+        + 0.5 * loss_speed
+        + float(duplicate_loss_weight) * loss_duplicate
+        + float(denoising_loss_weight) * loss_dn
+    )
     metrics = {
         "loss": float(total.detach().cpu()),
         "loss_obj": float(loss_obj.detach().cpu()),
@@ -506,6 +688,8 @@ def trajectory_set_loss(
         "loss_valid": float(loss_valid.detach().cpu()),
         "loss_dir": float(loss_dir.detach().cpu()),
         "loss_speed": float(loss_speed.detach().cpu()),
+        "loss_duplicate": float(loss_duplicate.detach().cpu()),
+        "loss_dn": float(loss_dn.detach().cpu()),
         "matched": float(matched_total),
         "gt": float(gt_total),
         "max_objectness": float(max_objectness),

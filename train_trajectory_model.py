@@ -85,6 +85,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grad-clip", type=float, default=1.0, help="Gradient clipping norm; <=0 disables.")
     parser.add_argument("--log-every", type=int, default=10, help="Print training progress every N batches.")
     parser.add_argument("--no-object-weight", type=float, default=0.02, help="Loss weight for unmatched/no-object queries.")
+    parser.add_argument("--duplicate-loss-weight", type=float, default=0.2, help="Penalty weight for high-confidence duplicate trajectory queries.")
+    parser.add_argument("--duplicate-distance-tau", type=float, default=0.04, help="Normalized trajectory distance scale for duplicate penalty.")
+    parser.add_argument("--denoising-loss-weight", type=float, default=1.0, help="Auxiliary loss weight for denoising trajectory queries.")
+    parser.add_argument("--denoising-queries", type=int, default=32, help="Maximum denoising GT queries appended during training.")
+    parser.add_argument("--dn-point-noise", type=float, default=0.04, help="Normalized coordinate noise added to denoising GT polyline inputs.")
     return parser.parse_args()
 
 
@@ -124,6 +129,8 @@ def main() -> int:
         pooled_channels=int(args.pooled_channels),
         pooled_time=int(args.pooled_time),
         trajectory_points=int(args.trajectory_points),
+        denoising_queries=int(args.denoising_queries),
+        dn_point_noise=float(args.dn_point_noise),
     )
     model = TrajectorySetPredictor(model_config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
@@ -170,8 +177,15 @@ def main() -> int:
         for batch_idx, (x, targets) in enumerate(loader, start=1):
             x = x.to(device)
             optimizer.zero_grad(set_to_none=True)
-            outputs = model(x)
-            loss, metrics = trajectory_set_loss(outputs, targets, no_object_weight=float(args.no_object_weight))
+            outputs = model(x, targets=targets)
+            loss, metrics = trajectory_set_loss(
+                outputs,
+                targets,
+                no_object_weight=float(args.no_object_weight),
+                duplicate_loss_weight=float(args.duplicate_loss_weight),
+                duplicate_distance_tau=float(args.duplicate_distance_tau),
+                denoising_loss_weight=float(args.denoising_loss_weight),
+            )
             loss.backward()
             if float(args.grad_clip) > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), float(args.grad_clip))
@@ -184,6 +198,8 @@ def main() -> int:
                     f"obj={metrics.get('loss_obj', float('nan')):.4f} "
                     f"time={metrics.get('loss_time', float('nan')):.4f} "
                     f"vis={metrics.get('loss_vis', float('nan')):.4f} "
+                    f"dup={metrics.get('loss_duplicate', float('nan')):.4f} "
+                    f"dn={metrics.get('loss_dn', float('nan')):.4f} "
                     f"gt={metrics.get('gt', 0.0):.0f} "
                     f"matched={metrics.get('matched', 0.0):.0f}",
                     flush=True,
@@ -198,6 +214,8 @@ def main() -> int:
             f"loss={mean_metrics.get('loss', float('nan')):.4f} "
             f"time={mean_metrics.get('loss_time', float('nan')):.4f} "
             f"obj={mean_metrics.get('loss_obj', float('nan')):.4f} "
+            f"dup={mean_metrics.get('loss_duplicate', float('nan')):.4f} "
+            f"dn={mean_metrics.get('loss_dn', float('nan')):.4f} "
             f"gt={mean_metrics.get('gt', 0.0):.1f} "
             f"matched={mean_metrics.get('matched', 0.0):.1f} "
             f"elapsed={elapsed:.1f}s"

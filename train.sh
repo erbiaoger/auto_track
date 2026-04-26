@@ -14,4 +14,9 @@ uv run python train_trajectory_model.py \
   --trajectory-points 32 \
   --device mps \
   --no-object-weight 0.05 \
+  --duplicate-loss-weight 0.2 \
+  --duplicate-distance-tau 0.04 \
+  --denoising-loss-weight 1.0 \
+  --denoising-queries 16 \
+  --dn-point-noise 0.04 \
   --log-every 5

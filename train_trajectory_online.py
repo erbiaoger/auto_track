@@ -246,6 +246,9 @@ def parse_args() -> argparse.Namespace:
         help="Set normalized display values below this floor to zero in periodic plots.",
     )
     parser.add_argument("--no-object-weight", type=float, default=0.05, help="Loss weight for unmatched/no-object queries.")
+    parser.add_argument("--duplicate-loss-weight", type=float, default=0.2, help="Penalty weight for high-confidence duplicate trajectory queries.")
+    parser.add_argument("--duplicate-distance-tau", type=float, default=0.04, help="Normalized trajectory distance scale for duplicate penalty.")
+    parser.add_argument("--denoising-loss-weight", type=float, default=1.0, help="Auxiliary loss weight for denoising trajectory queries.")
     parser.add_argument("--batch-size", type=int, default=8, help="Batch size.")
     parser.add_argument("--lr", type=float, default=2e-4, help="AdamW learning rate.")
     parser.add_argument("--weight-decay", type=float, default=1e-4, help="AdamW weight decay.")
@@ -277,6 +280,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pooled-channels", type=int, default=8, help="Pooled feature channel dimension.")
     parser.add_argument("--pooled-time", type=int, default=128, help="Pooled feature time dimension.")
     parser.add_argument("--trajectory-points", type=int, default=32, help="Polyline points predicted per trajectory query.")
+    parser.add_argument("--denoising-queries", type=int, default=32, help="Maximum denoising GT queries appended during training.")
+    parser.add_argument("--dn-point-noise", type=float, default=0.04, help="Normalized coordinate noise added to denoising GT polyline inputs.")
     parser.add_argument("--device", default="", help="Torch device: cuda, mps, cpu, or empty for auto.")
     parser.add_argument("--num-workers", type=int, default=0, help="DataLoader workers.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
@@ -560,6 +565,8 @@ def main() -> int:
         pooled_channels=int(args.pooled_channels),
         pooled_time=int(args.pooled_time),
         trajectory_points=int(args.trajectory_points),
+        denoising_queries=int(args.denoising_queries),
+        dn_point_noise=float(args.dn_point_noise),
     )
     model = TrajectorySetPredictor(model_config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
@@ -622,8 +629,15 @@ def main() -> int:
         for batch_idx, (x, targets) in enumerate(loader, start=1):
             x = x.to(device, non_blocking=(device == "cuda"))
             optimizer.zero_grad(set_to_none=True)
-            outputs = model(x)
-            loss, metrics = trajectory_set_loss(outputs, targets, no_object_weight=float(args.no_object_weight))
+            outputs = model(x, targets=targets)
+            loss, metrics = trajectory_set_loss(
+                outputs,
+                targets,
+                no_object_weight=float(args.no_object_weight),
+                duplicate_loss_weight=float(args.duplicate_loss_weight),
+                duplicate_distance_tau=float(args.duplicate_distance_tau),
+                denoising_loss_weight=float(args.denoising_loss_weight),
+            )
             loss.backward()
             if float(args.grad_clip) > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), float(args.grad_clip))
@@ -636,6 +650,8 @@ def main() -> int:
                     f"obj={metrics.get('loss_obj', float('nan')):.4f} "
                     f"time={metrics.get('loss_time', float('nan')):.4f} "
                     f"vis={metrics.get('loss_vis', float('nan')):.4f} "
+                    f"dup={metrics.get('loss_duplicate', float('nan')):.4f} "
+                    f"dn={metrics.get('loss_dn', float('nan')):.4f} "
                     f"gt={metrics.get('gt', 0.0):.0f} "
                     f"matched={metrics.get('matched', 0.0):.0f} "
                     f"max_obj={metrics.get('max_objectness', 0.0):.3f}",
@@ -650,6 +666,8 @@ def main() -> int:
             f"epoch={epoch:03d} loss={mean_metrics.get('loss', float('nan')):.4f} "
             f"time={mean_metrics.get('loss_time', float('nan')):.4f} "
             f"obj={mean_metrics.get('loss_obj', float('nan')):.4f} "
+            f"dup={mean_metrics.get('loss_duplicate', float('nan')):.4f} "
+            f"dn={mean_metrics.get('loss_dn', float('nan')):.4f} "
             f"gt={mean_metrics.get('gt', 0.0):.1f} "
             f"matched={mean_metrics.get('matched', 0.0):.1f} "
             f"max_obj={mean_metrics.get('max_objectness', 0.0):.3f} "

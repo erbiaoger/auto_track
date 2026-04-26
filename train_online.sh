@@ -18,6 +18,11 @@ VAL_EVERY=${VAL_EVERY:-1}
 PLOT_EVERY=${PLOT_EVERY:-10}
 PLOT_WINDOW_SECONDS=${PLOT_WINDOW_SECONDS:-240}
 NO_OBJECT_WEIGHT=${NO_OBJECT_WEIGHT:-0.3}
+DUPLICATE_LOSS_WEIGHT=${DUPLICATE_LOSS_WEIGHT:-0.2}
+DUPLICATE_DISTANCE_TAU=${DUPLICATE_DISTANCE_TAU:-0.04}
+DENOISING_LOSS_WEIGHT=${DENOISING_LOSS_WEIGHT:-1.0}
+DENOISING_QUERIES=${DENOISING_QUERIES:-32}
+DN_POINT_NOISE=${DN_POINT_NOISE:-0.04}
 PLOT_OBJECTNESS_THRESHOLD=${PLOT_OBJECTNESS_THRESHOLD:-0.5}
 PLOT_VISIBILITY_THRESHOLD=${PLOT_VISIBILITY_THRESHOLD:-0.6}
 PLOT_TOP_K=${PLOT_TOP_K:-128}
@@ -54,6 +59,9 @@ uv run python train_trajectory_online.py \
   --plot-top-k "$PLOT_TOP_K" \
   --plot-display-floor "$PLOT_DISPLAY_FLOOR" \
   --no-object-weight "$NO_OBJECT_WEIGHT" \
+  --duplicate-loss-weight "$DUPLICATE_LOSS_WEIGHT" \
+  --duplicate-distance-tau "$DUPLICATE_DISTANCE_TAU" \
+  --denoising-loss-weight "$DENOISING_LOSS_WEIGHT" \
   --batch-size "$BATCH_SIZE" \
   --window-seconds 240 \
   --fs 1000 \
@@ -82,5 +90,7 @@ uv run python train_trajectory_online.py \
   --pooled-channels 8 \
   --pooled-time "$POOLED_TIME" \
   --trajectory-points "$TRAJECTORY_POINTS" \
+  --denoising-queries "$DENOISING_QUERIES" \
+  --dn-point-noise "$DN_POINT_NOISE" \
   --num-workers "$NUM_WORKERS" \
   --log-every "$LOG_EVERY"
