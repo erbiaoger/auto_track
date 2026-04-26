@@ -8,6 +8,7 @@ DEVICE=${DEVICE:-cuda}
 BATCH_SIZE=${BATCH_SIZE:-16}
 CACHE_DATASET=${CACHE_DATASET:-1}
 CACHE_DTYPE=${CACHE_DTYPE:-float16}
+CACHE_BUILD_WORKERS=${CACHE_BUILD_WORKERS:-64}
 NUM_WORKERS=${NUM_WORKERS:-0}
 HIDDEN_DIM=${HIDDEN_DIM:-128}
 DECODER_LAYERS=${DECODER_LAYERS:-2}
@@ -51,11 +52,13 @@ FAST_SPEED_MAX_KMH=${FAST_SPEED_MAX_KMH:-120}
 #   revisits that same pool instead of generating an unbounded random stream.
 # - CACHE_DATASET=1 precomputes that fixed pool into RAM. Keep NUM_WORKERS=0 to
 #   avoid copying the in-memory cache into multiple DataLoader worker processes.
+# - CACHE_BUILD_WORKERS only affects the startup cache-build stage. Training
+#   still uses the single in-process RAM cache after generation finishes.
 # - Current online generator is constant-speed only; use offline finetuning for
 #   accel/decel/stop-go after this fast pretraining.
 cache_args=""
 if [ "$CACHE_DATASET" = "1" ] || [ "$CACHE_DATASET" = "true" ]; then
-  cache_args="--cache-dataset --cache-dtype $CACHE_DTYPE"
+  cache_args="--cache-dataset --cache-dtype $CACHE_DTYPE --cache-build-workers $CACHE_BUILD_WORKERS"
 fi
 
 uv run python train_trajectory_online.py \

@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
@@ -92,6 +93,7 @@ class OnlineSyntheticTrajectoryDataset(Dataset):
         seed: int,
         cache_dataset: bool = False,
         cache_dtype: str = "float16",
+        cache_build_workers: int = 0,
     ):
         self.length = int(length)
         self.n_channels = int(n_channels)
@@ -121,6 +123,7 @@ class OnlineSyntheticTrajectoryDataset(Dataset):
         self.seed = int(seed)
         self.cache_dataset = bool(cache_dataset)
         self.cache_dtype = str(cache_dtype).lower()
+        self.cache_build_workers = int(max(0, cache_build_workers))
         self._cache: Optional[list[tuple[torch.Tensor, dict[str, torch.Tensor]]]] = None
         if self.cache_dataset:
             self.build_cache()
@@ -135,15 +138,72 @@ class OnlineSyntheticTrajectoryDataset(Dataset):
         return self._generate_item(int(index), cache_x=False)
 
     def build_cache(self) -> None:
-        cache: list[tuple[torch.Tensor, dict[str, torch.Tensor]]] = []
+        workers = min(int(self.cache_build_workers), int(self.length))
         t0 = time.perf_counter()
-        for index in range(self.length):
-            x, target = self._generate_item(index, cache_x=True)
-            if (index + 1) % 500 == 0 or index + 1 == self.length:
-                elapsed = time.perf_counter() - t0
-                print(f"cache_dataset: {index + 1}/{self.length} windows, elapsed={elapsed:.1f}s", flush=True)
-            cache.append((x, target))
-        self._cache = cache
+        print(
+            f"cache_dataset: building {self.length} windows, dtype={self.cache_dtype}, "
+            f"build_workers={workers if workers > 1 else 0}",
+            flush=True,
+        )
+        if workers <= 1:
+            cache: list[tuple[torch.Tensor, dict[str, torch.Tensor]]] = []
+            for index in range(self.length):
+                x, target = self._generate_item(index, cache_x=True)
+                if (index + 1) % 500 == 0 or index + 1 == self.length:
+                    elapsed = time.perf_counter() - t0
+                    print(f"cache_dataset: {index + 1}/{self.length} windows, elapsed={elapsed:.1f}s", flush=True)
+                cache.append((x, target))
+            self._cache = cache
+            return
+
+        cache_parallel: list[Optional[tuple[torch.Tensor, dict[str, torch.Tensor]]]] = [None] * self.length
+        worker_kwargs = self._cache_worker_kwargs()
+        chunksize = max(1, min(8, self.length // max(1, workers * 8)))
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            jobs = ((worker_kwargs, index) for index in range(self.length))
+            for done, (index, item_np) in enumerate(
+                executor.map(_generate_cached_online_item, jobs, chunksize=chunksize),
+                start=1,
+            ):
+                x_np, target_np = item_np
+                item = (
+                    torch.from_numpy(x_np).contiguous(),
+                    {key: torch.from_numpy(value).contiguous() for key, value in target_np.items()},
+                )
+                cache_parallel[index] = item
+                if done % 500 == 0 or done == self.length:
+                    elapsed = time.perf_counter() - t0
+                    print(f"cache_dataset: {done}/{self.length} windows, elapsed={elapsed:.1f}s", flush=True)
+        self._cache = [item for item in cache_parallel if item is not None]
+
+    def _cache_worker_kwargs(self) -> dict[str, object]:
+        return {
+            "n_channels": self.n_channels,
+            "fs": self.fs,
+            "window_seconds": self.window_seconds,
+            "time_downsample": self.time_downsample,
+            "dx_m": self.dx_m,
+            "vehicles_min": self.vehicles_min,
+            "vehicles_max": self.vehicles_max,
+            "speed_min_kmh": self.speed_min_kmh,
+            "speed_max_kmh": self.speed_max_kmh,
+            "speed_outlier_ratio": self.speed_outlier_ratio,
+            "slow_speed_min_kmh": self.slow_speed_min_kmh,
+            "slow_speed_max_kmh": self.slow_speed_max_kmh,
+            "fast_speed_min_kmh": self.fast_speed_min_kmh,
+            "fast_speed_max_kmh": self.fast_speed_max_kmh,
+            "noise_std": self.noise_std,
+            "amp_min": self.amp_min,
+            "amp_max": self.amp_max,
+            "sigma_min_s": self.sigma_min_s,
+            "sigma_max_s": self.sigma_max_s,
+            "primary_ratio": self.primary_ratio,
+            "min_visible_channels": self.min_visible_channels,
+            "speed_norm_kmh": self.speed_norm_kmh,
+            "clip_ratio": self.clip_ratio,
+            "seed": self.seed,
+            "cache_dtype": self.cache_dtype,
+        }
 
     def _cache_x(self, x: torch.Tensor) -> torch.Tensor:
         if self.cache_dtype in {"float16", "fp16", "half"}:
@@ -262,6 +322,25 @@ class OnlineSyntheticTrajectoryDataset(Dataset):
         return torch.stack([raw, abs_feat], dim=0).to(torch.float32)
 
 
+def _generate_cached_online_item(
+    args: tuple[dict[str, object], int],
+) -> tuple[int, tuple[np.ndarray, dict[str, np.ndarray]]]:
+    torch.set_num_threads(1)
+    dataset_kwargs, index = args
+    dataset = OnlineSyntheticTrajectoryDataset(
+        length=1,
+        cache_dataset=False,
+        cache_build_workers=0,
+        **dataset_kwargs,
+    )
+    x, target = dataset._generate_item(int(index), cache_x=True)
+    if x.dtype == torch.bfloat16:
+        x = x.to(torch.float32)
+    x_np = np.ascontiguousarray(x.cpu().numpy())
+    target_np = {key: np.ascontiguousarray(value.cpu().numpy()) for key, value in target.items()}
+    return int(index), (x_np, target_np)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train trajectory-query model with online synthetic windows.")
     parser.add_argument("--out-dir", required=True, type=Path, help="Output directory for checkpoints.")
@@ -329,6 +408,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=0, help="DataLoader workers.")
     parser.add_argument("--cache-dataset", action="store_true", help="Precompute the fixed online dataset pool into RAM before training.")
     parser.add_argument("--cache-dtype", default="float16", choices=["float16", "bfloat16", "float32"], help="RAM cache dtype for input tensors.")
+    parser.add_argument(
+        "--cache-build-workers",
+        type=int,
+        default=0,
+        help="Worker processes used only for prebuilding the RAM cache; 0 or 1 builds sequentially.",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--grad-clip", type=float, default=1.0, help="Gradient clipping norm; <=0 disables.")
     parser.add_argument("--log-every", type=int, default=0, help="Print batch progress every N batches; 0 prints epoch summaries only.")
@@ -378,6 +463,7 @@ def _build_online_dataset(args: argparse.Namespace, *, length: int, seed: int) -
         seed=int(seed),
         cache_dataset=bool(args.cache_dataset),
         cache_dtype=str(args.cache_dtype),
+        cache_build_workers=int(args.cache_build_workers),
     )
 
 
@@ -675,7 +761,8 @@ def main() -> int:
         f"fixed_pool_windows={len(dataset)}, shuffle_each_epoch=True, batch_size={int(args.batch_size)}, "
         f"batches_per_epoch={len(loader)}, vehicles=[{args.vehicles_min}, {args.vehicles_max}], "
         f"window_seconds={args.window_seconds}, time_downsample={args.time_downsample}, "
-        f"val_windows={int(args.val_steps)}, cache_dataset={bool(args.cache_dataset)}, cache_dtype={args.cache_dtype}"
+        f"val_windows={int(args.val_steps)}, cache_dataset={bool(args.cache_dataset)}, "
+        f"cache_dtype={args.cache_dtype}, cache_build_workers={int(args.cache_build_workers)}"
     )
     print(
         "Model: "
