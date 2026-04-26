@@ -12,9 +12,9 @@ DECODER_LAYERS=${DECODER_LAYERS:-2}
 MAX_QUERIES=${MAX_QUERIES:-128}
 POOLED_TIME=${POOLED_TIME:-128}
 TRAJECTORY_POINTS=${TRAJECTORY_POINTS:-32}
-STEPS_PER_EPOCH=${STEPS_PER_EPOCH:-2000}
+STEPS_PER_EPOCH=${STEPS_PER_EPOCH:-10000}
 VAL_STEPS=${VAL_STEPS:-200}
-VAL_EVERY=${VAL_EVERY:-1}
+VAL_EVERY=${VAL_EVERY:-5}
 PLOT_EVERY=${PLOT_EVERY:-2}
 PLOT_WINDOW_SECONDS=${PLOT_WINDOW_SECONDS:-240}
 NO_OBJECT_WEIGHT=${NO_OBJECT_WEIGHT:-0.3}
@@ -45,6 +45,8 @@ FAST_SPEED_MAX_KMH=${FAST_SPEED_MAX_KMH:-120}
 # - 240 s windows use about 40 visible vehicles by default.
 # - Most vehicles are nearly constant-speed in a narrow typical range; a small
 #   fraction are sampled from slow/fast outlier speed ranges.
+# - steps-per-epoch is a fixed synthetic window pool; each epoch shuffles and
+#   revisits that same pool instead of generating an unbounded random stream.
 # - Current online generator is constant-speed only; use offline finetuning for
 #   accel/decel/stop-go after this fast pretraining.
 uv run python train_trajectory_online.py \

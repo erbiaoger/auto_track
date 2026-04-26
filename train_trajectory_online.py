@@ -10,17 +10,19 @@
         --out-dir models/trajectory_query_online_v1 \
         --device cuda \
         --epochs 20 \
-        --steps-per-epoch 2000 \
+        --steps-per-epoch 10000 \
         --batch-size 8 \
         --window-seconds 60 \
         --fs 1000 \
         --time-downsample 20
 
 参数说明：
-    每个 batch 会随机生成不同车流密度、方向、速度、脉宽、噪声和窗口边界
-    截断情况。`--vehicles-min/--vehicles-max` 控制单窗口车辆数范围；模型的
-    `--max-queries` 应大于 `vehicles-max`。`--trajectory-points` 控制每个
-    query 输出多少个 `(channel, time)` polyline 点。
+    数据集是“固定样本池 + 每个 epoch 打乱顺序”：同一个 index 对应同一个
+    合成窗口，模型会反复看到同一批结构；不同 index 仍覆盖不同车流密度、
+    方向、速度、脉宽、噪声和窗口边界截断情况。`--steps-per-epoch` 控制
+    固定样本池大小。`--vehicles-min/--vehicles-max` 控制单窗口车辆数范围；
+    模型的 `--max-queries` 应大于 `vehicles-max`。`--trajectory-points`
+    控制每个 query 输出多少个 `(channel, time)` polyline 点。
 
 输出：
     - <out-dir>/checkpoint_last.pt
@@ -230,7 +232,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train trajectory-query model with online synthetic windows.")
     parser.add_argument("--out-dir", required=True, type=Path, help="Output directory for checkpoints.")
     parser.add_argument("--epochs", type=int, default=20, help="Number of epochs.")
-    parser.add_argument("--steps-per-epoch", type=int, default=2000, help="Online synthetic windows per epoch.")
+    parser.add_argument(
+        "--steps-per-epoch",
+        type=int,
+        default=10000,
+        help="Fixed online synthetic window pool size reused and shuffled each epoch.",
+    )
     parser.add_argument("--val-steps", type=int, default=200, help="Online validation windows per validation run; 0 disables validation.")
     parser.add_argument("--val-every", type=int, default=1, help="Run validation every N epochs.")
     parser.add_argument("--plot-every", type=int, default=10, help="Save prediction plot every N epochs; 0 disables.")
@@ -589,7 +596,7 @@ def main() -> int:
     loader = DataLoader(
         dataset,
         batch_size=int(args.batch_size),
-        shuffle=False,
+        shuffle=True,
         num_workers=int(args.num_workers),
         collate_fn=trajectory_collate,
         drop_last=False,
@@ -624,7 +631,7 @@ def main() -> int:
     )
     print(
         "Online dataset: "
-        f"windows_per_epoch={len(dataset)}, batch_size={int(args.batch_size)}, "
+        f"fixed_pool_windows={len(dataset)}, shuffle_each_epoch=True, batch_size={int(args.batch_size)}, "
         f"batches_per_epoch={len(loader)}, vehicles=[{args.vehicles_min}, {args.vehicles_max}], "
         f"window_seconds={args.window_seconds}, time_downsample={args.time_downsample}, "
         f"val_windows={int(args.val_steps)}"
