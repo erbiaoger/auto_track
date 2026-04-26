@@ -88,6 +88,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--duplicate-loss-weight", type=float, default=0.2, help="Penalty weight for high-confidence duplicate trajectory queries.")
     parser.add_argument("--duplicate-distance-tau", type=float, default=0.04, help="Normalized trajectory distance scale for duplicate penalty.")
     parser.add_argument("--denoising-loss-weight", type=float, default=1.0, help="Auxiliary loss weight for denoising trajectory queries.")
+    parser.add_argument("--line-loss-weight", type=float, default=1.0, help="Soft loss weight for fitting each predicted trajectory to a line.")
+    parser.add_argument("--slope-smooth-loss-weight", type=float, default=0.25, help="Soft loss weight for penalizing abrupt local speed changes.")
     parser.add_argument("--denoising-queries", type=int, default=32, help="Maximum denoising GT queries appended during training.")
     parser.add_argument("--dn-point-noise", type=float, default=0.04, help="Normalized coordinate noise added to denoising GT polyline inputs.")
     return parser.parse_args()
@@ -185,6 +187,8 @@ def main() -> int:
                 duplicate_loss_weight=float(args.duplicate_loss_weight),
                 duplicate_distance_tau=float(args.duplicate_distance_tau),
                 denoising_loss_weight=float(args.denoising_loss_weight),
+                line_loss_weight=float(args.line_loss_weight),
+                slope_smooth_loss_weight=float(args.slope_smooth_loss_weight),
             )
             loss.backward()
             if float(args.grad_clip) > 0:
@@ -200,6 +204,8 @@ def main() -> int:
                     f"vis={metrics.get('loss_vis', float('nan')):.4f} "
                     f"dup={metrics.get('loss_duplicate', float('nan')):.4f} "
                     f"dn={metrics.get('loss_dn', float('nan')):.4f} "
+                    f"line={metrics.get('loss_line', float('nan')):.4f} "
+                    f"slope={metrics.get('loss_slope_smooth', float('nan')):.4f} "
                     f"gt={metrics.get('gt', 0.0):.0f} "
                     f"matched={metrics.get('matched', 0.0):.0f}",
                     flush=True,
@@ -216,6 +222,8 @@ def main() -> int:
             f"obj={mean_metrics.get('loss_obj', float('nan')):.4f} "
             f"dup={mean_metrics.get('loss_duplicate', float('nan')):.4f} "
             f"dn={mean_metrics.get('loss_dn', float('nan')):.4f} "
+            f"line={mean_metrics.get('loss_line', float('nan')):.4f} "
+            f"slope={mean_metrics.get('loss_slope_smooth', float('nan')):.4f} "
             f"gt={mean_metrics.get('gt', 0.0):.1f} "
             f"matched={mean_metrics.get('matched', 0.0):.1f} "
             f"elapsed={elapsed:.1f}s"

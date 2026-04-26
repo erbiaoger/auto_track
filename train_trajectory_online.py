@@ -249,6 +249,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--duplicate-loss-weight", type=float, default=0.2, help="Penalty weight for high-confidence duplicate trajectory queries.")
     parser.add_argument("--duplicate-distance-tau", type=float, default=0.04, help="Normalized trajectory distance scale for duplicate penalty.")
     parser.add_argument("--denoising-loss-weight", type=float, default=1.0, help="Auxiliary loss weight for denoising trajectory queries.")
+    parser.add_argument("--line-loss-weight", type=float, default=1.0, help="Soft loss weight for fitting each predicted trajectory to a line.")
+    parser.add_argument("--slope-smooth-loss-weight", type=float, default=0.25, help="Soft loss weight for penalizing abrupt local speed changes.")
     parser.add_argument("--batch-size", type=int, default=8, help="Batch size.")
     parser.add_argument("--lr", type=float, default=2e-4, help="AdamW learning rate.")
     parser.add_argument("--weight-decay", type=float, default=1e-4, help="AdamW weight decay.")
@@ -339,6 +341,11 @@ def _evaluate(
     loader: DataLoader,
     device: str,
     no_object_weight: float,
+    duplicate_loss_weight: float,
+    duplicate_distance_tau: float,
+    denoising_loss_weight: float,
+    line_loss_weight: float,
+    slope_smooth_loss_weight: float,
 ) -> dict[str, float]:
     model.eval()
     metrics_items: list[dict[str, float]] = []
@@ -346,7 +353,16 @@ def _evaluate(
         for x, targets in loader:
             x = x.to(device, non_blocking=(device == "cuda"))
             outputs = model(x)
-            _, metrics = trajectory_set_loss(outputs, targets, no_object_weight=float(no_object_weight))
+            _, metrics = trajectory_set_loss(
+                outputs,
+                targets,
+                no_object_weight=float(no_object_weight),
+                duplicate_loss_weight=float(duplicate_loss_weight),
+                duplicate_distance_tau=float(duplicate_distance_tau),
+                denoising_loss_weight=float(denoising_loss_weight),
+                line_loss_weight=float(line_loss_weight),
+                slope_smooth_loss_weight=float(slope_smooth_loss_weight),
+            )
             metrics_items.append(metrics)
     return _mean_metrics(metrics_items)
 
@@ -637,6 +653,8 @@ def main() -> int:
                 duplicate_loss_weight=float(args.duplicate_loss_weight),
                 duplicate_distance_tau=float(args.duplicate_distance_tau),
                 denoising_loss_weight=float(args.denoising_loss_weight),
+                line_loss_weight=float(args.line_loss_weight),
+                slope_smooth_loss_weight=float(args.slope_smooth_loss_weight),
             )
             loss.backward()
             if float(args.grad_clip) > 0:
@@ -652,6 +670,8 @@ def main() -> int:
                     f"vis={metrics.get('loss_vis', float('nan')):.4f} "
                     f"dup={metrics.get('loss_duplicate', float('nan')):.4f} "
                     f"dn={metrics.get('loss_dn', float('nan')):.4f} "
+                    f"line={metrics.get('loss_line', float('nan')):.4f} "
+                    f"slope={metrics.get('loss_slope_smooth', float('nan')):.4f} "
                     f"gt={metrics.get('gt', 0.0):.0f} "
                     f"matched={metrics.get('matched', 0.0):.0f} "
                     f"max_obj={metrics.get('max_objectness', 0.0):.3f}",
@@ -668,6 +688,8 @@ def main() -> int:
             f"obj={mean_metrics.get('loss_obj', float('nan')):.4f} "
             f"dup={mean_metrics.get('loss_duplicate', float('nan')):.4f} "
             f"dn={mean_metrics.get('loss_dn', float('nan')):.4f} "
+            f"line={mean_metrics.get('loss_line', float('nan')):.4f} "
+            f"slope={mean_metrics.get('loss_slope_smooth', float('nan')):.4f} "
             f"gt={mean_metrics.get('gt', 0.0):.1f} "
             f"matched={mean_metrics.get('matched', 0.0):.1f} "
             f"max_obj={mean_metrics.get('max_objectness', 0.0):.3f} "
@@ -677,7 +699,17 @@ def main() -> int:
         val_metrics: dict[str, float] = {}
         if val_loader is not None and (epoch % int(max(1, args.val_every)) == 0):
             val_t0 = time.perf_counter()
-            val_metrics = _evaluate(model, val_loader, device, no_object_weight=float(args.no_object_weight))
+            val_metrics = _evaluate(
+                model,
+                val_loader,
+                device,
+                no_object_weight=float(args.no_object_weight),
+                duplicate_loss_weight=float(args.duplicate_loss_weight),
+                duplicate_distance_tau=float(args.duplicate_distance_tau),
+                denoising_loss_weight=0.0,
+                line_loss_weight=float(args.line_loss_weight),
+                slope_smooth_loss_weight=float(args.slope_smooth_loss_weight),
+            )
             print(
                 f"epoch={epoch:03d} val_loss={val_metrics.get('loss', float('nan')):.4f} "
                 f"val_time={val_metrics.get('loss_time', float('nan')):.4f} "

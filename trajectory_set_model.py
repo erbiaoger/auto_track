@@ -586,6 +586,42 @@ def _denoising_query_loss(
     return loss_obj + 8.0 * loss_point + loss_valid + 0.5 * loss_dir + 0.5 * loss_speed
 
 
+def _linearity_loss_for_points(points: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+    """Softly penalize curved vehicle polylines by fitting time = a * channel + b."""
+    device = points.device
+    losses: list[torch.Tensor] = []
+    for track_points, track_valid in zip(points, valid):
+        keep = torch.where(track_valid > 0.5)[0]
+        if int(keep.numel()) < 2:
+            continue
+        xy = track_points[keep]
+        x = xy[:, 0]
+        y = xy[:, 1]
+        x_centered = x - x.mean()
+        y_centered = y - y.mean()
+        slope = torch.sum(x_centered * y_centered) / torch.clamp(torch.sum(x_centered * x_centered), min=1e-6)
+        intercept = y.mean() - slope * x.mean()
+        fitted = slope * x + intercept
+        losses.append(F.smooth_l1_loss(y, fitted, reduction="mean"))
+    return torch.stack(losses).mean() if losses else torch.zeros((), dtype=torch.float32, device=device)
+
+
+def _slope_smooth_loss_for_points(points: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+    """Allow mild acceleration, but penalize sharp changes in local track slope."""
+    device = points.device
+    losses: list[torch.Tensor] = []
+    for track_points, track_valid in zip(points, valid):
+        keep = torch.where(track_valid > 0.5)[0]
+        if int(keep.numel()) < 3:
+            continue
+        xy = track_points[keep]
+        dx = torch.clamp(torch.abs(xy[1:, 0] - xy[:-1, 0]), min=0.02)
+        dy = xy[1:, 1] - xy[:-1, 1]
+        slopes = dy / dx
+        losses.append(F.smooth_l1_loss(slopes[1:], slopes[:-1], reduction="mean"))
+    return torch.stack(losses).mean() if losses else torch.zeros((), dtype=torch.float32, device=device)
+
+
 def trajectory_set_loss(
     outputs: dict[str, torch.Tensor],
     targets: Sequence[dict[str, torch.Tensor]],
@@ -593,6 +629,8 @@ def trajectory_set_loss(
     duplicate_loss_weight: float = 0.0,
     duplicate_distance_tau: float = 0.04,
     denoising_loss_weight: float = 0.0,
+    line_loss_weight: float = 0.0,
+    slope_smooth_loss_weight: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     device = outputs["objectness_logits"].device
     batch_size = int(outputs["objectness_logits"].shape[0])
@@ -602,6 +640,8 @@ def trajectory_set_loss(
     loss_valid_terms: list[torch.Tensor] = []
     loss_dir_terms: list[torch.Tensor] = []
     loss_speed_terms: list[torch.Tensor] = []
+    loss_line_terms: list[torch.Tensor] = []
+    loss_slope_smooth_terms: list[torch.Tensor] = []
     matched_total = 0
     gt_total = 0
     max_objectness = 0.0
@@ -654,6 +694,10 @@ def trajectory_set_loss(
             loss_point_terms.append(
                 F.smooth_l1_loss(pred_points[point_mask], gt_points[point_mask], reduction="mean")
             )
+        if float(line_loss_weight) > 0.0:
+            loss_line_terms.append(_linearity_loss_for_points(pred_points, gt_point_valid))
+        if float(slope_smooth_loss_weight) > 0.0:
+            loss_slope_smooth_terms.append(_slope_smooth_loss_for_points(pred_points, gt_point_valid))
         loss_valid_terms.append(F.binary_cross_entropy_with_logits(pred_valid_logits, gt_point_valid, reduction="mean"))
         loss_dir_terms.append(F.cross_entropy(pred_dir_logits, gt_dir, reduction="mean"))
         loss_speed_terms.append(F.smooth_l1_loss(pred_speed, gt_speed, reduction="mean"))
@@ -664,6 +708,8 @@ def trajectory_set_loss(
     loss_valid = torch.stack(loss_valid_terms).mean() if loss_valid_terms else zero
     loss_dir = torch.stack(loss_dir_terms).mean() if loss_dir_terms else zero
     loss_speed = torch.stack(loss_speed_terms).mean() if loss_speed_terms else zero
+    loss_line = torch.stack(loss_line_terms).mean() if loss_line_terms else zero
+    loss_slope_smooth = torch.stack(loss_slope_smooth_terms).mean() if loss_slope_smooth_terms else zero
     loss_duplicate = _duplicate_query_loss(
         outputs,
         regular_q=max_queries,
@@ -678,6 +724,8 @@ def trajectory_set_loss(
         + 0.5 * loss_speed
         + float(duplicate_loss_weight) * loss_duplicate
         + float(denoising_loss_weight) * loss_dn
+        + float(line_loss_weight) * loss_line
+        + float(slope_smooth_loss_weight) * loss_slope_smooth
     )
     metrics = {
         "loss": float(total.detach().cpu()),
@@ -690,6 +738,8 @@ def trajectory_set_loss(
         "loss_speed": float(loss_speed.detach().cpu()),
         "loss_duplicate": float(loss_duplicate.detach().cpu()),
         "loss_dn": float(loss_dn.detach().cpu()),
+        "loss_line": float(loss_line.detach().cpu()),
+        "loss_slope_smooth": float(loss_slope_smooth.detach().cpu()),
         "matched": float(matched_total),
         "gt": float(gt_total),
         "max_objectness": float(max_objectness),
