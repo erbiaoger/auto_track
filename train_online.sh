@@ -6,7 +6,9 @@ cd "$SCRIPT_DIR"
 
 DEVICE=${DEVICE:-cuda}
 BATCH_SIZE=${BATCH_SIZE:-16}
-NUM_WORKERS=${NUM_WORKERS:-16}
+CACHE_DATASET=${CACHE_DATASET:-1}
+CACHE_DTYPE=${CACHE_DTYPE:-float16}
+NUM_WORKERS=${NUM_WORKERS:-0}
 HIDDEN_DIM=${HIDDEN_DIM:-128}
 DECODER_LAYERS=${DECODER_LAYERS:-2}
 MAX_QUERIES=${MAX_QUERIES:-128}
@@ -47,8 +49,15 @@ FAST_SPEED_MAX_KMH=${FAST_SPEED_MAX_KMH:-120}
 #   fraction are sampled from slow/fast outlier speed ranges.
 # - steps-per-epoch is a fixed synthetic window pool; each epoch shuffles and
 #   revisits that same pool instead of generating an unbounded random stream.
+# - CACHE_DATASET=1 precomputes that fixed pool into RAM. Keep NUM_WORKERS=0 to
+#   avoid copying the in-memory cache into multiple DataLoader worker processes.
 # - Current online generator is constant-speed only; use offline finetuning for
 #   accel/decel/stop-go after this fast pretraining.
+cache_args=""
+if [ "$CACHE_DATASET" = "1" ] || [ "$CACHE_DATASET" = "true" ]; then
+  cache_args="--cache-dataset --cache-dtype $CACHE_DTYPE"
+fi
+
 uv run python train_trajectory_online.py \
   --out-dir models/trajectory_query_online_v1_cuda \
   --device "$DEVICE" \
@@ -99,4 +108,5 @@ uv run python train_trajectory_online.py \
   --denoising-queries "$DENOISING_QUERIES" \
   --dn-point-noise "$DN_POINT_NOISE" \
   --num-workers "$NUM_WORKERS" \
+  $cache_args \
   --log-every "$LOG_EVERY"

@@ -41,6 +41,7 @@ import json
 import time
 from dataclasses import asdict
 from pathlib import Path
+from typing import Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -89,6 +90,8 @@ class OnlineSyntheticTrajectoryDataset(Dataset):
         speed_norm_kmh: float,
         clip_ratio: float,
         seed: int,
+        cache_dataset: bool = False,
+        cache_dtype: str = "float16",
     ):
         self.length = int(length)
         self.n_channels = int(n_channels)
@@ -116,11 +119,40 @@ class OnlineSyntheticTrajectoryDataset(Dataset):
         self.speed_norm_kmh = float(speed_norm_kmh)
         self.clip_ratio = float(clip_ratio)
         self.seed = int(seed)
+        self.cache_dataset = bool(cache_dataset)
+        self.cache_dtype = str(cache_dtype).lower()
+        self._cache: Optional[list[tuple[torch.Tensor, dict[str, torch.Tensor]]]] = None
+        if self.cache_dataset:
+            self.build_cache()
 
     def __len__(self) -> int:
         return self.length
 
     def __getitem__(self, index: int):
+        if self._cache is not None:
+            x_cached, target = self._cache[int(index)]
+            return x_cached.to(torch.float32), {key: value.clone() for key, value in target.items()}
+        return self._generate_item(int(index), cache_x=False)
+
+    def build_cache(self) -> None:
+        cache: list[tuple[torch.Tensor, dict[str, torch.Tensor]]] = []
+        t0 = time.perf_counter()
+        for index in range(self.length):
+            x, target = self._generate_item(index, cache_x=True)
+            if (index + 1) % 500 == 0 or index + 1 == self.length:
+                elapsed = time.perf_counter() - t0
+                print(f"cache_dataset: {index + 1}/{self.length} windows, elapsed={elapsed:.1f}s", flush=True)
+            cache.append((x, target))
+        self._cache = cache
+
+    def _cache_x(self, x: torch.Tensor) -> torch.Tensor:
+        if self.cache_dtype in {"float16", "fp16", "half"}:
+            return x.to(torch.float16).contiguous()
+        if self.cache_dtype in {"bfloat16", "bf16"}:
+            return x.to(torch.bfloat16).contiguous()
+        return x.to(torch.float32).contiguous()
+
+    def _generate_item(self, index: int, cache_x: bool):
         gen = torch.Generator(device="cpu")
         gen.manual_seed(self.seed + int(index) * 1000003)
 
@@ -198,6 +230,8 @@ class OnlineSyntheticTrajectoryDataset(Dataset):
             track_id += 1
 
         x = self._prepare_input(data)
+        if cache_x:
+            x = self._cache_x(x)
         if time_rows:
             target = {
                 "time": torch.stack(time_rows, dim=0),
@@ -293,6 +327,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dn-point-noise", type=float, default=0.04, help="Normalized coordinate noise added to denoising GT polyline inputs.")
     parser.add_argument("--device", default="", help="Torch device: cuda, mps, cpu, or empty for auto.")
     parser.add_argument("--num-workers", type=int, default=0, help="DataLoader workers.")
+    parser.add_argument("--cache-dataset", action="store_true", help="Precompute the fixed online dataset pool into RAM before training.")
+    parser.add_argument("--cache-dtype", default="float16", choices=["float16", "bfloat16", "float32"], help="RAM cache dtype for input tensors.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--grad-clip", type=float, default=1.0, help="Gradient clipping norm; <=0 disables.")
     parser.add_argument("--log-every", type=int, default=0, help="Print batch progress every N batches; 0 prints epoch summaries only.")
@@ -340,6 +376,8 @@ def _build_online_dataset(args: argparse.Namespace, *, length: int, seed: int) -
         speed_norm_kmh=float(dataset_config.speed_norm_kmh),
         clip_ratio=float(dataset_config.clip_ratio),
         seed=int(seed),
+        cache_dataset=bool(args.cache_dataset),
+        cache_dtype=str(args.cache_dtype),
     )
 
 
@@ -565,6 +603,9 @@ def main() -> int:
     torch.manual_seed(int(args.seed))
     device = str(args.device).strip() or auto_torch_device()
     print(f"Using torch device: {device}")
+    if bool(args.cache_dataset) and int(args.num_workers) != 0:
+        print("cache_dataset is enabled; forcing num_workers=0 to avoid copying the RAM cache into worker processes.")
+        args.num_workers = 0
 
     dataset_config = WindowDatasetConfig(
         window_seconds=float(args.window_seconds),
@@ -634,7 +675,7 @@ def main() -> int:
         f"fixed_pool_windows={len(dataset)}, shuffle_each_epoch=True, batch_size={int(args.batch_size)}, "
         f"batches_per_epoch={len(loader)}, vehicles=[{args.vehicles_min}, {args.vehicles_max}], "
         f"window_seconds={args.window_seconds}, time_downsample={args.time_downsample}, "
-        f"val_windows={int(args.val_steps)}"
+        f"val_windows={int(args.val_steps)}, cache_dataset={bool(args.cache_dataset)}, cache_dtype={args.cache_dtype}"
     )
     print(
         "Model: "
