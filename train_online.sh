@@ -21,10 +21,11 @@ NO_OBJECT_WEIGHT=${NO_OBJECT_WEIGHT:-0.05}
 PLOT_OBJECTNESS_THRESHOLD=${PLOT_OBJECTNESS_THRESHOLD:-0.35}
 PLOT_VISIBILITY_THRESHOLD=${PLOT_VISIBILITY_THRESHOLD:-0.5}
 PLOT_TOP_K=${PLOT_TOP_K:-20}
+PLOT_DISPLAY_FLOOR=${PLOT_DISPLAY_FLOOR:-0.08}
 LOG_EVERY=${LOG_EVERY:-0}
 VEHICLES_MIN=${VEHICLES_MIN:-1}
 VEHICLES_MAX=${VEHICLES_MAX:-8}
-NOISE_STD=${NOISE_STD:-0.05}
+NOISE_STD=${NOISE_STD:-0.0}
 
 # Mirrors the main offline dataset distribution:
 # - 360 vehicles/hour = about 6 vehicles/minute on average.
@@ -44,6 +45,7 @@ uv run python train_trajectory_online.py \
   --plot-objectness-threshold "$PLOT_OBJECTNESS_THRESHOLD" \
   --plot-visibility-threshold "$PLOT_VISIBILITY_THRESHOLD" \
   --plot-top-k "$PLOT_TOP_K" \
+  --plot-display-floor "$PLOT_DISPLAY_FLOOR" \
   --no-object-weight "$NO_OBJECT_WEIGHT" \
   --batch-size "$BATCH_SIZE" \
   --window-seconds 240 \

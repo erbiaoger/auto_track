@@ -222,6 +222,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--plot-objectness-threshold", type=float, default=0.35, help="Objectness threshold for periodic plots.")
     parser.add_argument("--plot-visibility-threshold", type=float, default=0.5, help="Visibility threshold for periodic plots.")
     parser.add_argument("--plot-top-k", type=int, default=20, help="Maximum predicted trajectories to draw in periodic plots.")
+    parser.add_argument(
+        "--plot-display-floor",
+        type=float,
+        default=0.08,
+        help="Set normalized display values below this floor to zero in periodic plots.",
+    )
     parser.add_argument("--no-object-weight", type=float, default=0.05, help="Loss weight for unmatched/no-object queries.")
     parser.add_argument("--batch-size", type=int, default=8, help="Batch size.")
     parser.add_argument("--lr", type=float, default=2e-4, help="AdamW learning rate.")
@@ -447,11 +453,13 @@ def _save_prediction_plot(
     )
 
     shown = x[1].detach().cpu().numpy()
-    vmax = float(max(np.percentile(shown[np.isfinite(shown)], 99.5), 1e-6))
+    display_floor = float(max(0.0, args.plot_display_floor))
+    shown_plot = np.where(shown >= display_floor, shown, 0.0) if display_floor > 0.0 else shown
+    vmax = float(max(np.percentile(shown_plot[np.isfinite(shown_plot)], 99.5), 1e-6))
     extent = [0.0, (int(args.n_ch) - 1) * float(args.dx_m) * 1e-3, 0.0, float(args.plot_window_seconds)]
     fig, ax = plt.subplots(figsize=(12, 7))
     ax.imshow(
-        np.clip(shown.T, 0.0, vmax),
+        np.clip(shown_plot.T, 0.0, vmax),
         aspect="auto",
         origin="lower",
         cmap="magma",
