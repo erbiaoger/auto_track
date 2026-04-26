@@ -25,8 +25,8 @@
     控制每个 query 输出多少个 `(channel, time)` polyline 点。
 
 输出：
-    - <out-dir>/checkpoint_last.pt
-    - <out-dir>/checkpoint_best.pt
+    - <out-dir>/checkpoint_last.pt，按 `--checkpoint-every` 保存
+    - <out-dir>/checkpoint_best.pt，按 `--checkpoint-every` 保存当前最优
     - <out-dir>/train_config.json
 
 限制：
@@ -354,6 +354,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-steps", type=int, default=200, help="Online validation windows per validation run; 0 disables validation.")
     parser.add_argument("--val-every", type=int, default=1, help="Run validation every N epochs.")
     parser.add_argument("--plot-every", type=int, default=10, help="Save prediction plot every N epochs; 0 disables.")
+    parser.add_argument("--checkpoint-every", type=int, default=1, help="Save checkpoint every N epochs; final epoch is always saved.")
     parser.add_argument("--plot-window-seconds", type=float, default=240.0, help="Window length for periodic prediction plots.")
     parser.add_argument("--plot-seed", type=int, default=987654, help="Fixed seed for periodic prediction plots.")
     parser.add_argument("--plot-objectness-threshold", type=float, default=0.35, help="Objectness threshold for periodic plots.")
@@ -413,6 +414,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Worker processes used only for prebuilding the RAM cache; 0 or 1 builds sequentially.",
+    )
+    parser.add_argument(
+        "--amp",
+        default="auto",
+        choices=["auto", "on", "off"],
+        help="Use CUDA automatic mixed precision. auto enables AMP on CUDA only.",
+    )
+    parser.add_argument(
+        "--amp-dtype",
+        default="float16",
+        choices=["float16", "bfloat16"],
+        help="CUDA AMP dtype. float16 is usually fastest on RTX 4090.",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--grad-clip", type=float, default=1.0, help="Gradient clipping norm; <=0 disables.")
@@ -689,6 +702,11 @@ def main() -> int:
     torch.manual_seed(int(args.seed))
     device = str(args.device).strip() or auto_torch_device()
     print(f"Using torch device: {device}")
+    use_amp = (str(args.amp) == "on") or (str(args.amp) == "auto" and str(device).startswith("cuda"))
+    amp_dtype = torch.float16 if str(args.amp_dtype) == "float16" else torch.bfloat16
+    scaler = torch.amp.GradScaler("cuda", enabled=bool(use_amp and str(device).startswith("cuda") and amp_dtype == torch.float16))
+    if use_amp:
+        print(f"Using CUDA AMP: dtype={args.amp_dtype}, grad_scaler={scaler.is_enabled()}", flush=True)
     if bool(args.cache_dataset) and int(args.num_workers) != 0:
         print("cache_dataset is enabled; forcing num_workers=0 to avoid copying the RAM cache into worker processes.")
         args.num_workers = 0
@@ -780,21 +798,24 @@ def main() -> int:
         for batch_idx, (x, targets) in enumerate(loader, start=1):
             x = x.to(device, non_blocking=(device == "cuda"))
             optimizer.zero_grad(set_to_none=True)
-            outputs = model(x, targets=targets)
-            loss, metrics = trajectory_set_loss(
-                outputs,
-                targets,
-                no_object_weight=float(args.no_object_weight),
-                duplicate_loss_weight=float(args.duplicate_loss_weight),
-                duplicate_distance_tau=float(args.duplicate_distance_tau),
-                denoising_loss_weight=float(args.denoising_loss_weight),
-                line_loss_weight=float(args.line_loss_weight),
-                slope_smooth_loss_weight=float(args.slope_smooth_loss_weight),
-            )
-            loss.backward()
+            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=bool(use_amp and str(device).startswith("cuda"))):
+                outputs = model(x, targets=targets)
+                loss, metrics = trajectory_set_loss(
+                    outputs,
+                    targets,
+                    no_object_weight=float(args.no_object_weight),
+                    duplicate_loss_weight=float(args.duplicate_loss_weight),
+                    duplicate_distance_tau=float(args.duplicate_distance_tau),
+                    denoising_loss_weight=float(args.denoising_loss_weight),
+                    line_loss_weight=float(args.line_loss_weight),
+                    slope_smooth_loss_weight=float(args.slope_smooth_loss_weight),
+                )
+            scaler.scale(loss).backward()
             if float(args.grad_clip) > 0:
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), float(args.grad_clip))
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             epoch_metrics.append(metrics)
             if log_every > 0 and (batch_idx == 1 or batch_idx % log_every == 0 or batch_idx == len(loader)):
                 print(
@@ -856,17 +877,19 @@ def main() -> int:
                 flush=True,
             )
 
-        last_path = args.out_dir / "checkpoint_last.pt"
-        checkpoint_metrics = dict(mean_metrics)
-        checkpoint_metrics.update({f"val_{key}": value for key, value in val_metrics.items()})
-        save_checkpoint(last_path, model, optimizer, model_config, dataset_config, epoch, checkpoint_metrics)
-        print(f"Saved checkpoint: {last_path}", flush=True)
-        current_loss = float(val_metrics.get("loss", mean_metrics.get("loss", float("inf"))))
-        if current_loss < best_loss:
-            best_loss = current_loss
-            best_path = args.out_dir / "checkpoint_best.pt"
-            save_checkpoint(best_path, model, optimizer, model_config, dataset_config, epoch, checkpoint_metrics)
-            print(f"Saved new best checkpoint: {best_path}", flush=True)
+        save_this_epoch = (epoch % int(max(1, args.checkpoint_every)) == 0) or (epoch == int(args.epochs))
+        if save_this_epoch:
+            last_path = args.out_dir / "checkpoint_last.pt"
+            checkpoint_metrics = dict(mean_metrics)
+            checkpoint_metrics.update({f"val_{key}": value for key, value in val_metrics.items()})
+            save_checkpoint(last_path, model, optimizer, model_config, dataset_config, epoch, checkpoint_metrics)
+            print(f"Saved checkpoint: {last_path}", flush=True)
+            current_loss = float(val_metrics.get("loss", mean_metrics.get("loss", float("inf"))))
+            if current_loss < best_loss:
+                best_loss = current_loss
+                best_path = args.out_dir / "checkpoint_best.pt"
+                save_checkpoint(best_path, model, optimizer, model_config, dataset_config, epoch, checkpoint_metrics)
+                print(f"Saved new best checkpoint: {best_path}", flush=True)
 
         if int(args.plot_every) > 0 and epoch % int(args.plot_every) == 0:
             _save_prediction_plot(model, args, args.out_dir, epoch, device)

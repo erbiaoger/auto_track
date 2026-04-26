@@ -6,6 +6,8 @@ cd "$SCRIPT_DIR"
 
 DEVICE=${DEVICE:-cuda}
 BATCH_SIZE=${BATCH_SIZE:-16}
+AMP=${AMP:-auto}
+AMP_DTYPE=${AMP_DTYPE:-float16}
 CACHE_DATASET=${CACHE_DATASET:-1}
 CACHE_DTYPE=${CACHE_DTYPE:-float16}
 CACHE_BUILD_WORKERS=${CACHE_BUILD_WORKERS:-64}
@@ -17,8 +19,9 @@ POOLED_TIME=${POOLED_TIME:-128}
 TRAJECTORY_POINTS=${TRAJECTORY_POINTS:-32}
 STEPS_PER_EPOCH=${STEPS_PER_EPOCH:-10000}
 VAL_STEPS=${VAL_STEPS:-200}
-VAL_EVERY=${VAL_EVERY:-5}
+VAL_EVERY=${VAL_EVERY:-10}
 PLOT_EVERY=${PLOT_EVERY:-2}
+CHECKPOINT_EVERY=${CHECKPOINT_EVERY:-10}
 PLOT_WINDOW_SECONDS=${PLOT_WINDOW_SECONDS:-240}
 NO_OBJECT_WEIGHT=${NO_OBJECT_WEIGHT:-0.3}
 DUPLICATE_LOSS_WEIGHT=${DUPLICATE_LOSS_WEIGHT:-0.2}
@@ -54,6 +57,10 @@ FAST_SPEED_MAX_KMH=${FAST_SPEED_MAX_KMH:-120}
 #   avoid copying the in-memory cache into multiple DataLoader worker processes.
 # - CACHE_BUILD_WORKERS only affects the startup cache-build stage. Training
 #   still uses the single in-process RAM cache after generation finishes.
+# - AMP=auto enables CUDA mixed precision by default. Batch size stays at 16 by
+#   default because the 4090 was already close to full memory.
+# - CHECKPOINT_EVERY=10 and VAL_EVERY=10 reduce per-epoch CPU/disk overhead;
+#   PLOT_EVERY=2 keeps frequent visual feedback.
 # - Current online generator is constant-speed only; use offline finetuning for
 #   accel/decel/stop-go after this fast pretraining.
 cache_args=""
@@ -64,11 +71,14 @@ fi
 uv run python train_trajectory_online.py \
   --out-dir models/trajectory_query_online_v1_cuda \
   --device "$DEVICE" \
+  --amp "$AMP" \
+  --amp-dtype "$AMP_DTYPE" \
   --epochs 400 \
   --steps-per-epoch "$STEPS_PER_EPOCH" \
   --val-steps "$VAL_STEPS" \
   --val-every "$VAL_EVERY" \
   --plot-every "$PLOT_EVERY" \
+  --checkpoint-every "$CHECKPOINT_EVERY" \
   --plot-window-seconds "$PLOT_WINDOW_SECONDS" \
   --plot-objectness-threshold "$PLOT_OBJECTNESS_THRESHOLD" \
   --plot-visibility-threshold "$PLOT_VISIBILITY_THRESHOLD" \
