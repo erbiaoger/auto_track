@@ -127,7 +127,11 @@ class OnlineSyntheticTrajectoryDataset(Dataset):
         track_ids: list[int] = []
 
         channel_index = torch.arange(self.n_channels, dtype=torch.float32)
-        for track_id in range(n_veh):
+        track_id = 0
+        attempts = 0
+        max_attempts = max(32, n_veh * 64)
+        while track_id < n_veh and attempts < max_attempts:
+            attempts += 1
             is_primary = bool(torch.rand((), generator=gen).item() < self.primary_ratio)
             direction_label = 0 if is_primary else 1
             speed_kmh = float(
@@ -141,12 +145,13 @@ class OnlineSyntheticTrajectoryDataset(Dataset):
             )
             amp = float(self.amp_min + torch.rand((), generator=gen).item() * (self.amp_max - self.amp_min))
 
-            travel_total = ((self.n_channels - 1) * self.dx_m) / max(1e-6, speed_mps)
-            t_entry = float(-travel_total + torch.rand((), generator=gen).item() * (self.window_seconds + 2.0 * travel_total))
             if is_primary:
                 dist_m = channel_index * self.dx_m
             else:
                 dist_m = (self.n_channels - 1 - channel_index) * self.dx_m
+            anchor_ch = int(torch.randint(0, self.n_channels, (1,), generator=gen).item())
+            anchor_time = float(torch.rand((), generator=gen).item() * self.window_seconds)
+            t_entry = anchor_time - float(dist_m[anchor_ch].item()) / max(1e-6, speed_mps)
             t_center = t_entry + dist_m / max(1e-6, speed_mps)
             visible = (t_center >= 0.0) & (t_center < self.window_seconds)
             if int(visible.sum().item()) < self.min_visible_channels:
@@ -171,6 +176,7 @@ class OnlineSyntheticTrajectoryDataset(Dataset):
             dir_rows.append(direction_label)
             speed_rows.append(speed_kmh / max(1e-6, self.speed_norm_kmh))
             track_ids.append(track_id)
+            track_id += 1
 
         x = self._prepare_input(data)
         if time_rows:
