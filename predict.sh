@@ -5,6 +5,6 @@ uv run python infer_trajectory_model.py \
   --window-start-s 0 \
   --window-seconds 120 \
   --out-csv datasets/test/sim_1001/auto_tracks_deep.csv \
-  --objectness-threshold 0.35 \
-  --visibility-threshold 0.5 \
+  --objectness-threshold 0.5 \
+  --visibility-threshold 0.6 \
   --min-visible-channels 6
