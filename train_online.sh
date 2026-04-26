@@ -5,8 +5,8 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$SCRIPT_DIR"
 
 DEVICE=${DEVICE:-cuda}
-BATCH_SIZE=${BATCH_SIZE:-8}
-NUM_WORKERS=${NUM_WORKERS:-4}
+BATCH_SIZE=${BATCH_SIZE:-32}
+NUM_WORKERS=${NUM_WORKERS:-16}
 HIDDEN_DIM=${HIDDEN_DIM:-128}
 DECODER_LAYERS=${DECODER_LAYERS:-2}
 MAX_QUERIES=${MAX_QUERIES:-128}
@@ -46,7 +46,7 @@ uv run python train_trajectory_online.py \
   --plot-top-k "$PLOT_TOP_K" \
   --no-object-weight "$NO_OBJECT_WEIGHT" \
   --batch-size "$BATCH_SIZE" \
-  --window-seconds 60 \
+  --window-seconds 240 \
   --fs 1000 \
   --time-downsample 10 \
   --n-ch 50 \
