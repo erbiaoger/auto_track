@@ -50,7 +50,7 @@ FAST_SPEED_MAX_KMH=${FAST_SPEED_MAX_KMH:-120}
 uv run python train_trajectory_online.py \
   --out-dir models/trajectory_query_online_v1_cuda \
   --device "$DEVICE" \
-  --epochs 200 \
+  --epochs 400 \
   --steps-per-epoch "$STEPS_PER_EPOCH" \
   --val-steps "$VAL_STEPS" \
   --val-every "$VAL_EVERY" \
