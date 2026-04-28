@@ -535,9 +535,9 @@ NMS 做的事是：
 
 ## 8. 当前实现文件映射
 
-- 核心提取器：`KF/track_extractor_graph.py`
-- 后端调度与拼接：`KF/auto_track_backend.py`
-- GUI 参数与显示：`KF/auto_track_gui.py`
+- 核心提取器：`autotrack/core/track_extractor_graph.py`
+- 后端调度与拼接：`autotrack/core/auto_track_backend.py`
+- GUI 参数与显示：`autotrack/gui/auto_track_gui.py`
 
 ---
 
