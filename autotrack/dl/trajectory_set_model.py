@@ -21,7 +21,7 @@ from torch import nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 
-from track_extractor_graph import Track, TrackPoint
+from autotrack.core.track_extractor_graph import Track, TrackPoint
 
 
 DIRECTION_TO_LABEL = {"forward": 0, "reverse": 1, "primary": 0, "secondary": 1}
@@ -457,6 +457,7 @@ def _match_single(
     outputs: dict[str, torch.Tensor],
     target: dict[str, torch.Tensor],
     batch_idx: int,
+    matcher: str = "hungarian",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     device = outputs["objectness_logits"].device
     gt_time = target["time"].to(device)
@@ -490,11 +491,39 @@ def _match_single(
         speed_cost = torch.abs(pred_speed[:, None] - gt_speed[None, :])
         obj_cost = -pred_obj[:, None]
         cost = 5.0 * point_cost + 1.0 * valid_cost + 0.5 * dir_cost + 0.25 * speed_cost + 0.75 * obj_cost
+        if str(matcher).lower() == "greedy":
+            rows_t, cols_t = _greedy_match_cost(cost)
+            return rows_t.to(device=device), cols_t.to(device=device)
         rows, cols = linear_sum_assignment(cost.detach().cpu().numpy())
     return (
         torch.as_tensor(rows, dtype=torch.long, device=device),
         torch.as_tensor(cols, dtype=torch.long, device=device),
     )
+
+
+def _greedy_match_cost(cost: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Approximate one-to-one matching without copying the cost matrix to CPU."""
+    device = cost.device
+    q_count = int(cost.shape[0])
+    gt_count = int(cost.shape[1])
+    match_count = int(min(q_count, gt_count))
+    if match_count <= 0:
+        empty = torch.empty((0,), dtype=torch.long, device=device)
+        return empty, empty
+
+    work = cost.float().clone()
+    large = torch.finfo(work.dtype).max
+    rows: list[torch.Tensor] = []
+    cols: list[torch.Tensor] = []
+    for _ in range(match_count):
+        flat_idx = torch.argmin(work)
+        row = torch.div(flat_idx, gt_count, rounding_mode="floor").long()
+        col = (flat_idx - row * gt_count).long()
+        rows.append(row)
+        cols.append(col)
+        work[row, :] = large
+        work[:, col] = large
+    return torch.stack(rows).to(dtype=torch.long), torch.stack(cols).to(dtype=torch.long)
 
 
 def _duplicate_query_loss(
@@ -631,6 +660,8 @@ def trajectory_set_loss(
     denoising_loss_weight: float = 0.0,
     line_loss_weight: float = 0.0,
     slope_smooth_loss_weight: float = 0.0,
+    matcher: str = "hungarian",
+    collect_metrics: bool = True,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     device = outputs["objectness_logits"].device
     batch_size = int(outputs["objectness_logits"].shape[0])
@@ -650,9 +681,9 @@ def trajectory_set_loss(
     for b in range(batch_size):
         target = targets[b]
         gt_total += int(target["time"].shape[0])
-        src_idx, tgt_idx = _match_single(outputs, target, b)
+        src_idx, tgt_idx = _match_single(outputs, target, b, matcher=matcher)
         matched_total += int(src_idx.numel())
-        with torch.no_grad():
+        if collect_metrics:
             obj_prob = torch.sigmoid(outputs["objectness_logits"][b, :max_queries])
             max_objectness = max(max_objectness, float(torch.max(obj_prob).detach().cpu()))
             mean_objectness += float(torch.mean(obj_prob).detach().cpu())
@@ -727,6 +758,8 @@ def trajectory_set_loss(
         + float(line_loss_weight) * loss_line
         + float(slope_smooth_loss_weight) * loss_slope_smooth
     )
+    if not collect_metrics:
+        return total, {}
     metrics = {
         "loss": float(total.detach().cpu()),
         "loss_obj": float(loss_obj.detach().cpu()),
@@ -746,6 +779,90 @@ def trajectory_set_loss(
         "mean_objectness": float(mean_objectness / max(1, batch_size)),
     }
     return total, metrics
+
+
+def trajectory_detection_metrics(
+    outputs: dict[str, torch.Tensor],
+    targets: Sequence[dict[str, torch.Tensor]],
+    objectness_threshold: float = 0.5,
+    point_threshold: float = 0.05,
+    matcher: str = "hungarian",
+) -> dict[str, float]:
+    """Vehicle-level detection metrics for trajectory set prediction.
+
+    A predicted query is a vehicle detection when its objectness is above
+    `objectness_threshold`. A detected vehicle is counted as correct when its
+    matched normalized polyline point error is below `point_threshold`.
+    """
+    device = outputs["objectness_logits"].device
+    max_queries = _regular_query_count(outputs)
+    threshold = float(objectness_threshold)
+    point_threshold = float(point_threshold)
+
+    good_total = 0
+    pred_total = 0
+    gt_total = 0
+    count_abs_error = 0.0
+    count_exact = 0
+    point_errors: list[torch.Tensor] = []
+    time_errors: list[torch.Tensor] = []
+
+    with torch.no_grad():
+        obj_prob = torch.sigmoid(outputs["objectness_logits"][:, :max_queries])
+        for b, target in enumerate(targets):
+            n_gt = int(target["time"].shape[0])
+            active = obj_prob[b] >= threshold
+            pred_count = int(active.sum().detach().cpu())
+            pred_total += pred_count
+            gt_total += n_gt
+            count_abs_error += abs(pred_count - n_gt)
+            count_exact += int(pred_count == n_gt)
+            if n_gt == 0:
+                continue
+
+            src_idx, tgt_idx = _match_single(outputs, target, b, matcher=matcher)
+            if src_idx.numel() == 0:
+                continue
+            gt_points_all, gt_point_valid_all = _target_to_polyline(
+                target,
+                n_channels=int(outputs["time"].shape[-1]),
+                trajectory_points=int(outputs["points"].shape[2]),
+                device=device,
+            )
+            pred_points = outputs["points"][b, src_idx]
+            gt_points = gt_points_all[tgt_idx]
+            gt_valid = gt_point_valid_all[tgt_idx]
+            matched_active = active[src_idx]
+            if not torch.any(matched_active):
+                continue
+            pair_valid = gt_valid[matched_active] > 0.5
+            pair_pred = pred_points[matched_active]
+            pair_gt = gt_points[matched_active]
+            denom = torch.clamp(pair_valid.float().sum(dim=-1), min=1.0)
+            point_err = (torch.abs(pair_pred - pair_gt).sum(dim=-1) * pair_valid.float()).sum(dim=-1) / denom
+            time_err = (torch.abs(pair_pred[..., 1] - pair_gt[..., 1]) * pair_valid.float()).sum(dim=-1) / denom
+            good_total += int((point_err <= point_threshold).sum().detach().cpu())
+            point_errors.append(point_err)
+            time_errors.append(time_err)
+
+    precision = float(good_total / max(1, pred_total))
+    recall = float(good_total / max(1, gt_total))
+    f1 = float(2.0 * precision * recall / max(1e-12, precision + recall))
+    point_mae = float(torch.cat(point_errors).mean().detach().cpu()) if point_errors else float("nan")
+    time_mae = float(torch.cat(time_errors).mean().detach().cpu()) if time_errors else float("nan")
+    batch_size = int(outputs["objectness_logits"].shape[0])
+    return {
+        "track_precision": precision,
+        "track_recall": recall,
+        "track_f1": f1,
+        "track_tp": float(good_total),
+        "pred_count": float(pred_total),
+        "gt_count": float(gt_total),
+        "count_mae": float(count_abs_error / max(1, batch_size)),
+        "count_acc": float(count_exact / max(1, batch_size)),
+        "point_mae_norm": point_mae,
+        "time_mae_norm": time_mae,
+    }
 
 
 def auto_torch_device() -> str:

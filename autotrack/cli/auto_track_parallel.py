@@ -7,8 +7,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Iterable
 
-from auto_track_backend import AutoTrackBackend, DEFAULT_DATA_FOLDER
-from track_extractor_graph import ExtractorConfig, Track, extract_all
+from autotrack.core.auto_track_backend import AutoTrackBackend, DEFAULT_DATA_FOLDER
+from autotrack.core.track_extractor_graph import ExtractorConfig, Track, extract_all
 
 
 def _parse_args() -> argparse.Namespace:

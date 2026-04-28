@@ -16,10 +16,10 @@ cat <<'EOF'
 Auto-track uv environment is ready.
 
 Run examples:
-  uv run python auto_track_gui.py
-  uv run python train_data_label_viewer_gui.py --data-folder datasets/train/sim_0001
-  uv run python train_trajectory_model.py --help
-  uv run python infer_trajectory_model.py --help
+  uv run python -m autotrack.gui.auto_track_gui
+  uv run python -m autotrack.gui.train_data_label_viewer_gui --data-folder datasets/train/sim_0001
+  uv run python -m autotrack.dl.train_trajectory_model --help
+  uv run python -m autotrack.dl.infer_trajectory_model --help
 
 NVIDIA/CUDA note:
   If this machine installs a CPU-only torch wheel, install the CUDA torch build

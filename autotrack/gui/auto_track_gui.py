@@ -31,7 +31,7 @@ from matplotlib.backends.backend_qtagg import (
 from matplotlib.figure import Figure
 from matplotlib.ticker import FuncFormatter
 
-from auto_track_backend import AutoTrackBackend, DEFAULT_DATA_FOLDER
+from autotrack.core.auto_track_backend import AutoTrackBackend, DEFAULT_DATA_FOLDER
 
 
 class ExtractWorker(QObject):

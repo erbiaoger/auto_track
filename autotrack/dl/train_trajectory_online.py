@@ -49,13 +49,14 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from trajectory_set_model import (
+from autotrack.dl.trajectory_set_model import (
     ModelConfig,
     TrajectorySetPredictor,
     WindowDatasetConfig,
     auto_torch_device,
     save_checkpoint,
     trajectory_collate,
+    trajectory_detection_metrics,
     trajectory_set_loss,
 )
 
@@ -346,6 +347,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-dir", required=True, type=Path, help="Output directory for checkpoints.")
     parser.add_argument("--epochs", type=int, default=20, help="Number of epochs.")
     parser.add_argument(
+        "--resume",
+        type=Path,
+        default=None,
+        help="Resume from a checkpoint. The saved model and optimizer states are loaded, and --epochs is treated as the final target epoch.",
+    )
+    parser.add_argument(
+        "--resume-model-only",
+        action="store_true",
+        help="When used with --resume, load only model weights and start optimizer state from scratch.",
+    )
+    parser.add_argument(
         "--steps-per-epoch",
         type=int,
         default=10000,
@@ -355,6 +367,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-every", type=int, default=1, help="Run validation every N epochs.")
     parser.add_argument("--plot-every", type=int, default=10, help="Save prediction plot every N epochs; 0 disables.")
     parser.add_argument("--checkpoint-every", type=int, default=1, help="Save checkpoint every N epochs; final epoch is always saved.")
+    parser.add_argument("--metrics-every", type=int, default=50, help="Collect synchronized batch metrics every N batches; 0 disables intermediate metric sync.")
+    parser.add_argument("--metric-objectness-threshold", type=float, default=0.5, help="Objectness threshold used for vehicle-level precision/recall/F1 metrics.")
+    parser.add_argument("--metric-point-threshold", type=float, default=0.05, help="Normalized polyline point-error threshold used to count a matched vehicle as correct.")
+    parser.add_argument(
+        "--matcher",
+        default="hungarian",
+        choices=["hungarian", "greedy"],
+        help="Query-to-GT assignment. hungarian is exact but CPU-bound; greedy stays on GPU and is faster but approximate.",
+    )
     parser.add_argument("--plot-window-seconds", type=float, default=240.0, help="Window length for periodic prediction plots.")
     parser.add_argument("--plot-seed", type=int, default=987654, help="Fixed seed for periodic prediction plots.")
     parser.add_argument("--plot-objectness-threshold", type=float, default=0.35, help="Objectness threshold for periodic plots.")
@@ -440,6 +461,19 @@ def _mean_metrics(items: list[dict[str, float]]) -> dict[str, float]:
     return {key: float(sum(item.get(key, 0.0) for item in items) / len(items)) for key in keys}
 
 
+def _move_optimizer_state_to_device(optimizer: torch.optim.Optimizer, device: str) -> None:
+    for state in optimizer.state.values():
+        for key, value in list(state.items()):
+            if torch.is_tensor(value):
+                state[key] = value.to(device)
+
+
+def _append_history_row(path: Path, row: dict[str, float | int | str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fp:
+        fp.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+
+
 def _build_online_dataset(args: argparse.Namespace, *, length: int, seed: int) -> OnlineSyntheticTrajectoryDataset:
     dataset_config = WindowDatasetConfig(
         window_seconds=float(args.window_seconds),
@@ -490,6 +524,9 @@ def _evaluate(
     denoising_loss_weight: float,
     line_loss_weight: float,
     slope_smooth_loss_weight: float,
+    matcher: str,
+    metric_objectness_threshold: float,
+    metric_point_threshold: float,
 ) -> dict[str, float]:
     model.eval()
     metrics_items: list[dict[str, float]] = []
@@ -506,6 +543,17 @@ def _evaluate(
                 denoising_loss_weight=float(denoising_loss_weight),
                 line_loss_weight=float(line_loss_weight),
                 slope_smooth_loss_weight=float(slope_smooth_loss_weight),
+                matcher=str(matcher),
+                collect_metrics=True,
+            )
+            metrics.update(
+                trajectory_detection_metrics(
+                    outputs,
+                    targets,
+                    objectness_threshold=float(metric_objectness_threshold),
+                    point_threshold=float(metric_point_threshold),
+                    matcher=str(matcher),
+                )
             )
             metrics_items.append(metrics)
     return _mean_metrics(metrics_items)
@@ -723,21 +771,40 @@ def main() -> int:
     val_loader = None
     if int(args.val_steps) > 0:
         val_dataset = _build_online_dataset(args, length=int(args.val_steps), seed=int(args.seed) + 10_000_000)
-    model_config = ModelConfig(
-        n_channels=int(args.n_ch),
-        in_channels=2,
-        max_queries=int(args.max_queries),
-        hidden_dim=int(args.hidden_dim),
-        num_heads=int(args.num_heads),
-        decoder_layers=int(args.decoder_layers),
-        pooled_channels=int(args.pooled_channels),
-        pooled_time=int(args.pooled_time),
-        trajectory_points=int(args.trajectory_points),
-        denoising_queries=int(args.denoising_queries),
-        dn_point_noise=float(args.dn_point_noise),
-    )
+    resume_checkpoint = None
+    resume_epoch = 0
+    if args.resume is not None:
+        resume_path = Path(args.resume).expanduser()
+        print(f"Resuming from checkpoint: {resume_path}", flush=True)
+        resume_checkpoint = torch.load(str(resume_path), map_location="cpu", weights_only=False)
+        resume_epoch = int(resume_checkpoint.get("epoch", 0))
+        model_config = ModelConfig(**dict(resume_checkpoint["model_config"]))
+    else:
+        model_config = ModelConfig(
+            n_channels=int(args.n_ch),
+            in_channels=2,
+            max_queries=int(args.max_queries),
+            hidden_dim=int(args.hidden_dim),
+            num_heads=int(args.num_heads),
+            decoder_layers=int(args.decoder_layers),
+            pooled_channels=int(args.pooled_channels),
+            pooled_time=int(args.pooled_time),
+            trajectory_points=int(args.trajectory_points),
+            denoising_queries=int(args.denoising_queries),
+            dn_point_noise=float(args.dn_point_noise),
+        )
     model = TrajectorySetPredictor(model_config).to(device)
+    if resume_checkpoint is not None:
+        missing, unexpected = model.load_state_dict(resume_checkpoint["model_state"], strict=False)
+        if missing or unexpected:
+            print(f"Resume load_state_dict: missing={len(missing)}, unexpected={len(unexpected)}", flush=True)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
+    if resume_checkpoint is not None and not bool(args.resume_model_only) and "optimizer_state" in resume_checkpoint:
+        optimizer.load_state_dict(resume_checkpoint["optimizer_state"])
+        _move_optimizer_state_to_device(optimizer, device)
+        print("Loaded optimizer state from checkpoint.", flush=True)
+    elif resume_checkpoint is not None:
+        print("Loaded model weights only; optimizer starts from scratch.", flush=True)
     loader = DataLoader(
         dataset,
         batch_size=int(args.batch_size),
@@ -788,14 +855,32 @@ def main() -> int:
         f"decoder_layers={model_config.decoder_layers}, pooled=({model_config.pooled_channels}, {model_config.pooled_time}), "
         f"trajectory_points={model_config.trajectory_points}"
     )
+    print(f"Training speed: matcher={args.matcher}, metrics_every={int(args.metrics_every)}")
 
     best_loss = float("inf")
-    for epoch in range(1, int(args.epochs) + 1):
+    if resume_checkpoint is not None:
+        resume_metrics = dict(resume_checkpoint.get("metrics", {}))
+        best_loss = float(resume_metrics.get("val_loss", resume_metrics.get("loss", best_loss)))
+    start_epoch = resume_epoch + 1 if resume_checkpoint is not None else 1
+    if start_epoch > int(args.epochs):
+        print(f"Checkpoint epoch={resume_epoch} is already >= target epochs={int(args.epochs)}; nothing to train.")
+        return 0
+    if resume_checkpoint is not None:
+        print(f"Resume epoch: checkpoint={resume_epoch}, training_range=[{start_epoch}, {int(args.epochs)}]", flush=True)
+    for epoch in range(start_epoch, int(args.epochs) + 1):
         model.train()
         t0 = time.perf_counter()
         epoch_metrics: list[dict[str, float]] = []
         log_every = int(args.log_every)
+        metrics_every = int(args.metrics_every)
         for batch_idx, (x, targets) in enumerate(loader, start=1):
+            should_log_batch = log_every > 0 and (batch_idx == 1 or batch_idx % log_every == 0 or batch_idx == len(loader))
+            collect_metrics = (
+                should_log_batch
+                or batch_idx == 1
+                or batch_idx == len(loader)
+                or (metrics_every > 0 and batch_idx % metrics_every == 0)
+            )
             x = x.to(device, non_blocking=(device == "cuda"))
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=bool(use_amp and str(device).startswith("cuda"))):
@@ -809,6 +894,8 @@ def main() -> int:
                     denoising_loss_weight=float(args.denoising_loss_weight),
                     line_loss_weight=float(args.line_loss_weight),
                     slope_smooth_loss_weight=float(args.slope_smooth_loss_weight),
+                    matcher=str(args.matcher),
+                    collect_metrics=bool(collect_metrics),
                 )
             scaler.scale(loss).backward()
             if float(args.grad_clip) > 0:
@@ -816,8 +903,18 @@ def main() -> int:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), float(args.grad_clip))
             scaler.step(optimizer)
             scaler.update()
-            epoch_metrics.append(metrics)
-            if log_every > 0 and (batch_idx == 1 or batch_idx % log_every == 0 or batch_idx == len(loader)):
+            if metrics:
+                metrics.update(
+                    trajectory_detection_metrics(
+                        outputs,
+                        targets,
+                        objectness_threshold=float(args.metric_objectness_threshold),
+                        point_threshold=float(args.metric_point_threshold),
+                        matcher=str(args.matcher),
+                    )
+                )
+                epoch_metrics.append(metrics)
+            if should_log_batch and metrics:
                 print(
                     f"epoch={epoch:03d} batch={batch_idx:04d}/{len(loader):04d} "
                     f"loss={metrics.get('loss', float('nan')):.4f} "
@@ -842,6 +939,10 @@ def main() -> int:
             f"epoch={epoch:03d} loss={mean_metrics.get('loss', float('nan')):.4f} "
             f"time={mean_metrics.get('loss_time', float('nan')):.4f} "
             f"obj={mean_metrics.get('loss_obj', float('nan')):.4f} "
+            f"f1={mean_metrics.get('track_f1', float('nan')):.3f} "
+            f"prec={mean_metrics.get('track_precision', float('nan')):.3f} "
+            f"rec={mean_metrics.get('track_recall', float('nan')):.3f} "
+            f"cnt_mae={mean_metrics.get('count_mae', float('nan')):.2f} "
             f"dup={mean_metrics.get('loss_duplicate', float('nan')):.4f} "
             f"dn={mean_metrics.get('loss_dn', float('nan')):.4f} "
             f"line={mean_metrics.get('loss_line', float('nan')):.4f} "
@@ -865,17 +966,32 @@ def main() -> int:
                 denoising_loss_weight=0.0,
                 line_loss_weight=float(args.line_loss_weight),
                 slope_smooth_loss_weight=float(args.slope_smooth_loss_weight),
+                matcher=str(args.matcher),
+                metric_objectness_threshold=float(args.metric_objectness_threshold),
+                metric_point_threshold=float(args.metric_point_threshold),
             )
             print(
                 f"epoch={epoch:03d} val_loss={val_metrics.get('loss', float('nan')):.4f} "
                 f"val_time={val_metrics.get('loss_time', float('nan')):.4f} "
                 f"val_obj={val_metrics.get('loss_obj', float('nan')):.4f} "
+                f"val_f1={val_metrics.get('track_f1', float('nan')):.3f} "
+                f"val_prec={val_metrics.get('track_precision', float('nan')):.3f} "
+                f"val_rec={val_metrics.get('track_recall', float('nan')):.3f} "
+                f"val_cnt_mae={val_metrics.get('count_mae', float('nan')):.2f} "
                 f"val_gt={val_metrics.get('gt', 0.0):.1f} "
                 f"val_matched={val_metrics.get('matched', 0.0):.1f} "
                 f"val_max_obj={val_metrics.get('max_objectness', 0.0):.3f} "
                 f"val_elapsed={time.perf_counter() - val_t0:.1f}s",
                 flush=True,
             )
+
+        history_row: dict[str, float | int | str] = {
+            "epoch": int(epoch),
+            "elapsed_seconds": float(elapsed),
+        }
+        history_row.update({f"train_{key}": float(value) for key, value in mean_metrics.items() if np.isfinite(value)})
+        history_row.update({f"val_{key}": float(value) for key, value in val_metrics.items() if np.isfinite(value)})
+        _append_history_row(args.out_dir / "train_history.jsonl", history_row)
 
         save_this_epoch = (epoch % int(max(1, args.checkpoint_every)) == 0) or (epoch == int(args.epochs))
         if save_this_epoch:

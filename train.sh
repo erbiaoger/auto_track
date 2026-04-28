@@ -1,4 +1,4 @@
-uv run python train_trajectory_model.py \
+uv run python -m autotrack.dl.train_trajectory_model \
   $(for d in datasets/train/sim_*; do echo --data-folder "$d"; done) \
   --out-dir models/trajectory_query_v1 \
   --epochs 20 \

@@ -14,7 +14,7 @@ import xml.etree.ElementTree as ET
 import numpy as np
 from obspy import Stream, Trace, read
 
-from track_extractor_graph import ExtractorConfig, Track, TrackPoint, extract_all
+from autotrack.core.track_extractor_graph import ExtractorConfig, Track, TrackPoint, extract_all
 
 
 DEFAULT_DATA_FOLDER = "/Volumes/SanDisk2T4/MyProjects/BaFang/KF/data/synthetic_sac"
@@ -834,18 +834,18 @@ class AutoTrackBackend:
             if int(gpu_device_id) < 0 or int(gpu_device_id) >= n_dev:
                 raise ValueError(f"gpu_device_id out of range; available device count: {n_dev}")
             cp.cuda.Device(int(gpu_device_id)).use()
-            from auto_track_gpu import extract_all_gpu
+            from autotrack.cli.auto_track_gpu import extract_all_gpu
 
             extract_fn = extract_all_gpu
             device_id_used = int(gpu_device_id)
             engine_text = f"GPU(cuda:{device_id_used})"
         elif engine == "gpu_torch_mps":
-            from auto_track_torch_mps import extract_all_torch_mps
+            from autotrack.core.auto_track_torch_mps import extract_all_torch_mps
 
             extract_fn = extract_all_torch_mps
             engine_text = "GPU(PyTorch MPS)"
         elif engine == "deep_learning":
-            from trajectory_deep_engine import extract_all_deep_learning
+            from autotrack.core.trajectory_deep_engine import extract_all_deep_learning
 
             extract_fn = extract_all_deep_learning
             workers = 1

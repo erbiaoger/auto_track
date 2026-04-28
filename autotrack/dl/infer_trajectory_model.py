@@ -29,7 +29,7 @@ import argparse
 import json
 from pathlib import Path
 
-from auto_track_backend import AutoTrackBackend
+from autotrack.core.auto_track_backend import AutoTrackBackend
 
 
 def parse_args() -> argparse.Namespace:

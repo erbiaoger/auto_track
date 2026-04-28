@@ -38,7 +38,7 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
-from trajectory_set_model import (
+from autotrack.dl.trajectory_set_model import (
     ModelConfig,
     SimulatedSacTrajectoryDataset,
     TrajectorySetPredictor,

@@ -12,8 +12,8 @@ from typing import Optional
 
 import numpy as np
 
-from track_extractor_graph import Track
-from trajectory_set_model import (
+from autotrack.core.track_extractor_graph import Track
+from autotrack.dl.trajectory_set_model import (
     InferenceConfig,
     auto_torch_device,
     load_checkpoint_model,

@@ -1,4 +1,4 @@
-uv run python infer_trajectory_model.py \
+uv run python -m autotrack.dl.infer_trajectory_model \
   --data-folder datasets/test/sim_1001 \
   --model models/trajectory_query_online_v1_cuda/checkpoint_best.pt \
   --device auto \

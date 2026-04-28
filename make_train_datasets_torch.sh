@@ -9,7 +9,7 @@ COUNT=${COUNT:-50}
 START_SEED=${START_SEED:-1}
 
 for i in $(seq "$START_SEED" $((START_SEED + COUNT - 1))); do
-  uv run python simulate_vehicle_sac_torch.py \
+  uv run python -m autotrack.simulation.simulate_vehicle_sac_torch \
     --out-dir "$SCRIPT_DIR/datasets/train/sim_$(printf "%04d" "$i")" \
     --seed "$i" \
     --primary-count 300 \

@@ -8,6 +8,9 @@ DEVICE=${DEVICE:-cuda}
 BATCH_SIZE=${BATCH_SIZE:-16}
 AMP=${AMP:-auto}
 AMP_DTYPE=${AMP_DTYPE:-float16}
+EPOCHS=${EPOCHS:-400}
+RESUME=${RESUME:-}
+RESUME_MODEL_ONLY=${RESUME_MODEL_ONLY:-0}
 CACHE_DATASET=${CACHE_DATASET:-1}
 CACHE_DTYPE=${CACHE_DTYPE:-float16}
 CACHE_BUILD_WORKERS=${CACHE_BUILD_WORKERS:-64}
@@ -18,10 +21,14 @@ MAX_QUERIES=${MAX_QUERIES:-128}
 POOLED_TIME=${POOLED_TIME:-128}
 TRAJECTORY_POINTS=${TRAJECTORY_POINTS:-32}
 STEPS_PER_EPOCH=${STEPS_PER_EPOCH:-10000}
-VAL_STEPS=${VAL_STEPS:-200}
+VAL_STEPS=${VAL_STEPS:-100}
 VAL_EVERY=${VAL_EVERY:-10}
 PLOT_EVERY=${PLOT_EVERY:-2}
 CHECKPOINT_EVERY=${CHECKPOINT_EVERY:-10}
+METRICS_EVERY=${METRICS_EVERY:-50}
+METRIC_OBJECTNESS_THRESHOLD=${METRIC_OBJECTNESS_THRESHOLD:-0.5}
+METRIC_POINT_THRESHOLD=${METRIC_POINT_THRESHOLD:-0.05}
+MATCHER=${MATCHER:-hungarian}
 PLOT_WINDOW_SECONDS=${PLOT_WINDOW_SECONDS:-240}
 NO_OBJECT_WEIGHT=${NO_OBJECT_WEIGHT:-0.3}
 DUPLICATE_LOSS_WEIGHT=${DUPLICATE_LOSS_WEIGHT:-0.2}
@@ -61,24 +68,41 @@ FAST_SPEED_MAX_KMH=${FAST_SPEED_MAX_KMH:-120}
 #   default because the 4090 was already close to full memory.
 # - CHECKPOINT_EVERY=10 and VAL_EVERY=10 reduce per-epoch CPU/disk overhead;
 #   PLOT_EVERY=2 keeps frequent visual feedback.
+# - METRICS_EVERY=50 avoids synchronizing detailed GPU metrics on every batch.
+# - METRIC_* controls vehicle-level precision/recall/F1 reporting only.
+# - MATCHER=hungarian keeps exact assignment. Try MATCHER=greedy for a faster
+#   approximate GPU-side assignment if you need more throughput.
+# - RESUME=/path/to/checkpoint_last.pt continues from a saved epoch. EPOCHS is
+#   the final target epoch, so epoch 118 with EPOCHS=400 continues at 119.
 # - Current online generator is constant-speed only; use offline finetuning for
 #   accel/decel/stop-go after this fast pretraining.
 cache_args=""
 if [ "$CACHE_DATASET" = "1" ] || [ "$CACHE_DATASET" = "true" ]; then
   cache_args="--cache-dataset --cache-dtype $CACHE_DTYPE --cache-build-workers $CACHE_BUILD_WORKERS"
 fi
+resume_args=""
+if [ -n "$RESUME" ]; then
+  resume_args="--resume $RESUME"
+  if [ "$RESUME_MODEL_ONLY" = "1" ] || [ "$RESUME_MODEL_ONLY" = "true" ]; then
+    resume_args="$resume_args --resume-model-only"
+  fi
+fi
 
-uv run python train_trajectory_online.py \
+uv run python -m autotrack.dl.train_trajectory_online \
   --out-dir models/trajectory_query_online_v1_cuda \
   --device "$DEVICE" \
   --amp "$AMP" \
   --amp-dtype "$AMP_DTYPE" \
-  --epochs 400 \
+  --epochs "$EPOCHS" \
   --steps-per-epoch "$STEPS_PER_EPOCH" \
   --val-steps "$VAL_STEPS" \
   --val-every "$VAL_EVERY" \
   --plot-every "$PLOT_EVERY" \
   --checkpoint-every "$CHECKPOINT_EVERY" \
+  --metrics-every "$METRICS_EVERY" \
+  --metric-objectness-threshold "$METRIC_OBJECTNESS_THRESHOLD" \
+  --metric-point-threshold "$METRIC_POINT_THRESHOLD" \
+  --matcher "$MATCHER" \
   --plot-window-seconds "$PLOT_WINDOW_SECONDS" \
   --plot-objectness-threshold "$PLOT_OBJECTNESS_THRESHOLD" \
   --plot-visibility-threshold "$PLOT_VISIBILITY_THRESHOLD" \
@@ -122,4 +146,5 @@ uv run python train_trajectory_online.py \
   --dn-point-noise "$DN_POINT_NOISE" \
   --num-workers "$NUM_WORKERS" \
   $cache_args \
+  $resume_args \
   --log-every "$LOG_EVERY"

@@ -8,8 +8,8 @@ from typing import Optional
 import numpy as np
 from scipy.signal import find_peaks
 
-from auto_track_backend import AutoTrackBackend, DEFAULT_DATA_FOLDER
-from track_extractor_graph import (
+from autotrack.core.auto_track_backend import AutoTrackBackend, DEFAULT_DATA_FOLDER
+from autotrack.core.track_extractor_graph import (
     ExtractorConfig,
     Track,
     _as_config,

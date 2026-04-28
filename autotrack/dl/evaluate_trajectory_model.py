@@ -31,7 +31,7 @@ from pathlib import Path
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
-from trajectory_set_model import (
+from autotrack.dl.trajectory_set_model import (
     InferenceConfig,
     Track,
     TrackPoint,

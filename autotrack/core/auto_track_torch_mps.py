@@ -5,7 +5,7 @@ from typing import Optional
 import numpy as np
 from scipy.signal import find_peaks
 
-from track_extractor_graph import (
+from autotrack.core.track_extractor_graph import (
     ExtractorConfig,
     Track,
     _as_config,
