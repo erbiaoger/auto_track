@@ -734,6 +734,7 @@ def _save_prediction_plot(
         min_visible_channels=int(args.min_visible_channels),
         speed_norm_kmh=150.0,
         clip_ratio=1.35,
+        input_mode=str(args.resolved_input_mode),
         seed=int(args.plot_seed),
     )
     x, target = plot_dataset[0]
@@ -751,7 +752,8 @@ def _save_prediction_plot(
         top_k=int(args.plot_top_k),
     )
 
-    shown = x[1].detach().cpu().numpy()
+    display_channel = 1 if int(x.shape[0]) > 1 else 0
+    shown = x[display_channel].detach().cpu().numpy()
     display_floor = float(max(0.0, args.plot_display_floor))
     shown_plot = np.where(shown >= display_floor, shown, 0.0) if display_floor > 0.0 else shown
     vmax = float(max(np.percentile(shown_plot[np.isfinite(shown_plot)], 99.5), 1e-6))
