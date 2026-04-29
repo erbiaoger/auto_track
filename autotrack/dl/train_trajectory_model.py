@@ -33,6 +33,7 @@ import argparse
 import json
 import time
 from dataclasses import asdict
+from functools import partial
 from pathlib import Path
 
 import torch
@@ -44,6 +45,7 @@ from autotrack.dl.trajectory_set_model import (
     TrajectorySetPredictor,
     WindowDatasetConfig,
     auto_torch_device,
+    move_targets_to_device,
     save_checkpoint,
     trajectory_collate,
     trajectory_set_loss,
@@ -143,7 +145,7 @@ def main() -> int:
         batch_size=int(args.batch_size),
         shuffle=True,
         num_workers=int(args.num_workers),
-        collate_fn=trajectory_collate,
+        collate_fn=partial(trajectory_collate, trajectory_points=int(model_config.trajectory_points)),
         drop_last=False,
     )
 
@@ -180,6 +182,7 @@ def main() -> int:
         log_every = int(max(1, args.log_every))
         for batch_idx, (x, targets) in enumerate(loader, start=1):
             x = x.to(device)
+            targets = move_targets_to_device(targets, device)
             optimizer.zero_grad(set_to_none=True)
             outputs = model(x, targets=targets)
             loss, metrics = trajectory_set_loss(

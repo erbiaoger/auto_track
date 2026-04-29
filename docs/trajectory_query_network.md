@@ -236,6 +236,20 @@ point_valid[vehicle, trajectory_points]
 
 如果一辆车可见通道数大于 `trajectory_points`，会均匀采样到固定点数；如果小于固定点数，后面点用 `point_valid=0` 标记无效。
 
+训练 batch 现在会把不同窗口中不定数量的车辆 padding 成固定 tensor：
+
+```text
+time         [B, G, C]
+visibility   [B, G, C]
+points       [B, G, P, 2]
+point_valid  [B, G, P]
+direction    [B, G]
+speed        [B, G]
+gt_valid     [B, G]
+```
+
+其中 `G` 是当前 batch 中最大 GT 车辆数，空槽由 `gt_valid=False` 屏蔽。训练循环会把这整套 target tensor 一次性搬到 GPU，避免 loss 里反复处理 Python list/dict。
+
 ## 8. Matching
 
 训练时不知道哪个 query 对应哪辆 GT 车，所以需要 matching。
@@ -264,6 +278,8 @@ MATCHER=greedy sh train_online.sh
 ```
 
 `hungarian` 更精确，但会把 cost matrix 拷到 CPU 调 SciPy，速度慢一些；`greedy` 更快，但匹配质量可能略差。
+
+当 target 是 batched tensor 且 `MATCHER=greedy` 时，训练 loss 使用 batched greedy matching：一次性构造 `[B, Q, G]` cost，在 GPU 上对整个 batch 做近似一对一匹配。这样比逐样本 Python loop 更适合大 batch 训练。
 
 ## 9. Loss
 

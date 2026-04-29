@@ -41,6 +41,7 @@ import json
 import time
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict
+from functools import partial
 from pathlib import Path
 from typing import Optional
 
@@ -54,6 +55,7 @@ from autotrack.dl.trajectory_set_model import (
     TrajectorySetPredictor,
     WindowDatasetConfig,
     auto_torch_device,
+    move_targets_to_device,
     save_checkpoint,
     trajectory_collate,
     trajectory_detection_metrics,
@@ -587,6 +589,7 @@ def _evaluate(
     with torch.no_grad():
         for x, targets in loader:
             x = x.to(device, non_blocking=(device == "cuda"))
+            targets = move_targets_to_device(targets, device, non_blocking=(device == "cuda"))
             outputs = model(x)
             _, metrics = trajectory_set_loss(
                 outputs,
@@ -892,7 +895,7 @@ def main() -> int:
         batch_size=int(args.batch_size),
         shuffle=True,
         num_workers=int(args.num_workers),
-        collate_fn=trajectory_collate,
+        collate_fn=partial(trajectory_collate, trajectory_points=int(model_config.trajectory_points)),
         drop_last=False,
         pin_memory=(device == "cuda"),
     )
@@ -902,7 +905,7 @@ def main() -> int:
             batch_size=int(args.batch_size),
             shuffle=False,
             num_workers=int(args.num_workers),
-            collate_fn=trajectory_collate,
+            collate_fn=partial(trajectory_collate, trajectory_points=int(model_config.trajectory_points)),
             drop_last=False,
             pin_memory=(device == "cuda"),
         )
@@ -964,6 +967,7 @@ def main() -> int:
                 or (metrics_every > 0 and batch_idx % metrics_every == 0)
             )
             x = x.to(device, non_blocking=(device == "cuda"))
+            targets = move_targets_to_device(targets, device, non_blocking=(device == "cuda"))
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=bool(use_amp and str(device).startswith("cuda"))):
                 outputs = model(x, targets=targets)
