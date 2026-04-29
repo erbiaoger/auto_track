@@ -9,6 +9,7 @@ BATCH_SIZE=${BATCH_SIZE:-16}
 AMP=${AMP:-auto}
 AMP_DTYPE=${AMP_DTYPE:-float16}
 EPOCHS=${EPOCHS:-400}
+INPUT_MODE=${INPUT_MODE:-auto}
 RESUME=${RESUME:-models/trajectory_query_online_v1_cuda/checkpoint_last.pt}
 RESUME_MODEL_ONLY=${RESUME_MODEL_ONLY:-0}
 CACHE_DATASET=${CACHE_DATASET:-1}
@@ -28,7 +29,7 @@ CHECKPOINT_EVERY=${CHECKPOINT_EVERY:-10}
 METRICS_EVERY=${METRICS_EVERY:-50}
 METRIC_OBJECTNESS_THRESHOLD=${METRIC_OBJECTNESS_THRESHOLD:-0.5}
 METRIC_POINT_THRESHOLD=${METRIC_POINT_THRESHOLD:-0.05}
-MATCHER=${MATCHER:-hungarian}
+MATCHER=${MATCHER:-greedy}       # hungarian, greedy
 PLOT_WINDOW_SECONDS=${PLOT_WINDOW_SECONDS:-240}
 NO_OBJECT_WEIGHT=${NO_OBJECT_WEIGHT:-0.3}
 DUPLICATE_LOSS_WEIGHT=${DUPLICATE_LOSS_WEIGHT:-0.2}
@@ -66,12 +67,14 @@ FAST_SPEED_MAX_KMH=${FAST_SPEED_MAX_KMH:-120}
 #   still uses the single in-process RAM cache after generation finishes.
 # - AMP=auto enables CUDA mixed precision by default. Batch size stays at 16 by
 #   default because the 4090 was already close to full memory.
+# - INPUT_MODE=auto uses raw for new models and preserves raw_abs for old
+#   two-channel checkpoints. Set INPUT_MODE=raw for a new one-channel model.
 # - CHECKPOINT_EVERY=10 and VAL_EVERY=10 reduce per-epoch CPU/disk overhead;
 #   PLOT_EVERY=2 keeps frequent visual feedback.
 # - METRICS_EVERY=50 avoids synchronizing detailed GPU metrics on every batch.
 # - METRIC_* controls vehicle-level precision/recall/F1 reporting only.
-# - MATCHER=hungarian keeps exact assignment. Try MATCHER=greedy for a faster
-#   approximate GPU-side assignment if you need more throughput.
+# - MATCHER=greedy uses faster approximate GPU-side assignment. Set
+#   MATCHER=hungarian for exact CPU Hungarian assignment.
 # - RESUME=/path/to/checkpoint_last.pt continues from a saved epoch. EPOCHS is
 #   the final target epoch, so epoch 118 with EPOCHS=400 continues at 119.
 # - Current online generator is constant-speed only; use offline finetuning for
@@ -93,6 +96,7 @@ uv run python -m autotrack.dl.train_trajectory_online \
   --device "$DEVICE" \
   --amp "$AMP" \
   --amp-dtype "$AMP_DTYPE" \
+  --input-mode "$INPUT_MODE" \
   --epochs "$EPOCHS" \
   --steps-per-epoch "$STEPS_PER_EPOCH" \
   --val-steps "$VAL_STEPS" \

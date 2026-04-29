@@ -65,6 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=1e-4, help="AdamW weight decay.")
     parser.add_argument("--window-seconds", type=float, default=60.0, help="Random training window length in seconds.")
     parser.add_argument("--time-downsample", type=int, default=10, help="Time-axis stride for model input.")
+    parser.add_argument("--input-mode", default="raw", choices=["raw", "raw_abs"], help="Input feature channels. raw uses only normalized signal; raw_abs adds abs(signal).")
     parser.add_argument("--samples-per-folder", type=int, default=512, help="Random windows sampled per folder per epoch.")
     parser.add_argument("--min-visible-channels", type=int, default=2, help="Minimum visible points for a GT track.")
     parser.add_argument("--max-queries", type=int, default=128, help="Maximum predicted trajectory queries per window.")
@@ -113,6 +114,7 @@ def main() -> int:
         time_downsample=int(max(1, args.time_downsample)),
         samples_per_folder=int(max(1, args.samples_per_folder)),
         min_visible_channels=int(max(1, args.min_visible_channels)),
+        input_mode=str(args.input_mode),
         seed=int(args.seed),
     )
     dataset = SimulatedSacTrajectoryDataset(args.data_folder, config=dataset_config)
@@ -123,7 +125,7 @@ def main() -> int:
 
     model_config = ModelConfig(
         n_channels=n_channels,
-        in_channels=2,
+        in_channels=1 if str(args.input_mode) == "raw" else 2,
         max_queries=int(args.max_queries),
         hidden_dim=int(args.hidden_dim),
         num_heads=int(args.num_heads),

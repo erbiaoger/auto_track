@@ -5,6 +5,7 @@ uv run python -m autotrack.dl.train_trajectory_model \
   --batch-size 1 \
   --window-seconds 45 \
   --time-downsample 20 \
+  --input-mode raw \
   --max-queries 96 \
   --hidden-dim 96 \
   --decoder-layers 1 \

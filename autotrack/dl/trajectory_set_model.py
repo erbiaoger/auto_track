@@ -36,13 +36,14 @@ class WindowDatasetConfig:
     min_visible_channels: int = 2
     speed_norm_kmh: float = 150.0
     clip_ratio: float = 1.35
+    input_mode: str = "raw"
     seed: int = 42
 
 
 @dataclass
 class ModelConfig:
     n_channels: int = 50
-    in_channels: int = 2
+    in_channels: int = 1
     max_queries: int = 128
     hidden_dim: int = 128
     num_heads: int = 4
@@ -126,6 +127,7 @@ def prepare_window_input(
     data_window: np.ndarray,
     time_downsample: int,
     clip_ratio: float = 1.35,
+    input_mode: str = "raw",
 ) -> torch.Tensor:
     arr = np.asarray(data_window, dtype=np.float32)
     if arr.ndim != 2:
@@ -135,8 +137,14 @@ def prepare_window_input(
     scale = _robust_scale(arr_ds)
     clip = float(max(clip_ratio, 1e-6))
     raw = np.clip(arr_ds / scale, -clip, clip) / clip
-    abs_feat = np.clip(np.abs(arr_ds) / scale, 0.0, clip) / clip
-    features = np.stack([raw, abs_feat], axis=0).astype(np.float32, copy=False)
+    mode = str(input_mode).lower()
+    if mode == "raw":
+        features = raw[None, :, :].astype(np.float32, copy=False)
+    elif mode == "raw_abs":
+        abs_feat = np.clip(np.abs(arr_ds) / scale, 0.0, clip) / clip
+        features = np.stack([raw, abs_feat], axis=0).astype(np.float32, copy=False)
+    else:
+        raise ValueError(f"Unsupported input_mode={input_mode!r}; expected raw or raw_abs")
     return torch.from_numpy(features)
 
 
@@ -240,6 +248,7 @@ class SimulatedSacTrajectoryDataset(Dataset):
             window,
             time_downsample=int(self.config.time_downsample),
             clip_ratio=float(self.config.clip_ratio),
+            input_mode=str(self.config.input_mode),
         )
         target = build_window_target(
             rec["tracks"],
@@ -540,18 +549,17 @@ def _duplicate_query_loss(
     points = outputs["points"][:, :q_count]
     valid = torch.sigmoid(outputs["point_valid_logits"][:, :q_count]).detach()
     tau = float(max(1e-6, distance_tau))
-    losses: list[torch.Tensor] = []
     pair_mask = torch.triu(torch.ones((q_count, q_count), dtype=torch.bool, device=device), diagonal=1)
 
-    for b in range(int(points.shape[0])):
-        pair_valid = valid[b, :, None, :] * valid[b, None, :, :]
-        denom = torch.clamp(pair_valid.sum(dim=-1), min=1.0)
-        distance = (torch.abs(points[b, :, None, :, :] - points[b, None, :, :, :]).sum(dim=-1) * pair_valid).sum(dim=-1) / denom
-        similarity = torch.exp(-distance.detach() / tau)
-        pair_obj = obj[b, :, None] * obj[b, None, :]
-        losses.append((pair_obj[pair_mask] * similarity[pair_mask]).mean())
+    pair_valid = valid[:, :, None, :] * valid[:, None, :, :]
+    denom = torch.clamp(pair_valid.sum(dim=-1), min=1.0)
+    distance = (
+        torch.abs(points[:, :, None, :, :] - points[:, None, :, :, :]).sum(dim=-1) * pair_valid
+    ).sum(dim=-1) / denom
+    similarity = torch.exp(-distance.detach() / tau)
+    pair_obj = obj[:, :, None] * obj[:, None, :]
 
-    return torch.stack(losses).mean() if losses else torch.zeros((), dtype=torch.float32, device=device)
+    return (pair_obj[:, pair_mask] * similarity[:, pair_mask]).mean()
 
 
 def _denoising_query_loss(
@@ -618,37 +626,50 @@ def _denoising_query_loss(
 def _linearity_loss_for_points(points: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
     """Softly penalize curved vehicle polylines by fitting time = a * channel + b."""
     device = points.device
-    losses: list[torch.Tensor] = []
-    for track_points, track_valid in zip(points, valid):
-        keep = torch.where(track_valid > 0.5)[0]
-        if int(keep.numel()) < 2:
-            continue
-        xy = track_points[keep]
-        x = xy[:, 0]
-        y = xy[:, 1]
-        x_centered = x - x.mean()
-        y_centered = y - y.mean()
-        slope = torch.sum(x_centered * y_centered) / torch.clamp(torch.sum(x_centered * x_centered), min=1e-6)
-        intercept = y.mean() - slope * x.mean()
-        fitted = slope * x + intercept
-        losses.append(F.smooth_l1_loss(y, fitted, reduction="mean"))
-    return torch.stack(losses).mean() if losses else torch.zeros((), dtype=torch.float32, device=device)
+    if points.numel() == 0:
+        return torch.zeros((), dtype=torch.float32, device=device)
+    w = (valid > 0.5).to(points.dtype)
+    count = w.sum(dim=-1)
+    eligible = count >= 2
+    if not torch.any(eligible):
+        return torch.zeros((), dtype=torch.float32, device=device)
+
+    x = points[..., 0]
+    y = points[..., 1]
+    denom = torch.clamp(count, min=1.0)
+    mean_x = (x * w).sum(dim=-1) / denom
+    mean_y = (y * w).sum(dim=-1) / denom
+    x_centered = x - mean_x[:, None]
+    y_centered = y - mean_y[:, None]
+    slope = (x_centered * y_centered * w).sum(dim=-1) / torch.clamp((x_centered * x_centered * w).sum(dim=-1), min=1e-6)
+    intercept = mean_y - slope * mean_x
+    fitted = slope[:, None] * x + intercept[:, None]
+    diff = torch.abs(y - fitted)
+    point_loss = torch.where(diff < 1.0, 0.5 * diff * diff, diff - 0.5) * w
+    per_track = point_loss.sum(dim=-1) / denom
+    return per_track[eligible].mean()
 
 
 def _slope_smooth_loss_for_points(points: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
     """Allow mild acceleration, but penalize sharp changes in local track slope."""
     device = points.device
-    losses: list[torch.Tensor] = []
-    for track_points, track_valid in zip(points, valid):
-        keep = torch.where(track_valid > 0.5)[0]
-        if int(keep.numel()) < 3:
-            continue
-        xy = track_points[keep]
-        dx = torch.clamp(torch.abs(xy[1:, 0] - xy[:-1, 0]), min=0.02)
-        dy = xy[1:, 1] - xy[:-1, 1]
-        slopes = dy / dx
-        losses.append(F.smooth_l1_loss(slopes[1:], slopes[:-1], reduction="mean"))
-    return torch.stack(losses).mean() if losses else torch.zeros((), dtype=torch.float32, device=device)
+    if points.numel() == 0 or int(points.shape[1]) < 3:
+        return torch.zeros((), dtype=torch.float32, device=device)
+    w = (valid > 0.5).to(points.dtype)
+    segment_valid = w[:, 1:] * w[:, :-1]
+    slope_pair_valid = segment_valid[:, 1:] * segment_valid[:, :-1]
+    count = slope_pair_valid.sum(dim=-1)
+    eligible = count > 0
+    if not torch.any(eligible):
+        return torch.zeros((), dtype=torch.float32, device=device)
+
+    dx = torch.clamp(torch.abs(points[:, 1:, 0] - points[:, :-1, 0]), min=0.02)
+    dy = points[:, 1:, 1] - points[:, :-1, 1]
+    slopes = dy / dx
+    diff = torch.abs(slopes[:, 1:] - slopes[:, :-1])
+    pair_loss = torch.where(diff < 1.0, 0.5 * diff * diff, diff - 0.5) * slope_pair_valid
+    per_track = pair_loss.sum(dim=-1) / torch.clamp(count, min=1.0)
+    return per_track[eligible].mean()
 
 
 def trajectory_set_loss(
@@ -1097,7 +1118,13 @@ def predict_tracks_from_window(
             f"Model expects {model.config.n_channels} channels, but input has {arr.shape[0]} channels"
         )
     resolved_device = device or next(model.parameters()).device
-    x = prepare_window_input(arr, int(cfg.time_downsample), float(cfg.clip_ratio)).unsqueeze(0).to(resolved_device)
+    input_mode = "raw_abs" if int(getattr(model.config, "in_channels", 1)) == 2 else "raw"
+    x = prepare_window_input(
+        arr,
+        int(cfg.time_downsample),
+        float(cfg.clip_ratio),
+        input_mode=input_mode,
+    ).unsqueeze(0).to(resolved_device)
     with torch.inference_mode():
         outputs = model(x)
     if "points" in outputs and "point_valid_logits" in outputs and not bool(getattr(model, "prefer_dense_output", False)):

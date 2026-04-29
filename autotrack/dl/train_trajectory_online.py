@@ -91,6 +91,7 @@ class OnlineSyntheticTrajectoryDataset(Dataset):
         min_visible_channels: int,
         speed_norm_kmh: float,
         clip_ratio: float,
+        input_mode: str,
         seed: int,
         cache_dataset: bool = False,
         cache_dtype: str = "float16",
@@ -121,6 +122,7 @@ class OnlineSyntheticTrajectoryDataset(Dataset):
         self.min_visible_channels = int(min_visible_channels)
         self.speed_norm_kmh = float(speed_norm_kmh)
         self.clip_ratio = float(clip_ratio)
+        self.input_mode = str(input_mode).lower()
         self.seed = int(seed)
         self.cache_dataset = bool(cache_dataset)
         self.cache_dtype = str(cache_dtype).lower()
@@ -202,6 +204,7 @@ class OnlineSyntheticTrajectoryDataset(Dataset):
             "min_visible_channels": self.min_visible_channels,
             "speed_norm_kmh": self.speed_norm_kmh,
             "clip_ratio": self.clip_ratio,
+            "input_mode": self.input_mode,
             "seed": self.seed,
             "cache_dtype": self.cache_dtype,
         }
@@ -319,8 +322,12 @@ class OnlineSyntheticTrajectoryDataset(Dataset):
         scale = torch.clamp(torch.maximum(q995, 3.0 * rms), min=1e-6)
         clip = float(max(1e-6, self.clip_ratio))
         raw = torch.clamp(arr / scale, -clip, clip) / clip
-        abs_feat = torch.clamp(abs_vals / scale, 0.0, clip) / clip
-        return torch.stack([raw, abs_feat], dim=0).to(torch.float32)
+        if self.input_mode == "raw":
+            return raw.unsqueeze(0).to(torch.float32)
+        if self.input_mode == "raw_abs":
+            abs_feat = torch.clamp(abs_vals / scale, 0.0, clip) / clip
+            return torch.stack([raw, abs_feat], dim=0).to(torch.float32)
+        raise ValueError(f"Unsupported input_mode={self.input_mode!r}; expected raw or raw_abs")
 
 
 def _generate_cached_online_item(
@@ -431,6 +438,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache-dataset", action="store_true", help="Precompute the fixed online dataset pool into RAM before training.")
     parser.add_argument("--cache-dtype", default="float16", choices=["float16", "bfloat16", "float32"], help="RAM cache dtype for input tensors.")
     parser.add_argument(
+        "--input-mode",
+        default="auto",
+        choices=["auto", "raw", "raw_abs"],
+        help="Input feature channels. raw uses only normalized signal; raw_abs adds abs(signal). auto uses raw for new runs and checkpoint in_channels for resume.",
+    )
+    parser.add_argument(
         "--cache-build-workers",
         type=int,
         default=0,
@@ -474,12 +487,52 @@ def _append_history_row(path: Path, row: dict[str, float | int | str]) -> None:
         fp.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
 
 
+def _input_mode_to_channels(input_mode: str) -> int:
+    if str(input_mode).lower() == "raw":
+        return 1
+    if str(input_mode).lower() == "raw_abs":
+        return 2
+    raise ValueError(f"Unsupported input_mode={input_mode!r}; expected raw or raw_abs")
+
+
+def _adapt_checkpoint_model_state(
+    checkpoint_state: dict[str, torch.Tensor],
+    model_state: dict[str, torch.Tensor],
+) -> tuple[dict[str, torch.Tensor], bool]:
+    adapted = False
+    out: dict[str, torch.Tensor] = {}
+    first_conv_key = "backbone.0.net.0.weight"
+    for key, value in checkpoint_state.items():
+        if key not in model_state:
+            continue
+        target = model_state[key]
+        if tuple(value.shape) == tuple(target.shape):
+            out[key] = value
+            continue
+        if key == first_conv_key and value.ndim == 4 and target.ndim == 4 and value.shape[0] == target.shape[0]:
+            if int(value.shape[1]) == 2 and int(target.shape[1]) == 1:
+                # Old raw+abs checkpoint -> new raw-only model. Keep only the raw
+                # signal channel, because abs(signal) is intentionally removed.
+                out[key] = value[:, :1].contiguous()
+                adapted = True
+                continue
+            if int(value.shape[1]) == 1 and int(target.shape[1]) == 2:
+                migrated = torch.zeros_like(target)
+                migrated[:, :1] = value
+                out[key] = migrated
+                adapted = True
+                continue
+        adapted = True
+    return out, adapted
+
+
 def _build_online_dataset(args: argparse.Namespace, *, length: int, seed: int) -> OnlineSyntheticTrajectoryDataset:
     dataset_config = WindowDatasetConfig(
         window_seconds=float(args.window_seconds),
         time_downsample=int(max(1, args.time_downsample)),
         samples_per_folder=int(max(1, length)),
         min_visible_channels=int(max(1, args.min_visible_channels)),
+        input_mode=str(args.resolved_input_mode),
         seed=int(seed),
     )
     return OnlineSyntheticTrajectoryDataset(
@@ -507,6 +560,7 @@ def _build_online_dataset(args: argparse.Namespace, *, length: int, seed: int) -
         min_visible_channels=int(args.min_visible_channels),
         speed_norm_kmh=float(dataset_config.speed_norm_kmh),
         clip_ratio=float(dataset_config.clip_ratio),
+        input_mode=str(args.resolved_input_mode),
         seed=int(seed),
         cache_dataset=bool(args.cache_dataset),
         cache_dtype=str(args.cache_dtype),
@@ -759,18 +813,6 @@ def main() -> int:
         print("cache_dataset is enabled; forcing num_workers=0 to avoid copying the RAM cache into worker processes.")
         args.num_workers = 0
 
-    dataset_config = WindowDatasetConfig(
-        window_seconds=float(args.window_seconds),
-        time_downsample=int(max(1, args.time_downsample)),
-        samples_per_folder=int(max(1, args.steps_per_epoch)),
-        min_visible_channels=int(max(1, args.min_visible_channels)),
-        seed=int(args.seed),
-    )
-    dataset = _build_online_dataset(args, length=int(args.steps_per_epoch), seed=int(args.seed))
-    val_dataset = None
-    val_loader = None
-    if int(args.val_steps) > 0:
-        val_dataset = _build_online_dataset(args, length=int(args.val_steps), seed=int(args.seed) + 10_000_000)
     resume_checkpoint = None
     resume_epoch = 0
     if args.resume is not None:
@@ -779,10 +821,19 @@ def main() -> int:
         resume_checkpoint = torch.load(str(resume_path), map_location="cpu", weights_only=False)
         resume_epoch = int(resume_checkpoint.get("epoch", 0))
         model_config = ModelConfig(**dict(resume_checkpoint["model_config"]))
+        if str(args.input_mode) != "auto":
+            requested_channels = _input_mode_to_channels(str(args.input_mode))
+            if requested_channels != int(model_config.in_channels):
+                print(
+                    f"Adapting resumed model input channels: checkpoint={model_config.in_channels}, requested={requested_channels}",
+                    flush=True,
+                )
+                model_config.in_channels = requested_channels
     else:
+        requested_mode = "raw" if str(args.input_mode) == "auto" else str(args.input_mode)
         model_config = ModelConfig(
             n_channels=int(args.n_ch),
-            in_channels=2,
+            in_channels=_input_mode_to_channels(requested_mode),
             max_queries=int(args.max_queries),
             hidden_dim=int(args.hidden_dim),
             num_heads=int(args.num_heads),
@@ -793,13 +844,42 @@ def main() -> int:
             denoising_queries=int(args.denoising_queries),
             dn_point_noise=float(args.dn_point_noise),
         )
+    if str(args.input_mode) == "auto":
+        resolved_input_mode = "raw_abs" if int(model_config.in_channels) == 2 else "raw"
+    else:
+        resolved_input_mode = str(args.input_mode)
+    if _input_mode_to_channels(resolved_input_mode) != int(model_config.in_channels):
+        raise ValueError(
+            f"input_mode={resolved_input_mode!r} produces {_input_mode_to_channels(resolved_input_mode)} channels, "
+            f"but model_config.in_channels={model_config.in_channels}. Use --input-mode auto for checkpoint resume."
+        )
+    args.resolved_input_mode = resolved_input_mode
+    print(f"Input mode: {resolved_input_mode} ({model_config.in_channels} channel{'s' if int(model_config.in_channels) != 1 else ''})")
+
+    dataset_config = WindowDatasetConfig(
+        window_seconds=float(args.window_seconds),
+        time_downsample=int(max(1, args.time_downsample)),
+        samples_per_folder=int(max(1, args.steps_per_epoch)),
+        min_visible_channels=int(max(1, args.min_visible_channels)),
+        input_mode=resolved_input_mode,
+        seed=int(args.seed),
+    )
+    dataset = _build_online_dataset(args, length=int(args.steps_per_epoch), seed=int(args.seed))
+    val_dataset = None
+    val_loader = None
+    if int(args.val_steps) > 0:
+        val_dataset = _build_online_dataset(args, length=int(args.val_steps), seed=int(args.seed) + 10_000_000)
     model = TrajectorySetPredictor(model_config).to(device)
+    adapted_state = False
     if resume_checkpoint is not None:
-        missing, unexpected = model.load_state_dict(resume_checkpoint["model_state"], strict=False)
+        model_state, adapted_state = _adapt_checkpoint_model_state(resume_checkpoint["model_state"], model.state_dict())
+        missing, unexpected = model.load_state_dict(model_state, strict=False)
         if missing or unexpected:
             print(f"Resume load_state_dict: missing={len(missing)}, unexpected={len(unexpected)}", flush=True)
+        if adapted_state:
+            print("Adapted checkpoint weights for the current model shape; optimizer state will not be loaded.", flush=True)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
-    if resume_checkpoint is not None and not bool(args.resume_model_only) and "optimizer_state" in resume_checkpoint:
+    if resume_checkpoint is not None and not adapted_state and not bool(args.resume_model_only) and "optimizer_state" in resume_checkpoint:
         optimizer.load_state_dict(resume_checkpoint["optimizer_state"])
         _move_optimizer_state_to_device(optimizer, device)
         print("Loaded optimizer state from checkpoint.", flush=True)
