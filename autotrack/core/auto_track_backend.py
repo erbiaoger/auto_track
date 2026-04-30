@@ -763,6 +763,7 @@ class AutoTrackBackend:
         gpu_device_id: int = 0,
         enable_template_enhancement: bool = False,
         dl_model_path: str = "",
+        dl_model_family: str = "auto",
         dl_device: str = "",
         dl_objectness_threshold: float = 0.5,
         dl_visibility_threshold: float = 0.5,
@@ -852,6 +853,7 @@ class AutoTrackBackend:
             engine_text = "Deep Learning(Trajectory Queries)"
             extract_config = {
                 "model_path": str(dl_model_path).strip(),
+                "model_family": str(dl_model_family).strip() or "auto",
                 "device": str(dl_device).strip() or None,
                 "objectness_threshold": float(dl_objectness_threshold),
                 "visibility_threshold": float(dl_visibility_threshold),
@@ -985,6 +987,7 @@ class AutoTrackBackend:
         if engine == "deep_learning":
             extractor_config_summary = {
                 "model_path": str(dl_model_path).strip(),
+                "model_family": str(dl_model_family).strip() or "auto",
                 "device": str(dl_device).strip() or "auto",
                 "objectness_threshold": float(dl_objectness_threshold),
                 "visibility_threshold": float(dl_visibility_threshold),

@@ -40,7 +40,7 @@ import argparse
 import json
 import time
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import asdict
+from dataclasses import asdict, fields
 from functools import partial
 from pathlib import Path
 from typing import Optional
@@ -61,6 +61,7 @@ from autotrack.dl.trajectory_set_model import (
     trajectory_detection_metrics,
     trajectory_set_loss,
 )
+from autotrack.dl import query_mask_instance_model as mask_model
 
 plt.rcParams["font.family"] = "Times New Roman"
 
@@ -95,6 +96,8 @@ class OnlineSyntheticTrajectoryDataset(Dataset):
         clip_ratio: float,
         input_mode: str,
         seed: int,
+        mask_sigma_ch: float = 0.8,
+        mask_sigma_t: float = 2.0,
         cache_dataset: bool = False,
         cache_dtype: str = "float16",
         cache_build_workers: int = 0,
@@ -126,6 +129,9 @@ class OnlineSyntheticTrajectoryDataset(Dataset):
         self.clip_ratio = float(clip_ratio)
         self.input_mode = str(input_mode).lower()
         self.seed = int(seed)
+        self.mask_sigma_ch = float(max(1e-3, mask_sigma_ch))
+        self.mask_sigma_t = float(max(1e-3, mask_sigma_t))
+        self.ds_samples = int(max(1, len(range(0, self.window_samples, self.time_downsample))))
         self.cache_dataset = bool(cache_dataset)
         self.cache_dtype = str(cache_dtype).lower()
         self.cache_build_workers = int(max(0, cache_build_workers))
@@ -208,8 +214,22 @@ class OnlineSyntheticTrajectoryDataset(Dataset):
             "clip_ratio": self.clip_ratio,
             "input_mode": self.input_mode,
             "seed": self.seed,
+            "mask_sigma_ch": self.mask_sigma_ch,
+            "mask_sigma_t": self.mask_sigma_t,
             "cache_dtype": self.cache_dtype,
         }
+
+    def _render_instance_mask(self, center_idx: torch.Tensor, visible: torch.Tensor) -> torch.Tensor:
+        ch_axis = torch.arange(self.n_channels, dtype=torch.float32).view(-1, 1)
+        t_axis = torch.arange(self.ds_samples, dtype=torch.float32).view(1, -1)
+        mask = torch.zeros((self.n_channels, self.ds_samples), dtype=torch.float32)
+        idx_ds = torch.div(center_idx.to(torch.long), int(max(1, self.time_downsample)), rounding_mode="floor")
+        idx_ds = idx_ds.clamp(0, self.ds_samples - 1)
+        for ch in torch.where(visible)[0].tolist():
+            gc = torch.exp(-0.5 * ((ch_axis - float(ch)) / self.mask_sigma_ch) ** 2)
+            gt = torch.exp(-0.5 * ((t_axis - float(idx_ds[ch].item())) / self.mask_sigma_t) ** 2)
+            mask = torch.maximum(mask, gc * gt)
+        return mask.clamp(0.0, 1.0)
 
     def _cache_x(self, x: torch.Tensor) -> torch.Tensor:
         if self.cache_dtype in {"float16", "fp16", "half"}:
@@ -235,6 +255,7 @@ class OnlineSyntheticTrajectoryDataset(Dataset):
         dir_rows: list[int] = []
         speed_rows: list[float] = []
         track_ids: list[int] = []
+        mask_rows: list[torch.Tensor] = []
 
         channel_index = torch.arange(self.n_channels, dtype=torch.float32)
         track_id = 0
@@ -293,6 +314,7 @@ class OnlineSyntheticTrajectoryDataset(Dataset):
             dir_rows.append(direction_label)
             speed_rows.append(speed_kmh / max(1e-6, self.speed_norm_kmh))
             track_ids.append(track_id)
+            mask_rows.append(self._render_instance_mask(center_idx=center_idx, visible=visible))
             track_id += 1
 
         x = self._prepare_input(data)
@@ -305,6 +327,7 @@ class OnlineSyntheticTrajectoryDataset(Dataset):
                 "direction": torch.tensor(dir_rows, dtype=torch.long),
                 "speed": torch.tensor(speed_rows, dtype=torch.float32),
                 "track_id": torch.tensor(track_ids, dtype=torch.long),
+                "gt_masks": torch.stack(mask_rows, dim=0),
             }
         else:
             target = {
@@ -313,6 +336,7 @@ class OnlineSyntheticTrajectoryDataset(Dataset):
                 "direction": torch.zeros((0,), dtype=torch.long),
                 "speed": torch.zeros((0,), dtype=torch.float32),
                 "track_id": torch.zeros((0,), dtype=torch.long),
+                "gt_masks": torch.zeros((0, self.n_channels, self.ds_samples), dtype=torch.float32),
             }
         return x, target
 
@@ -353,6 +377,12 @@ def _generate_cached_online_item(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train trajectory-query model with online synthetic windows.")
+    parser.add_argument(
+        "--model-family",
+        default="query_masks",
+        choices=["query_points", "query_masks", "auto"],
+        help="Model family. query_points is legacy polyline set prediction; query_masks is query mask instance segmentation.",
+    )
     parser.add_argument("--out-dir", required=True, type=Path, help="Output directory for checkpoints.")
     parser.add_argument("--epochs", type=int, default=20, help="Number of epochs.")
     parser.add_argument(
@@ -433,6 +463,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pooled-channels", type=int, default=8, help="Pooled feature channel dimension.")
     parser.add_argument("--pooled-time", type=int, default=128, help="Pooled feature time dimension.")
     parser.add_argument("--trajectory-points", type=int, default=32, help="Polyline points predicted per trajectory query.")
+    parser.add_argument("--mask-sigma-ch", type=float, default=0.8, help="Gaussian sigma on channel axis for synthetic instance masks.")
+    parser.add_argument("--mask-sigma-t", type=float, default=2.0, help="Gaussian sigma on downsampled time axis for synthetic instance masks.")
+    parser.add_argument("--loss-warmup-epochs", type=int, default=8, help="Disable duplicate/dn auxiliary losses before this epoch for query_masks.")
     parser.add_argument("--denoising-queries", type=int, default=32, help="Maximum denoising GT queries appended during training.")
     parser.add_argument("--dn-point-noise", type=float, default=0.04, help="Normalized coordinate noise added to denoising GT polyline inputs.")
     parser.add_argument("--device", default="", help="Torch device: cuda, mps, cpu, or empty for auto.")
@@ -487,6 +520,11 @@ def _append_history_row(path: Path, row: dict[str, float | int | str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as fp:
         fp.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def _filter_dataclass_kwargs(cls: type, raw: dict[str, object]) -> dict[str, object]:
+    names = {f.name for f in fields(cls)}
+    return {k: v for k, v in raw.items() if k in names}
 
 
 def _input_mode_to_channels(input_mode: str) -> int:
@@ -564,6 +602,8 @@ def _build_online_dataset(args: argparse.Namespace, *, length: int, seed: int) -
         clip_ratio=float(dataset_config.clip_ratio),
         input_mode=str(args.resolved_input_mode),
         seed=int(seed),
+        mask_sigma_ch=float(args.mask_sigma_ch),
+        mask_sigma_t=float(args.mask_sigma_t),
         cache_dataset=bool(args.cache_dataset),
         cache_dtype=str(args.cache_dtype),
         cache_build_workers=int(args.cache_build_workers),
@@ -571,9 +611,10 @@ def _build_online_dataset(args: argparse.Namespace, *, length: int, seed: int) -
 
 
 def _evaluate(
-    model: TrajectorySetPredictor,
+    model: torch.nn.Module,
     loader: DataLoader,
     device: str,
+    model_family: str,
     no_object_weight: float,
     duplicate_loss_weight: float,
     duplicate_distance_tau: float,
@@ -591,27 +632,49 @@ def _evaluate(
             x = x.to(device, non_blocking=(device == "cuda"))
             targets = move_targets_to_device(targets, device, non_blocking=(device == "cuda"))
             outputs = model(x)
-            _, metrics = trajectory_set_loss(
-                outputs,
-                targets,
-                no_object_weight=float(no_object_weight),
-                duplicate_loss_weight=float(duplicate_loss_weight),
-                duplicate_distance_tau=float(duplicate_distance_tau),
-                denoising_loss_weight=float(denoising_loss_weight),
-                line_loss_weight=float(line_loss_weight),
-                slope_smooth_loss_weight=float(slope_smooth_loss_weight),
-                matcher=str(matcher),
-                collect_metrics=True,
-            )
-            metrics.update(
-                trajectory_detection_metrics(
+            if str(model_family) == "query_masks":
+                _, metrics = mask_model.query_mask_set_loss(
                     outputs,
                     targets,
-                    objectness_threshold=float(metric_objectness_threshold),
-                    point_threshold=float(metric_point_threshold),
+                    no_object_weight=float(no_object_weight),
+                    duplicate_loss_weight=float(duplicate_loss_weight),
+                    denoising_loss_weight=float(denoising_loss_weight),
                     matcher=str(matcher),
+                    collect_metrics=True,
+                    epoch=10**9,
+                    warmup_epochs=0,
                 )
-            )
+                metrics.update(
+                    mask_model.query_mask_detection_metrics(
+                        outputs,
+                        targets,
+                        objectness_threshold=float(metric_objectness_threshold),
+                        iou_threshold=float(metric_point_threshold),
+                        matcher=str(matcher),
+                    )
+                )
+            else:
+                _, metrics = trajectory_set_loss(
+                    outputs,
+                    targets,
+                    no_object_weight=float(no_object_weight),
+                    duplicate_loss_weight=float(duplicate_loss_weight),
+                    duplicate_distance_tau=float(duplicate_distance_tau),
+                    denoising_loss_weight=float(denoising_loss_weight),
+                    line_loss_weight=float(line_loss_weight),
+                    slope_smooth_loss_weight=float(slope_smooth_loss_weight),
+                    matcher=str(matcher),
+                    collect_metrics=True,
+                )
+                metrics.update(
+                    trajectory_detection_metrics(
+                        outputs,
+                        targets,
+                        objectness_threshold=float(metric_objectness_threshold),
+                        point_threshold=float(metric_point_threshold),
+                        matcher=str(matcher),
+                    )
+                )
             metrics_items.append(metrics)
     return _mean_metrics(metrics_items)
 
@@ -634,7 +697,7 @@ def _target_to_tracks(target: dict[str, torch.Tensor], fs: float, window_samples
 
 
 def _predict_plot_tracks(
-    model: TrajectorySetPredictor,
+    model: torch.nn.Module,
     x: torch.Tensor,
     fs: float,
     window_samples: int,
@@ -649,7 +712,11 @@ def _predict_plot_tracks(
         outputs = model(x.unsqueeze(0).to(device))
     obj = torch.sigmoid(outputs["objectness_logits"][0]).detach().cpu()
     dirs = torch.argmax(outputs["direction_logits"][0], dim=-1).detach().cpu()
-    if "points" in outputs and "point_valid_logits" in outputs:
+    if "mask_logits" in outputs:
+        valid_prob = torch.sigmoid(outputs["mask_logits"][0]).detach().cpu()
+        point_coords = None
+        visibility_source = valid_prob
+    elif "points" in outputs and "point_valid_logits" in outputs:
         valid_prob = torch.sigmoid(outputs["point_valid_logits"][0]).detach().cpu()
         point_coords = outputs["points"][0].detach().cpu()
         visibility_source = valid_prob
@@ -671,7 +738,18 @@ def _predict_plot_tracks(
         if float(obj[q_idx]) < float(objectness_threshold):
             continue
         pts = []
-        if point_coords.ndim == 3:
+        if point_coords is None:
+            for ch in range(int(valid_prob.shape[1])):
+                row = valid_prob[q_idx, ch]
+                vmax = float(torch.max(row).item())
+                if vmax < float(visibility_threshold):
+                    continue
+                t_ds = int(torch.argmax(row).item())
+                t_idx = int(round(float(t_ds) * float(max(1, window_samples - 1)) / float(max(1, int(valid_prob.shape[-1]) - 1))))
+                pts.append((float(ch) * float(dx_m) * 1e-3, float(t_idx) / float(fs), int(ch), int(t_idx)))
+            if len(pts) < 2:
+                continue
+        elif point_coords.ndim == 3:
             keep = torch.where(valid_prob[q_idx] >= float(visibility_threshold))[0].tolist()
             if len(keep) < 2:
                 continue
@@ -820,12 +898,19 @@ def main() -> int:
 
     resume_checkpoint = None
     resume_epoch = 0
+    resumed_family = "query_points"
     if args.resume is not None:
         resume_path = Path(args.resume).expanduser()
         print(f"Resuming from checkpoint: {resume_path}", flush=True)
         resume_checkpoint = torch.load(str(resume_path), map_location="cpu", weights_only=False)
         resume_epoch = int(resume_checkpoint.get("epoch", 0))
-        model_config = ModelConfig(**dict(resume_checkpoint["model_config"]))
+        resumed_family = str(resume_checkpoint.get("model_family", "query_points"))
+        if str(args.model_family) == "auto":
+            args.model_family = resumed_family
+        if str(args.model_family) == "query_masks":
+            model_config = mask_model.ModelConfig(**_filter_dataclass_kwargs(mask_model.ModelConfig, dict(resume_checkpoint["model_config"])))
+        else:
+            model_config = ModelConfig(**_filter_dataclass_kwargs(ModelConfig, dict(resume_checkpoint["model_config"])))
         if str(args.input_mode) != "auto":
             requested_channels = _input_mode_to_channels(str(args.input_mode))
             if requested_channels != int(model_config.in_channels):
@@ -835,20 +920,41 @@ def main() -> int:
                 )
                 model_config.in_channels = requested_channels
     else:
+        if str(args.model_family) == "auto":
+            args.model_family = "query_masks"
         requested_mode = "raw" if str(args.input_mode) == "auto" else str(args.input_mode)
-        model_config = ModelConfig(
-            n_channels=int(args.n_ch),
-            in_channels=_input_mode_to_channels(requested_mode),
-            max_queries=int(args.max_queries),
-            hidden_dim=int(args.hidden_dim),
-            num_heads=int(args.num_heads),
-            decoder_layers=int(args.decoder_layers),
-            pooled_channels=int(args.pooled_channels),
-            pooled_time=int(args.pooled_time),
-            trajectory_points=int(args.trajectory_points),
-            denoising_queries=int(args.denoising_queries),
-            dn_point_noise=float(args.dn_point_noise),
+        if str(args.model_family) == "query_masks":
+            model_config = mask_model.ModelConfig(
+                n_channels=int(args.n_ch),
+                in_channels=_input_mode_to_channels(requested_mode),
+                max_queries=int(args.max_queries),
+                hidden_dim=int(args.hidden_dim),
+                num_heads=int(args.num_heads),
+                decoder_layers=int(args.decoder_layers),
+                pooled_channels=int(args.pooled_channels),
+                pooled_time=int(args.pooled_time),
+            )
+        else:
+            model_config = ModelConfig(
+                n_channels=int(args.n_ch),
+                in_channels=_input_mode_to_channels(requested_mode),
+                max_queries=int(args.max_queries),
+                hidden_dim=int(args.hidden_dim),
+                num_heads=int(args.num_heads),
+                decoder_layers=int(args.decoder_layers),
+                pooled_channels=int(args.pooled_channels),
+                pooled_time=int(args.pooled_time),
+                trajectory_points=int(args.trajectory_points),
+                denoising_queries=int(args.denoising_queries),
+                dn_point_noise=float(args.dn_point_noise),
+            )
+    if args.resume is not None and str(args.model_family) != "auto" and str(args.model_family) != str(resumed_family):
+        print(
+            f"Warning: requested model_family={args.model_family} but checkpoint is {resumed_family}; keeping requested value.",
+            flush=True,
         )
+    resolved_model_family = str(args.model_family)
+    args.resolved_model_family = resolved_model_family
     if str(args.input_mode) == "auto":
         resolved_input_mode = "raw_abs" if int(model_config.in_channels) == 2 else "raw"
     else:
@@ -860,6 +966,7 @@ def main() -> int:
         )
     args.resolved_input_mode = resolved_input_mode
     print(f"Input mode: {resolved_input_mode} ({model_config.in_channels} channel{'s' if int(model_config.in_channels) != 1 else ''})")
+    print(f"Model family: {resolved_model_family}")
 
     dataset_config = WindowDatasetConfig(
         window_seconds=float(args.window_seconds),
@@ -874,7 +981,10 @@ def main() -> int:
     val_loader = None
     if int(args.val_steps) > 0:
         val_dataset = _build_online_dataset(args, length=int(args.val_steps), seed=int(args.seed) + 10_000_000)
-    model = TrajectorySetPredictor(model_config).to(device)
+    if resolved_model_family == "query_masks":
+        model = mask_model.QueryMaskInstancePredictor(model_config).to(device)
+    else:
+        model = TrajectorySetPredictor(model_config).to(device)
     adapted_state = False
     if resume_checkpoint is not None:
         model_state, adapted_state = _adapt_checkpoint_model_state(resume_checkpoint["model_state"], model.state_dict())
@@ -890,12 +1000,23 @@ def main() -> int:
         print("Loaded optimizer state from checkpoint.", flush=True)
     elif resume_checkpoint is not None:
         print("Loaded model weights only; optimizer starts from scratch.", flush=True)
+    if resolved_model_family == "query_masks":
+        collate_fn = partial(
+            mask_model.mask_trajectory_collate,
+            n_channels=int(model_config.n_channels),
+            time_downsample=int(args.time_downsample),
+            sigma_ch=float(args.mask_sigma_ch),
+            sigma_t=float(args.mask_sigma_t),
+        )
+    else:
+        collate_fn = partial(trajectory_collate, trajectory_points=int(model_config.trajectory_points))
+
     loader = DataLoader(
         dataset,
         batch_size=int(args.batch_size),
         shuffle=True,
         num_workers=int(args.num_workers),
-        collate_fn=partial(trajectory_collate, trajectory_points=int(model_config.trajectory_points)),
+        collate_fn=collate_fn,
         drop_last=False,
         pin_memory=(device == "cuda"),
     )
@@ -905,7 +1026,7 @@ def main() -> int:
             batch_size=int(args.batch_size),
             shuffle=False,
             num_workers=int(args.num_workers),
-            collate_fn=partial(trajectory_collate, trajectory_points=int(model_config.trajectory_points)),
+            collate_fn=collate_fn,
             drop_last=False,
             pin_memory=(device == "cuda"),
         )
@@ -913,6 +1034,7 @@ def main() -> int:
     args.out_dir.mkdir(parents=True, exist_ok=True)
     config_payload = {
         "mode": "online_synthetic",
+        "model_family": resolved_model_family,
         "dataset_config": asdict(dataset_config),
         "model_config": asdict(model_config),
         "online_args": {
@@ -938,7 +1060,7 @@ def main() -> int:
         "Model: "
         f"queries={model_config.max_queries}, hidden_dim={model_config.hidden_dim}, "
         f"decoder_layers={model_config.decoder_layers}, pooled=({model_config.pooled_channels}, {model_config.pooled_time}), "
-        f"trajectory_points={model_config.trajectory_points}"
+        f"trajectory_points={getattr(model_config, 'trajectory_points', 'n/a')}"
     )
     print(f"Training speed: matcher={args.matcher}, metrics_every={int(args.metrics_every)}")
 
@@ -971,18 +1093,31 @@ def main() -> int:
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=bool(use_amp and str(device).startswith("cuda"))):
                 outputs = model(x, targets=targets)
-                loss, metrics = trajectory_set_loss(
-                    outputs,
-                    targets,
-                    no_object_weight=float(args.no_object_weight),
-                    duplicate_loss_weight=float(args.duplicate_loss_weight),
-                    duplicate_distance_tau=float(args.duplicate_distance_tau),
-                    denoising_loss_weight=float(args.denoising_loss_weight),
-                    line_loss_weight=float(args.line_loss_weight),
-                    slope_smooth_loss_weight=float(args.slope_smooth_loss_weight),
-                    matcher=str(args.matcher),
-                    collect_metrics=bool(collect_metrics),
-                )
+                if resolved_model_family == "query_masks":
+                    loss, metrics = mask_model.query_mask_set_loss(
+                        outputs,
+                        targets,
+                        no_object_weight=float(args.no_object_weight),
+                        duplicate_loss_weight=float(args.duplicate_loss_weight),
+                        denoising_loss_weight=float(args.denoising_loss_weight),
+                        matcher=str(args.matcher),
+                        collect_metrics=bool(collect_metrics),
+                        epoch=int(epoch),
+                        warmup_epochs=int(args.loss_warmup_epochs),
+                    )
+                else:
+                    loss, metrics = trajectory_set_loss(
+                        outputs,
+                        targets,
+                        no_object_weight=float(args.no_object_weight),
+                        duplicate_loss_weight=float(args.duplicate_loss_weight),
+                        duplicate_distance_tau=float(args.duplicate_distance_tau),
+                        denoising_loss_weight=float(args.denoising_loss_weight),
+                        line_loss_weight=float(args.line_loss_weight),
+                        slope_smooth_loss_weight=float(args.slope_smooth_loss_weight),
+                        matcher=str(args.matcher),
+                        collect_metrics=bool(collect_metrics),
+                    )
             scaler.scale(loss).backward()
             if float(args.grad_clip) > 0:
                 scaler.unscale_(optimizer)
@@ -990,15 +1125,26 @@ def main() -> int:
             scaler.step(optimizer)
             scaler.update()
             if metrics:
-                metrics.update(
-                    trajectory_detection_metrics(
-                        outputs,
-                        targets,
-                        objectness_threshold=float(args.metric_objectness_threshold),
-                        point_threshold=float(args.metric_point_threshold),
-                        matcher=str(args.matcher),
+                if resolved_model_family == "query_masks":
+                    metrics.update(
+                        mask_model.query_mask_detection_metrics(
+                            outputs,
+                            targets,
+                            objectness_threshold=float(args.metric_objectness_threshold),
+                            iou_threshold=float(args.metric_point_threshold),
+                            matcher=str(args.matcher),
+                        )
                     )
-                )
+                else:
+                    metrics.update(
+                        trajectory_detection_metrics(
+                            outputs,
+                            targets,
+                            objectness_threshold=float(args.metric_objectness_threshold),
+                            point_threshold=float(args.metric_point_threshold),
+                            matcher=str(args.matcher),
+                        )
+                    )
                 epoch_metrics.append(metrics)
             if should_log_batch and metrics:
                 print(
@@ -1046,6 +1192,7 @@ def main() -> int:
                 model,
                 val_loader,
                 device,
+                model_family=resolved_model_family,
                 no_object_weight=float(args.no_object_weight),
                 duplicate_loss_weight=float(args.duplicate_loss_weight),
                 duplicate_distance_tau=float(args.duplicate_distance_tau),
@@ -1084,13 +1231,19 @@ def main() -> int:
             last_path = args.out_dir / "checkpoint_last.pt"
             checkpoint_metrics = dict(mean_metrics)
             checkpoint_metrics.update({f"val_{key}": value for key, value in val_metrics.items()})
-            save_checkpoint(last_path, model, optimizer, model_config, dataset_config, epoch, checkpoint_metrics)
+            if resolved_model_family == "query_masks":
+                mask_model.save_checkpoint(last_path, model, optimizer, model_config, dataset_config, epoch, checkpoint_metrics)
+            else:
+                save_checkpoint(last_path, model, optimizer, model_config, dataset_config, epoch, checkpoint_metrics)
             print(f"Saved checkpoint: {last_path}", flush=True)
             current_loss = float(val_metrics.get("loss", mean_metrics.get("loss", float("inf"))))
             if current_loss < best_loss:
                 best_loss = current_loss
                 best_path = args.out_dir / "checkpoint_best.pt"
-                save_checkpoint(best_path, model, optimizer, model_config, dataset_config, epoch, checkpoint_metrics)
+                if resolved_model_family == "query_masks":
+                    mask_model.save_checkpoint(best_path, model, optimizer, model_config, dataset_config, epoch, checkpoint_metrics)
+                else:
+                    save_checkpoint(best_path, model, optimizer, model_config, dataset_config, epoch, checkpoint_metrics)
                 print(f"Saved new best checkpoint: {best_path}", flush=True)
 
         if int(args.plot_every) > 0 and epoch % int(args.plot_every) == 0:

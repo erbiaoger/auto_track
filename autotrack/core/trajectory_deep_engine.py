@@ -11,30 +11,41 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
+import torch
 
 from autotrack.core.track_extractor_graph import Track
-from autotrack.dl.trajectory_set_model import (
-    InferenceConfig,
-    auto_torch_device,
-    load_checkpoint_model,
-    predict_tracks_from_window,
-)
+from autotrack.dl.trajectory_set_model import auto_torch_device
 
 
-_MODEL_CACHE: dict[tuple[str, str], tuple[object, dict]] = {}
+_MODEL_CACHE: dict[tuple[str, str, str], tuple[object, dict, str]] = {}
 
 
-def _load_cached_model(model_path: str, device: Optional[str]):
+def _resolve_model_family(model_path: str, requested_family: Optional[str]) -> str:
+    family = str(requested_family or "").strip().lower()
+    if family in {"query_points", "query_masks"}:
+        return family
+    checkpoint = torch.load(str(Path(model_path).expanduser()), map_location="cpu", weights_only=False)
+    return str(checkpoint.get("model_family", "query_points")).strip().lower()
+
+
+def _load_cached_model(model_path: str, device: Optional[str], model_family: str):
     path = str(Path(model_path).expanduser().resolve())
     raw_device = str(device or "").strip()
     resolved_device = auto_torch_device() if raw_device in {"", "auto", "None"} else raw_device
-    key = (path, resolved_device)
+    key = (path, resolved_device, model_family)
     cached = _MODEL_CACHE.get(key)
     if cached is not None:
         return cached
-    model, checkpoint = load_checkpoint_model(path, device=resolved_device)
-    _MODEL_CACHE[key] = (model, checkpoint)
-    return model, checkpoint
+    if model_family == "query_masks":
+        from autotrack.dl import query_mask_instance_model as mm
+
+        model, checkpoint = mm.load_checkpoint_model(path, device=resolved_device)
+    else:
+        from autotrack.dl import trajectory_set_model as pm
+
+        model, checkpoint = pm.load_checkpoint_model(path, device=resolved_device)
+    _MODEL_CACHE[key] = (model, checkpoint, model_family)
+    return model, checkpoint, model_family
 
 
 def _resolve_device(device: Optional[str]) -> str:
@@ -58,22 +69,42 @@ def extract_all_deep_learning(
         raise ValueError("Deep-learning engine requires model_path in config")
 
     resolved_device = _resolve_device(cfg.get("device"))
-    model, checkpoint = _load_cached_model(model_path, resolved_device)
+    model_family = _resolve_model_family(model_path, cfg.get("model_family"))
+    model, checkpoint, model_family = _load_cached_model(model_path, resolved_device, model_family)
     dataset_cfg = dict(checkpoint.get("dataset_config", {}))
-    inference_cfg = InferenceConfig(
-        time_downsample=int(cfg.get("time_downsample", dataset_cfg.get("time_downsample", 10))),
-        objectness_threshold=float(cfg.get("objectness_threshold", 0.5)),
-        visibility_threshold=float(cfg.get("visibility_threshold", 0.5)),
-        min_visible_channels=int(cfg.get("min_visible_channels", 3)),
-        refine_radius_samples=int(cfg.get("refine_radius_samples", 120)),
-        max_tracks=int(cfg.get("max_tracks", 128)),
-        dedup_tolerance_samples=int(cfg.get("dedup_tolerance_samples", 180)),
-        speed_norm_kmh=float(dataset_cfg.get("speed_norm_kmh", 150.0)),
-        clip_ratio=float(dataset_cfg.get("clip_ratio", 1.35)),
-    )
+    if model_family == "query_masks":
+        from autotrack.dl import query_mask_instance_model as mm
+
+        inference_cfg = mm.InferenceConfig(
+            time_downsample=int(cfg.get("time_downsample", dataset_cfg.get("time_downsample", 10))),
+            objectness_threshold=float(cfg.get("objectness_threshold", 0.5)),
+            visibility_threshold=float(cfg.get("visibility_threshold", 0.5)),
+            min_visible_channels=int(cfg.get("min_visible_channels", 3)),
+            refine_radius_samples=int(cfg.get("refine_radius_samples", 120)),
+            max_tracks=int(cfg.get("max_tracks", 128)),
+            dedup_tolerance_samples=int(cfg.get("dedup_tolerance_samples", 180)),
+            speed_norm_kmh=float(dataset_cfg.get("speed_norm_kmh", 150.0)),
+            clip_ratio=float(dataset_cfg.get("clip_ratio", 1.35)),
+        )
+        predict_fn = mm.predict_tracks_from_window
+    else:
+        from autotrack.dl import trajectory_set_model as pm
+
+        inference_cfg = pm.InferenceConfig(
+            time_downsample=int(cfg.get("time_downsample", dataset_cfg.get("time_downsample", 10))),
+            objectness_threshold=float(cfg.get("objectness_threshold", 0.5)),
+            visibility_threshold=float(cfg.get("visibility_threshold", 0.5)),
+            min_visible_channels=int(cfg.get("min_visible_channels", 3)),
+            refine_radius_samples=int(cfg.get("refine_radius_samples", 120)),
+            max_tracks=int(cfg.get("max_tracks", 128)),
+            dedup_tolerance_samples=int(cfg.get("dedup_tolerance_samples", 180)),
+            speed_norm_kmh=float(dataset_cfg.get("speed_norm_kmh", 150.0)),
+            clip_ratio=float(dataset_cfg.get("clip_ratio", 1.35)),
+        )
+        predict_fn = pm.predict_tracks_from_window
     arr = np.asarray(data, dtype=np.float32)
     x_axis_m = np.arange(arr.shape[0], dtype=np.float64) * float(dx_m)
-    return predict_tracks_from_window(
+    return predict_fn(
         model=model,
         data_window=arr,
         fs=float(fs),

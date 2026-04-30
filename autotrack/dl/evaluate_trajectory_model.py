@@ -29,23 +29,26 @@ import json
 from pathlib import Path
 
 import numpy as np
+import torch
 from scipy.optimize import linear_sum_assignment
 
 from autotrack.dl.trajectory_set_model import (
-    InferenceConfig,
     Track,
     TrackPoint,
-    load_checkpoint_model,
-    load_sac_matrix,
-    load_tracks_json,
-    predict_tracks_from_window,
 )
+from autotrack.dl.trajectory_set_model import load_sac_matrix, load_tracks_json
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate trajectory-query model on simulated SAC data.")
     parser.add_argument("--data-folder", required=True, help="SAC data folder containing tracks.json.")
     parser.add_argument("--model", required=True, help="Trajectory model checkpoint path.")
+    parser.add_argument(
+        "--model-family",
+        default="query_masks",
+        choices=["auto", "query_points", "query_masks"],
+        help="Model family. auto reads from checkpoint metadata.",
+    )
     parser.add_argument("--out-json", default="", help="Optional evaluation JSON output path.")
     parser.add_argument("--device", default="", help="Torch device: cuda, mps, cpu, or empty for auto.")
     parser.add_argument("--window-count", type=int, default=50, help="Number of sampled evaluation windows.")
@@ -124,17 +127,39 @@ def main() -> int:
     args = parse_args()
     data, fs, x_axis_m, _ = load_sac_matrix(args.data_folder)
     payload = load_tracks_json(args.data_folder)
-    model, checkpoint = load_checkpoint_model(args.model, device=str(args.device).strip() or None)
+    family = str(args.model_family)
+    if family == "auto":
+        checkpoint_meta = torch.load(str(Path(args.model).expanduser()), map_location="cpu", weights_only=False)
+        family = str(checkpoint_meta.get("model_family", "query_points"))
+    if family == "query_masks":
+        from autotrack.dl import query_mask_instance_model as mm
+
+        model, checkpoint = mm.load_checkpoint_model(args.model, device=str(args.device).strip() or None)
+        infer_cfg = mm.InferenceConfig(
+            time_downsample=int(dict(checkpoint.get("dataset_config", {})).get("time_downsample", 10)),
+            objectness_threshold=float(args.objectness_threshold),
+            visibility_threshold=float(args.visibility_threshold),
+            min_visible_channels=int(args.min_visible_channels),
+            refine_radius_samples=int(args.refine_radius_samples),
+            speed_norm_kmh=float(dict(checkpoint.get("dataset_config", {})).get("speed_norm_kmh", 150.0)),
+            clip_ratio=float(dict(checkpoint.get("dataset_config", {})).get("clip_ratio", 1.35)),
+        )
+        predict_fn = mm.predict_tracks_from_window
+    else:
+        from autotrack.dl import trajectory_set_model as pm
+
+        model, checkpoint = pm.load_checkpoint_model(args.model, device=str(args.device).strip() or None)
+        infer_cfg = pm.InferenceConfig(
+            time_downsample=int(dict(checkpoint.get("dataset_config", {})).get("time_downsample", 10)),
+            objectness_threshold=float(args.objectness_threshold),
+            visibility_threshold=float(args.visibility_threshold),
+            min_visible_channels=int(args.min_visible_channels),
+            refine_radius_samples=int(args.refine_radius_samples),
+            speed_norm_kmh=float(dict(checkpoint.get("dataset_config", {})).get("speed_norm_kmh", 150.0)),
+            clip_ratio=float(dict(checkpoint.get("dataset_config", {})).get("clip_ratio", 1.35)),
+        )
+        predict_fn = pm.predict_tracks_from_window
     dataset_cfg = dict(checkpoint.get("dataset_config", {}))
-    infer_cfg = InferenceConfig(
-        time_downsample=int(dataset_cfg.get("time_downsample", 10)),
-        objectness_threshold=float(args.objectness_threshold),
-        visibility_threshold=float(args.visibility_threshold),
-        min_visible_channels=int(args.min_visible_channels),
-        refine_radius_samples=int(args.refine_radius_samples),
-        speed_norm_kmh=float(dataset_cfg.get("speed_norm_kmh", 150.0)),
-        clip_ratio=float(dataset_cfg.get("clip_ratio", 1.35)),
-    )
 
     rng = np.random.default_rng(int(args.seed))
     window_samples = int(round(float(args.window_seconds) * float(fs)))
@@ -150,7 +175,7 @@ def main() -> int:
         start = int(rng.integers(0, max_start + 1)) if max_start > 0 else 0
         end = start + window_samples
         gt_tracks = _gt_tracks_for_window(payload, start, end, fs, int(args.min_visible_channels))
-        pred_tracks = predict_tracks_from_window(
+        pred_tracks = predict_fn(
             model=model,
             data_window=data[:, start:end],
             fs=float(fs),

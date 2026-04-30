@@ -9,6 +9,7 @@ BATCH_SIZE=${BATCH_SIZE:-16}
 AMP=${AMP:-auto}
 AMP_DTYPE=${AMP_DTYPE:-float16}
 EPOCHS=${EPOCHS:-400}
+MODEL_FAMILY=${MODEL_FAMILY:-query_masks}
 INPUT_MODE=${INPUT_MODE:-auto}
 RESUME=${RESUME:-models/trajectory_query_online_v1_cuda/checkpoint_last.pt}
 RESUME_MODEL_ONLY=${RESUME_MODEL_ONLY:-0}
@@ -37,6 +38,9 @@ DUPLICATE_DISTANCE_TAU=${DUPLICATE_DISTANCE_TAU:-0.04}
 DENOISING_LOSS_WEIGHT=${DENOISING_LOSS_WEIGHT:-1.0}
 DENOISING_QUERIES=${DENOISING_QUERIES:-32}
 DN_POINT_NOISE=${DN_POINT_NOISE:-0.04}
+MASK_SIGMA_CH=${MASK_SIGMA_CH:-0.8}
+MASK_SIGMA_T=${MASK_SIGMA_T:-2.0}
+LOSS_WARMUP_EPOCHS=${LOSS_WARMUP_EPOCHS:-8}
 LINE_LOSS_WEIGHT=${LINE_LOSS_WEIGHT:-1.0}
 SLOPE_SMOOTH_LOSS_WEIGHT=${SLOPE_SMOOTH_LOSS_WEIGHT:-0.25}
 PLOT_OBJECTNESS_THRESHOLD=${PLOT_OBJECTNESS_THRESHOLD:-0.5}
@@ -96,6 +100,7 @@ uv run python -m autotrack.dl.train_trajectory_online \
   --device "$DEVICE" \
   --amp "$AMP" \
   --amp-dtype "$AMP_DTYPE" \
+  --model-family "$MODEL_FAMILY" \
   --input-mode "$INPUT_MODE" \
   --epochs "$EPOCHS" \
   --steps-per-epoch "$STEPS_PER_EPOCH" \
@@ -118,6 +123,9 @@ uv run python -m autotrack.dl.train_trajectory_online \
   --denoising-loss-weight "$DENOISING_LOSS_WEIGHT" \
   --line-loss-weight "$LINE_LOSS_WEIGHT" \
   --slope-smooth-loss-weight "$SLOPE_SMOOTH_LOSS_WEIGHT" \
+  --mask-sigma-ch "$MASK_SIGMA_CH" \
+  --mask-sigma-t "$MASK_SIGMA_T" \
+  --loss-warmup-epochs "$LOSS_WARMUP_EPOCHS" \
   --batch-size "$BATCH_SIZE" \
   --window-seconds 240 \
   --fs 1000 \

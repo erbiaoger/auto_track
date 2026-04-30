@@ -36,6 +36,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Infer vehicle trajectories with a trained deep-learning model.")
     parser.add_argument("--data-folder", required=True, help="SAC data folder.")
     parser.add_argument("--model", required=True, help="Trajectory model checkpoint path (.pt/.pth).")
+    parser.add_argument(
+        "--model-family",
+        default="query_masks",
+        choices=["auto", "query_points", "query_masks"],
+        help="Model family. auto reads from checkpoint metadata.",
+    )
     parser.add_argument("--out-csv", default="", help="Output CSV path; default is <data-folder>/auto_tracks_deep.csv.")
     parser.add_argument("--device", default="", help="Torch device: cuda, mps, cpu, auto, or empty for auto.")
     parser.add_argument("--window-start-s", type=float, default=0.0, help="Current-window start time in seconds.")
@@ -80,6 +86,7 @@ def main() -> int:
         current_window_only=not bool(args.full_hour),
         engine="deep_learning",
         dl_model_path=str(args.model),
+        dl_model_family=str(args.model_family),
         dl_device=str(args.device),
         dl_objectness_threshold=float(args.objectness_threshold),
         dl_visibility_threshold=float(args.visibility_threshold),
