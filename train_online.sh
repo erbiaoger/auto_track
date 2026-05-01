@@ -58,6 +58,8 @@ SLOW_SPEED_MIN_KMH=${SLOW_SPEED_MIN_KMH:-45}
 SLOW_SPEED_MAX_KMH=${SLOW_SPEED_MAX_KMH:-60}
 FAST_SPEED_MIN_KMH=${FAST_SPEED_MIN_KMH:-95}
 FAST_SPEED_MAX_KMH=${FAST_SPEED_MAX_KMH:-120}
+PULSE_LENGTH_SECONDS=${PULSE_LENGTH_SECONDS:-2.0}
+SIGMA_SECONDS=${SIGMA_SECONDS:-$(awk "BEGIN{printf \"%.6f\", ${PULSE_LENGTH_SECONDS}/8.0}")}
 
 # Mirrors the main offline dataset distribution:
 # - 240 s windows use about 40 visible vehicles by default.
@@ -83,6 +85,9 @@ FAST_SPEED_MAX_KMH=${FAST_SPEED_MAX_KMH:-120}
 #   the final target epoch, so epoch 118 with EPOCHS=400 continues at 119.
 # - Current online generator is constant-speed only; use offline finetuning for
 #   accel/decel/stop-go after this fast pretraining.
+# - Pulse length is fixed by sigma. Current generator uses ±4σ truncation
+#   (about 8σ total width), so PULSE_LENGTH_SECONDS=2.0 corresponds to
+#   SIGMA_SECONDS=0.25.
 cache_args=""
 if [ "$CACHE_DATASET" = "1" ] || [ "$CACHE_DATASET" = "true" ]; then
   cache_args="--cache-dataset --cache-dtype $CACHE_DTYPE --cache-build-workers $CACHE_BUILD_WORKERS"
@@ -144,8 +149,8 @@ uv run python -m autotrack.dl.train_trajectory_online \
   --noise-std "$NOISE_STD" \
   --amp-min 6.0 \
   --amp-max 6.0 \
-  --sigma-min-s 0.06 \
-  --sigma-max-s 0.18 \
+  --sigma-min-s "$SIGMA_SECONDS" \
+  --sigma-max-s "$SIGMA_SECONDS" \
   --primary-ratio 0.8333333333 \
   --max-queries "$MAX_QUERIES" \
   --hidden-dim "$HIDDEN_DIM" \
