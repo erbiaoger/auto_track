@@ -22,7 +22,7 @@ _MODEL_CACHE: dict[tuple[str, str, str], tuple[object, dict, str]] = {}
 
 def _resolve_model_family(model_path: str, requested_family: Optional[str]) -> str:
     family = str(requested_family or "").strip().lower()
-    if family in {"query_points", "query_masks"}:
+    if family in {"query_points", "query_masks", "track_slot"}:
         return family
     checkpoint = torch.load(str(Path(model_path).expanduser()), map_location="cpu", weights_only=False)
     return str(checkpoint.get("model_family", "query_points")).strip().lower()
@@ -36,7 +36,11 @@ def _load_cached_model(model_path: str, device: Optional[str], model_family: str
     cached = _MODEL_CACHE.get(key)
     if cached is not None:
         return cached
-    if model_family == "query_masks":
+    if model_family == "track_slot":
+        from autotrack.dl import track_slot_model as tm
+
+        model, checkpoint = tm.load_checkpoint_model(path, device=resolved_device)
+    elif model_family == "query_masks":
         from autotrack.dl import query_mask_instance_model as mm
 
         model, checkpoint = mm.load_checkpoint_model(path, device=resolved_device)
@@ -72,7 +76,21 @@ def extract_all_deep_learning(
     model_family = _resolve_model_family(model_path, cfg.get("model_family"))
     model, checkpoint, model_family = _load_cached_model(model_path, resolved_device, model_family)
     dataset_cfg = dict(checkpoint.get("dataset_config", {}))
-    if model_family == "query_masks":
+    if model_family == "track_slot":
+        from autotrack.dl import track_slot_model as tm
+
+        inference_cfg = tm.InferenceConfig(
+            time_downsample=int(cfg.get("time_downsample", dataset_cfg.get("time_downsample", 10))),
+            objectness_threshold=float(cfg.get("objectness_threshold", 0.5)),
+            visibility_threshold=float(cfg.get("visibility_threshold", 0.5)),
+            min_visible_channels=int(cfg.get("min_visible_channels", 3)),
+            max_tracks=int(cfg.get("max_tracks", 96)),
+            dedup_tolerance_samples=int(cfg.get("dedup_tolerance_samples", 180)),
+            speed_norm_kmh=float(dataset_cfg.get("speed_norm_kmh", 150.0)),
+            clip_ratio=float(dataset_cfg.get("clip_ratio", 1.35)),
+        )
+        predict_fn = tm.predict_tracks_from_window
+    elif model_family == "query_masks":
         from autotrack.dl import query_mask_instance_model as mm
 
         inference_cfg = mm.InferenceConfig(

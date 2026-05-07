@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model-family",
         default="query_masks",
-        choices=["auto", "query_points", "query_masks"],
+        choices=["auto", "query_points", "query_masks", "track_slot"],
         help="Model family. auto reads from checkpoint metadata.",
     )
     parser.add_argument("--out-json", default="", help="Optional evaluation JSON output path.")
@@ -131,7 +131,21 @@ def main() -> int:
     if family == "auto":
         checkpoint_meta = torch.load(str(Path(args.model).expanduser()), map_location="cpu", weights_only=False)
         family = str(checkpoint_meta.get("model_family", "query_points"))
-    if family == "query_masks":
+    if family == "track_slot":
+        from autotrack.dl import track_slot_model as tm
+
+        model, checkpoint = tm.load_checkpoint_model(args.model, device=str(args.device).strip() or None)
+        infer_cfg = tm.InferenceConfig(
+            time_downsample=int(dict(checkpoint.get("dataset_config", {})).get("time_downsample", 10)),
+            objectness_threshold=float(args.objectness_threshold),
+            visibility_threshold=float(args.visibility_threshold),
+            min_visible_channels=int(args.min_visible_channels),
+            dedup_tolerance_samples=int(round(float(args.match_tolerance_s) * float(fs))),
+            speed_norm_kmh=float(dict(checkpoint.get("dataset_config", {})).get("speed_norm_kmh", 150.0)),
+            clip_ratio=float(dict(checkpoint.get("dataset_config", {})).get("clip_ratio", 1.35)),
+        )
+        predict_fn = tm.predict_tracks_from_window
+    elif family == "query_masks":
         from autotrack.dl import query_mask_instance_model as mm
 
         model, checkpoint = mm.load_checkpoint_model(args.model, device=str(args.device).strip() or None)

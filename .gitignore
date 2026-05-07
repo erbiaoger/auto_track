@@ -10,8 +10,10 @@ __pycache__/
 
 # Generated / large data
 data/
-datasets/
-models/
+datasets/*
+!datasets/README.md
+models/*
+!models/README.md
 *.sac
 *.mseed
 *.npz
