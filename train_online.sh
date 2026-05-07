@@ -5,7 +5,7 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$SCRIPT_DIR"
 
 DEVICE=${DEVICE:-cuda}
-BATCH_SIZE=${BATCH_SIZE:-16}
+BATCH_SIZE=${BATCH_SIZE:-8}
 AMP=${AMP:-auto}
 AMP_DTYPE=${AMP_DTYPE:-float16}
 EPOCHS=${EPOCHS:-400}
@@ -16,6 +16,8 @@ RESUME_MODEL_ONLY=${RESUME_MODEL_ONLY:-0}
 CACHE_DATASET=${CACHE_DATASET:-1}
 CACHE_DTYPE=${CACHE_DTYPE:-float16}
 CACHE_BUILD_WORKERS=${CACHE_BUILD_WORKERS:-8}
+DISK_CACHE_DIR=${DISK_CACHE_DIR:-datasets/cache/online_train}
+CACHE_REBUILD=${CACHE_REBUILD:-0}
 NUM_WORKERS=${NUM_WORKERS:-0}
 HIDDEN_DIM=${HIDDEN_DIM:-128}
 DECODER_LAYERS=${DECODER_LAYERS:-2}
@@ -90,7 +92,10 @@ SIGMA_SECONDS=${SIGMA_SECONDS:-$(awk "BEGIN{printf \"%.6f\", ${PULSE_LENGTH_SECO
 #   SIGMA_SECONDS=0.25.
 cache_args=""
 if [ "$CACHE_DATASET" = "1" ] || [ "$CACHE_DATASET" = "true" ]; then
-  cache_args="--cache-dataset --cache-dtype $CACHE_DTYPE --cache-build-workers $CACHE_BUILD_WORKERS"
+  cache_args="--cache-dataset --cache-dtype $CACHE_DTYPE --cache-build-workers $CACHE_BUILD_WORKERS --cache-dir $DISK_CACHE_DIR"
+  if [ "$CACHE_REBUILD" = "1" ] || [ "$CACHE_REBUILD" = "true" ]; then
+    cache_args="$cache_args --cache-rebuild"
+  fi
 fi
 resume_args=""
 if [ -n "$RESUME" ]; then

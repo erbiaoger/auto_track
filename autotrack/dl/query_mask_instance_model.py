@@ -271,7 +271,8 @@ def _match_single(
         empty = torch.empty((0,), dtype=torch.long, device=device)
         return empty, empty
 
-    pred_masks = torch.sigmoid(outputs["mask_logits"][b, :regular_q])
+    pred_mask_logits = outputs["mask_logits"][b, :regular_q]
+    pred_masks = torch.sigmoid(pred_mask_logits)
     pred_obj = torch.sigmoid(outputs["objectness_logits"][b, :regular_q])
     pred_dir = torch.softmax(outputs["direction_logits"][b, :regular_q], dim=-1)
     pred_speed = outputs["speed"][b, :regular_q]
@@ -281,12 +282,18 @@ def _match_single(
     gt_speed = targets["speed"][b, gt_valid].to(device=device, dtype=torch.float32)
 
     bins = int(max(8, min(match_time_bins, pred_masks.shape[-1])))
-    pred_pool = F.adaptive_avg_pool2d(pred_masks, output_size=(pred_masks.shape[-2], bins))
+    pred_pool_logits = F.adaptive_avg_pool2d(pred_mask_logits, output_size=(pred_mask_logits.shape[-2], bins))
+    pred_pool = torch.sigmoid(pred_pool_logits)
     gt_pool = F.adaptive_avg_pool2d(gt_masks, output_size=(gt_masks.shape[-2], bins))
 
+    pred_logit_e = pred_pool_logits[:, None, :, :]
     pred_e = pred_pool[:, None, :, :]
     gt_e = gt_pool[None, :, :, :]
-    bce = F.binary_cross_entropy(pred_e.expand(-1, g_count, -1, -1), gt_e.expand(int(pred_pool.shape[0]), -1, -1, -1), reduction="none").mean(dim=(-1, -2))
+    bce = F.binary_cross_entropy_with_logits(
+        pred_logit_e.expand(-1, g_count, -1, -1),
+        gt_e.expand(int(pred_pool.shape[0]), -1, -1, -1),
+        reduction="none",
+    ).mean(dim=(-1, -2))
     dice = _dice_from_prob(pred_e, gt_e)
     dir_cost = -pred_dir[:, gt_dir]
     speed_cost = torch.abs(pred_speed[:, None] - gt_speed[None, :])

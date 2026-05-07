@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import hashlib
 import time
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, fields
@@ -101,6 +102,8 @@ class OnlineSyntheticTrajectoryDataset(Dataset):
         cache_dataset: bool = False,
         cache_dtype: str = "float16",
         cache_build_workers: int = 0,
+        cache_dir: Optional[Path] = None,
+        cache_rebuild: bool = False,
     ):
         self.length = int(length)
         self.n_channels = int(n_channels)
@@ -135,6 +138,8 @@ class OnlineSyntheticTrajectoryDataset(Dataset):
         self.cache_dataset = bool(cache_dataset)
         self.cache_dtype = str(cache_dtype).lower()
         self.cache_build_workers = int(max(0, cache_build_workers))
+        self.cache_dir = Path(cache_dir).expanduser() if cache_dir is not None else None
+        self.cache_rebuild = bool(cache_rebuild)
         self._cache: Optional[list[tuple[torch.Tensor, dict[str, torch.Tensor]]]] = None
         if self.cache_dataset:
             self.build_cache()
@@ -149,6 +154,9 @@ class OnlineSyntheticTrajectoryDataset(Dataset):
         return self._generate_item(int(index), cache_x=False)
 
     def build_cache(self) -> None:
+        if self.cache_dir is not None and not self.cache_rebuild:
+            if self._load_cache_from_disk():
+                return
         workers = min(int(self.cache_build_workers), int(self.length))
         t0 = time.perf_counter()
         print(
@@ -165,6 +173,8 @@ class OnlineSyntheticTrajectoryDataset(Dataset):
                     print(f"cache_dataset: {index + 1}/{self.length} windows, elapsed={elapsed:.1f}s", flush=True)
                 cache.append((x, target))
             self._cache = cache
+            if self.cache_dir is not None:
+                self._save_cache_to_disk()
             return
 
         cache_parallel: list[Optional[tuple[torch.Tensor, dict[str, torch.Tensor]]]] = [None] * self.length
@@ -186,6 +196,76 @@ class OnlineSyntheticTrajectoryDataset(Dataset):
                     elapsed = time.perf_counter() - t0
                     print(f"cache_dataset: {done}/{self.length} windows, elapsed={elapsed:.1f}s", flush=True)
         self._cache = [item for item in cache_parallel if item is not None]
+        if self.cache_dir is not None:
+            self._save_cache_to_disk()
+
+    def _cache_signature(self) -> str:
+        payload = {
+            "length": int(self.length),
+            "n_channels": int(self.n_channels),
+            "fs": float(self.fs),
+            "window_seconds": float(self.window_seconds),
+            "time_downsample": int(self.time_downsample),
+            "dx_m": float(self.dx_m),
+            "vehicles_min": int(self.vehicles_min),
+            "vehicles_max": int(self.vehicles_max),
+            "speed_min_kmh": float(self.speed_min_kmh),
+            "speed_max_kmh": float(self.speed_max_kmh),
+            "speed_outlier_ratio": float(self.speed_outlier_ratio),
+            "slow_speed_min_kmh": float(self.slow_speed_min_kmh),
+            "slow_speed_max_kmh": float(self.slow_speed_max_kmh),
+            "fast_speed_min_kmh": float(self.fast_speed_min_kmh),
+            "fast_speed_max_kmh": float(self.fast_speed_max_kmh),
+            "noise_std": float(self.noise_std),
+            "amp_min": float(self.amp_min),
+            "amp_max": float(self.amp_max),
+            "sigma_min_s": float(self.sigma_min_s),
+            "sigma_max_s": float(self.sigma_max_s),
+            "primary_ratio": float(self.primary_ratio),
+            "min_visible_channels": int(self.min_visible_channels),
+            "speed_norm_kmh": float(self.speed_norm_kmh),
+            "clip_ratio": float(self.clip_ratio),
+            "input_mode": str(self.input_mode),
+            "seed": int(self.seed),
+            "mask_sigma_ch": float(self.mask_sigma_ch),
+            "mask_sigma_t": float(self.mask_sigma_t),
+            "cache_dtype": str(self.cache_dtype),
+        }
+        text = json.dumps(payload, sort_keys=True, ensure_ascii=True)
+        return hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
+
+    def _cache_file_path(self) -> Optional[Path]:
+        if self.cache_dir is None:
+            return None
+        return self.cache_dir / f"online_cache_{self._cache_signature()}.pt"
+
+    def _save_cache_to_disk(self) -> None:
+        if self._cache is None:
+            return
+        cache_file = self._cache_file_path()
+        if cache_file is None:
+            return
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "signature": self._cache_signature(),
+            "items": self._cache,
+        }
+        torch.save(payload, cache_file)
+        print(f"cache_dataset: saved disk cache -> {cache_file}", flush=True)
+
+    def _load_cache_from_disk(self) -> bool:
+        cache_file = self._cache_file_path()
+        if cache_file is None or not cache_file.is_file():
+            return False
+        payload = torch.load(str(cache_file), map_location="cpu", weights_only=False)
+        if str(payload.get("signature", "")) != self._cache_signature():
+            return False
+        items = payload.get("items", None)
+        if not isinstance(items, list) or len(items) != self.length:
+            return False
+        self._cache = items
+        print(f"cache_dataset: loaded disk cache <- {cache_file}", flush=True)
+        return True
 
     def _cache_worker_kwargs(self) -> dict[str, object]:
         return {
@@ -472,6 +552,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=0, help="DataLoader workers.")
     parser.add_argument("--cache-dataset", action="store_true", help="Precompute the fixed online dataset pool into RAM before training.")
     parser.add_argument("--cache-dtype", default="float16", choices=["float16", "bfloat16", "float32"], help="RAM cache dtype for input tensors.")
+    parser.add_argument("--cache-dir", type=Path, default=None, help="Directory for persistent online cache on disk; reuse if config matches.")
+    parser.add_argument("--cache-rebuild", action="store_true", help="Force regenerate online cache and overwrite/recreate disk cache.")
     parser.add_argument(
         "--input-mode",
         default="auto",
@@ -607,6 +689,8 @@ def _build_online_dataset(args: argparse.Namespace, *, length: int, seed: int) -
         cache_dataset=bool(args.cache_dataset),
         cache_dtype=str(args.cache_dtype),
         cache_build_workers=int(args.cache_build_workers),
+        cache_dir=args.cache_dir,
+        cache_rebuild=bool(args.cache_rebuild),
     )
 
 
