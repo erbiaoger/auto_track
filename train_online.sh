@@ -18,6 +18,7 @@ CACHE_DTYPE=${CACHE_DTYPE:-float16}
 CACHE_BUILD_WORKERS=${CACHE_BUILD_WORKERS:-8}
 DISK_CACHE_DIR=${DISK_CACHE_DIR:-datasets/cache/online_train}
 CACHE_REBUILD=${CACHE_REBUILD:-0}
+DISK_CACHE_ONLY=${DISK_CACHE_ONLY:-1}
 NUM_WORKERS=${NUM_WORKERS:-0}
 HIDDEN_DIM=${HIDDEN_DIM:-128}
 DECODER_LAYERS=${DECODER_LAYERS:-2}
@@ -93,6 +94,7 @@ SIGMA_SECONDS=${SIGMA_SECONDS:-$(awk "BEGIN{printf \"%.6f\", ${PULSE_LENGTH_SECO
 cache_args=""
 if [ "$CACHE_DATASET" = "1" ] || [ "$CACHE_DATASET" = "true" ]; then
   cache_args="--cache-dataset --cache-dtype $CACHE_DTYPE --cache-build-workers $CACHE_BUILD_WORKERS --cache-dir $DISK_CACHE_DIR"
+  cache_args="$cache_args --disk-cache-only $DISK_CACHE_ONLY"
   if [ "$CACHE_REBUILD" = "1" ] || [ "$CACHE_REBUILD" = "true" ]; then
     cache_args="$cache_args --cache-rebuild"
   fi

@@ -63,6 +63,7 @@ from autotrack.dl.trajectory_set_model import (
     trajectory_set_loss,
 )
 from autotrack.dl import query_mask_instance_model as mask_model
+from autotrack.dl.online_synth_dataset import OnlineSyntheticTrajectoryDataset as DiskOnlineSyntheticTrajectoryDataset
 
 plt.rcParams["font.family"] = "Times New Roman"
 
@@ -554,6 +555,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache-dtype", default="float16", choices=["float16", "bfloat16", "float32"], help="RAM cache dtype for input tensors.")
     parser.add_argument("--cache-dir", type=Path, default=None, help="Directory for persistent online cache on disk; reuse if config matches.")
     parser.add_argument("--cache-rebuild", action="store_true", help="Force regenerate online cache and overwrite/recreate disk cache.")
+    parser.add_argument("--disk-cache-only", type=int, default=1, choices=[0, 1], help="1: generate cache to disk then read per-sample from disk; 0: keep RAM preload behavior.")
     parser.add_argument(
         "--input-mode",
         default="auto",
@@ -657,7 +659,7 @@ def _build_online_dataset(args: argparse.Namespace, *, length: int, seed: int) -
         input_mode=str(args.resolved_input_mode),
         seed=int(seed),
     )
-    return OnlineSyntheticTrajectoryDataset(
+    return DiskOnlineSyntheticTrajectoryDataset(
         length=int(max(1, length)),
         n_channels=int(args.n_ch),
         fs=float(args.fs),
@@ -691,6 +693,7 @@ def _build_online_dataset(args: argparse.Namespace, *, length: int, seed: int) -
         cache_build_workers=int(args.cache_build_workers),
         cache_dir=args.cache_dir,
         cache_rebuild=bool(args.cache_rebuild),
+        disk_cache_only=bool(args.disk_cache_only),
     )
 
 
@@ -976,7 +979,7 @@ def main() -> int:
     scaler = torch.amp.GradScaler("cuda", enabled=bool(use_amp and str(device).startswith("cuda") and amp_dtype == torch.float16))
     if use_amp:
         print(f"Using CUDA AMP: dtype={args.amp_dtype}, grad_scaler={scaler.is_enabled()}", flush=True)
-    if bool(args.cache_dataset) and int(args.num_workers) != 0:
+    if bool(args.cache_dataset) and (not bool(args.disk_cache_only)) and int(args.num_workers) != 0:
         print("cache_dataset is enabled; forcing num_workers=0 to avoid copying the RAM cache into worker processes.")
         args.num_workers = 0
 
@@ -1138,7 +1141,8 @@ def main() -> int:
         f"batches_per_epoch={len(loader)}, vehicles=[{args.vehicles_min}, {args.vehicles_max}], "
         f"window_seconds={args.window_seconds}, time_downsample={args.time_downsample}, "
         f"val_windows={int(args.val_steps)}, cache_dataset={bool(args.cache_dataset)}, "
-        f"cache_dtype={args.cache_dtype}, cache_build_workers={int(args.cache_build_workers)}"
+        f"cache_dtype={args.cache_dtype}, cache_build_workers={int(args.cache_build_workers)}, "
+        f"disk_cache_only={bool(args.disk_cache_only)}, cache_dir={str(args.cache_dir) if args.cache_dir is not None else ''}"
     )
     print(
         "Model: "
