@@ -113,13 +113,13 @@ evaluate_trajectory_model.py --model-family track_slot
 CPU smoke test:
 
 ```sh
-uv run python -m autotrack.dl.generate_track_slot_dataset --out-dir /tmp/track_slot_data --num-samples 32 --shard-size 16 --window-seconds 10 --time-downsample 20 --overwrite
+uv run python -m autotrack.dl.generate_track_slot_dataset --out-dir /tmp/track_slot_data --num-samples 32 --shard-size 16 --window-seconds 10 --time-downsample 20 --workers 2 --overwrite
 uv run python -m autotrack.dl.train_track_slot --data-dir /tmp/track_slot_data --out-dir /tmp/track_slot_smoke --device cpu --epochs 1 --batch-size 2
 ```
 
 CUDA training:
 
 ```sh
-sh generate_track_slot_dataset.sh
+WORKERS=8 sh generate_track_slot_dataset.sh
 DEVICE=cuda EPOCHS=2 BATCH_SIZE=64 sh train_track_slot_cuda.sh
 ```

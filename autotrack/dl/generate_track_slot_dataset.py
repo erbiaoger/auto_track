@@ -14,7 +14,8 @@ Example:
         --window-seconds 240 \
         --time-downsample 10 \
         --vehicles-min 32 \
-        --vehicles-max 48
+        --vehicles-max 48 \
+        --workers 8
 
 Outputs:
     <out-dir>/meta.json
@@ -40,7 +41,9 @@ import argparse
 import json
 import math
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
+from typing import Optional
 
 import torch
 
@@ -70,6 +73,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--clip-ratio", type=float, default=1.35, help="Robust clipping ratio for input normalization.")
     parser.add_argument("--input-mode", default="raw", choices=["raw", "raw_abs"], help="Input channels stored in x.")
     parser.add_argument("--x-dtype", default="float16", choices=["float16", "float32"], help="Stored dtype for x tensor.")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help="Parallel shard workers. 0 or 1 runs sequentially; each worker writes independent shard files.",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Base random seed.")
     parser.add_argument("--overwrite", action="store_true", help="Allow writing into an existing non-empty output directory.")
     return parser.parse_args()
@@ -178,6 +187,22 @@ def _write_shard(out_path: Path, items: list[dict[str, torch.Tensor]]) -> None:
     torch.save(payload, str(out_path))
 
 
+def _args_payload(args: argparse.Namespace) -> dict[str, object]:
+    return {key: (str(value) if isinstance(value, Path) else value) for key, value in vars(args).items()}
+
+
+def _generate_shard_worker(payload: tuple[dict[str, object], int, int, int]) -> tuple[int, str, int, float]:
+    raw_args, shard_idx, start, end = payload
+    torch.set_num_threads(1)
+    args = argparse.Namespace(**raw_args)
+    shard_name = f"shard_{int(shard_idx):06d}.pt"
+    out_path = Path(str(raw_args["out_dir"])).expanduser() / shard_name
+    t0 = time.perf_counter()
+    items = [_generate_one(args, index) for index in range(int(start), int(end))]
+    _write_shard(out_path, items)
+    return int(shard_idx), shard_name, int(end) - int(start), float(time.perf_counter() - t0)
+
+
 def main() -> int:
     args = parse_args()
     if int(args.num_samples) <= 0:
@@ -197,19 +222,44 @@ def main() -> int:
         old.unlink()
 
     t0 = time.perf_counter()
-    shard_files: list[str] = []
     total = int(args.num_samples)
     shard_size = int(args.shard_size)
     shard_count = int(math.ceil(total / shard_size))
-    for shard_idx in range(shard_count):
-        start = shard_idx * shard_size
-        end = min(total, start + shard_size)
-        items = [_generate_one(args, index) for index in range(start, end)]
-        shard_name = f"shard_{shard_idx:06d}.pt"
-        _write_shard(out_dir / shard_name, items)
-        shard_files.append(shard_name)
-        elapsed = time.perf_counter() - t0
-        print(f"wrote {shard_name}: samples={end - start}, total={end}/{total}, elapsed={elapsed:.1f}s", flush=True)
+    jobs = [(idx, idx * shard_size, min(total, (idx + 1) * shard_size)) for idx in range(shard_count)]
+    shard_files: list[Optional[str]] = [None] * shard_count
+    done_samples = 0
+    workers = int(max(0, args.workers))
+    raw_args = _args_payload(args)
+    if workers <= 1 or shard_count <= 1:
+        for shard_idx, start, end in jobs:
+            done_idx, shard_name, sample_count, shard_seconds = _generate_shard_worker((raw_args, shard_idx, start, end))
+            shard_files[done_idx] = shard_name
+            done_samples += sample_count
+            elapsed = time.perf_counter() - t0
+            print(
+                f"wrote {shard_name}: samples={sample_count}, total={done_samples}/{total}, "
+                f"shard_elapsed={shard_seconds:.1f}s, elapsed={elapsed:.1f}s",
+                flush=True,
+            )
+    else:
+        max_workers = int(min(workers, shard_count))
+        print(f"parallel generation: workers={max_workers}, shards={shard_count}", flush=True)
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(_generate_shard_worker, (raw_args, shard_idx, start, end))
+                for shard_idx, start, end in jobs
+            ]
+            for future in as_completed(futures):
+                done_idx, shard_name, sample_count, shard_seconds = future.result()
+                shard_files[done_idx] = shard_name
+                done_samples += sample_count
+                elapsed = time.perf_counter() - t0
+                print(
+                    f"wrote {shard_name}: samples={sample_count}, total={done_samples}/{total}, "
+                    f"shard_elapsed={shard_seconds:.1f}s, elapsed={elapsed:.1f}s",
+                    flush=True,
+                )
+    shard_names = [name for name in shard_files if name is not None]
 
     window_samples = int(round(float(args.window_seconds) * float(args.fs)))
     meta = {
@@ -217,7 +267,7 @@ def main() -> int:
         "created_at_unix": time.time(),
         "num_samples": total,
         "shard_size": shard_size,
-        "shards": shard_files,
+        "shards": shard_names,
         "n_channels": int(args.n_ch),
         "in_channels": 1 if str(args.input_mode) == "raw" else 2,
         "max_gt": int(args.vehicles_max),
@@ -230,10 +280,10 @@ def main() -> int:
         "speed_norm_kmh": float(args.speed_norm_kmh),
         "clip_ratio": float(args.clip_ratio),
         "input_mode": str(args.input_mode),
-        "generator_args": {key: (str(value) if isinstance(value, Path) else value) for key, value in vars(args).items()},
+        "generator_args": _args_payload(args),
     }
     (out_dir / "meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
-    print(f"done: samples={total}, shards={len(shard_files)}, out_dir={out_dir}")
+    print(f"done: samples={total}, shards={len(shard_names)}, out_dir={out_dir}")
     return 0
 
 

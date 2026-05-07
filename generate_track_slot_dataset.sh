@@ -23,6 +23,7 @@ SIGMA_SECONDS=${SIGMA_SECONDS:-0.25}
 PRIMARY_RATIO=${PRIMARY_RATIO:-0.8333333333}
 INPUT_MODE=${INPUT_MODE:-raw}
 X_DTYPE=${X_DTYPE:-float16}
+WORKERS=${WORKERS:-8}
 SEED=${SEED:-42}
 OVERWRITE=${OVERWRITE:-1}
 
@@ -52,5 +53,6 @@ uv run python -m autotrack.dl.generate_track_slot_dataset \
   --primary-ratio "$PRIMARY_RATIO" \
   --input-mode "$INPUT_MODE" \
   --x-dtype "$X_DTYPE" \
+  --workers "$WORKERS" \
   --seed "$SEED" \
   $overwrite_args
