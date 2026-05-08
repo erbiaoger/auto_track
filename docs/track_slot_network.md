@@ -29,8 +29,8 @@ duplicate slots by trajectory NMS.
 
 ## Physical Representation
 
-For a constant-speed vehicle moving over evenly spaced DAS channels, the center
-time at channel `c` is approximately:
+For an ideal constant-speed vehicle moving over evenly spaced DAS channels, the
+center time at channel `c` is approximately:
 
 ```text
 t(c) = t0 + direction_sign * c * dx / v
@@ -41,6 +41,12 @@ The observed training input is a Gaussian response around this center time:
 ```text
 x(c, t) += A * exp(-0.5 * ((t - t(c)) / sigma)^2)
 ```
+
+The current generator uses this line model as the base case, but defaults to a
+more realistic motion mix: `constant_sparse` with sparse local speed
+perturbations, `smooth_random` with low-frequency speed variation, and rare
+`stop_go` events. The tensor labels keep the same `time[g, c]` format, so the
+network can learn non-straight trajectories without changing the model.
 
 The model does not need to segment pixels. It learns the instance-level mapping
 from a set of Gaussian ridges to a set of vehicle slots. For every slot, `time`

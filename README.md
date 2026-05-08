@@ -27,10 +27,19 @@ Generate tensor shards without SAC I/O:
 WORKERS=8 sh generate_track_slot_dataset.sh
 ```
 
+The default generator uses realistic motion augmentation:
+`constant_sparse,smooth_random,stop_go` with weights `0.84,0.15,0.01`.
+
 Train on CUDA:
 
 ```sh
 DEVICE=cuda EPOCHS=2 BATCH_SIZE=64 sh train_track_slot_cuda.sh
+```
+
+Plot training history:
+
+```sh
+RUN_DIR=models/track_slot_cuda sh plot_track_slot_history.sh
 ```
 
 Run a CPU smoke test:
@@ -48,6 +57,12 @@ MODEL=/tmp/track_slot_smoke/checkpoint_best.pt DATA_DIR=/tmp/track_slot_data OUT
 
 This writes `summary.json`, prediction CSV files, and heatmap overlay figures
 under `<OUT_DIR>/plots/`.
+
+Full method documentation:
+
+```text
+docs/track_slot_method_complete.md
+```
 
 Infer on SAC data with a trained checkpoint:
 

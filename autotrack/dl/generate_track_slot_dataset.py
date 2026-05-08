@@ -15,6 +15,8 @@ Example:
         --time-downsample 10 \
         --vehicles-min 32 \
         --vehicles-max 48 \
+        --motion-mix constant_sparse,smooth_random,stop_go \
+        --motion-weights 0.84,0.15,0.01 \
         --workers 8
 
 Outputs:
@@ -32,7 +34,9 @@ Outputs:
 Notes:
     Use this generator before `train_track_slot.py`. For CPU-only experiments,
     keep `--num-samples` small. For CUDA training, generate a larger dataset
-    once and reuse the shards across runs.
+    once and reuse the shards across runs. Motion models are integrated as
+    channel-segment speed profiles, so labels keep the same compact
+    `[vehicle, channel]` time representation while becoming more realistic.
 """
 
 from __future__ import annotations
@@ -62,6 +66,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vehicles-max", type=int, default=48, help="Maximum vehicles per window and label slots per sample.")
     parser.add_argument("--speed-min-kmh", type=float, default=70.0, help="Minimum vehicle speed.")
     parser.add_argument("--speed-max-kmh", type=float, default=85.0, help="Maximum vehicle speed.")
+    parser.add_argument(
+        "--motion-mix",
+        default="constant_sparse,smooth_random,stop_go",
+        help="Comma-separated motion models: constant_sparse, smooth_random, stop_go.",
+    )
+    parser.add_argument("--motion-weights", default="0.84,0.15,0.01", help="Comma-separated motion model weights.")
+    parser.add_argument("--constant-perturb-prob", type=float, default=0.05, help="Sparse local speed perturb event probability per segment.")
+    parser.add_argument("--constant-perturb-max-frac", type=float, default=0.01, help="Maximum absolute sparse perturbation fraction.")
+    parser.add_argument("--constant-perturb-width-min", type=int, default=1, help="Minimum sparse perturbation width in channel segments.")
+    parser.add_argument("--constant-perturb-width-max", type=int, default=2, help="Maximum sparse perturbation width in channel segments.")
+    parser.add_argument("--smooth-speed-max-frac", type=float, default=0.05, help="Maximum absolute smooth speed variation fraction.")
+    parser.add_argument("--smooth-speed-corr-channels", type=int, default=8, help="Smoothing width for random speed variation in channel segments.")
+    parser.add_argument("--stop-duration-min-s", type=float, default=1.0, help="Minimum stop-go delay in seconds.")
+    parser.add_argument("--stop-duration-max-s", type=float, default=8.0, help="Maximum stop-go delay in seconds.")
+    parser.add_argument("--stop-channel-width-min", type=int, default=1, help="Minimum number of path positions with widened stop response.")
+    parser.add_argument("--stop-channel-width-max", type=int, default=3, help="Maximum number of path positions with widened stop response.")
+    parser.add_argument("--stop-response-sigma-scale", type=float, default=3.0, help="Gaussian sigma multiplier near a stop event.")
+    parser.add_argument("--stop-response-amp-scale", type=float, default=1.2, help="Gaussian amplitude multiplier near a stop event.")
+    parser.add_argument("--restart-speed-ratio-min", type=float, default=0.95, help="Minimum restart speed ratio after a stop.")
+    parser.add_argument("--restart-speed-ratio-max", type=float, default=1.05, help="Maximum restart speed ratio after a stop.")
     parser.add_argument("--noise-std", type=float, default=0.0, help="Gaussian noise std added to the downsampled heatmap.")
     parser.add_argument("--amp-min", type=float, default=6.0, help="Minimum Gaussian pulse amplitude.")
     parser.add_argument("--amp-max", type=float, default=6.0, help="Maximum Gaussian pulse amplitude.")
@@ -101,6 +125,193 @@ def _prepare_input(data_ds: torch.Tensor, *, clip_ratio: float, input_mode: str)
     return torch.stack([raw, abs_feat], dim=0).to(torch.float32)
 
 
+def _split_csv(text: str) -> list[str]:
+    return [item.strip() for item in str(text).split(",") if item.strip()]
+
+
+def _parse_float_csv(text: str) -> list[float]:
+    return [float(item) for item in _split_csv(text)]
+
+
+def _motion_models_and_weights(args: argparse.Namespace) -> tuple[list[str], list[float]]:
+    allowed = {"constant_sparse", "smooth_random", "stop_go"}
+    models = _split_csv(str(args.motion_mix))
+    weights = _parse_float_csv(str(args.motion_weights))
+    if not models:
+        raise ValueError("--motion-mix must contain at least one model")
+    unknown = sorted(set(models) - allowed)
+    if unknown:
+        raise ValueError(f"Unknown motion model(s): {', '.join(unknown)}")
+    if len(weights) != len(models):
+        raise ValueError("--motion-weights must have the same item count as --motion-mix")
+    if any(weight < 0.0 for weight in weights):
+        raise ValueError("--motion-weights must be non-negative")
+    total = float(sum(weights))
+    if total <= 0.0:
+        raise ValueError("--motion-weights must sum to a positive value")
+    return models, [float(weight / total) for weight in weights]
+
+
+def _choose_motion_model(args: argparse.Namespace, gen: torch.Generator) -> str:
+    models, weights = _motion_models_and_weights(args)
+    idx = int(torch.multinomial(torch.tensor(weights, dtype=torch.float32), 1, generator=gen).item())
+    return models[idx]
+
+
+def _apply_constant_sparse_perturbations(
+    speed_kmh: torch.Tensor,
+    args: argparse.Namespace,
+    gen: torch.Generator,
+) -> torch.Tensor:
+    n_seg = int(speed_kmh.numel())
+    if n_seg <= 0:
+        return speed_kmh
+    prob = float(max(0.0, args.constant_perturb_prob))
+    max_frac = float(max(0.0, args.constant_perturb_max_frac))
+    width_min = int(max(1, args.constant_perturb_width_min))
+    width_max = int(max(width_min, args.constant_perturb_width_max))
+    out = speed_kmh.clone()
+    if prob <= 0.0 or max_frac <= 0.0:
+        return out
+    for start in range(n_seg):
+        if float(torch.rand((), generator=gen).item()) >= prob:
+            continue
+        width = int(torch.randint(width_min, width_max + 1, (1,), generator=gen).item())
+        end = min(n_seg, start + width)
+        delta = _rand_uniform(gen, -max_frac, max_frac)
+        out[start:end] *= float(1.0 + delta)
+    return out
+
+
+def _apply_smooth_random_speed(
+    speed_kmh: torch.Tensor,
+    args: argparse.Namespace,
+    gen: torch.Generator,
+) -> torch.Tensor:
+    n_seg = int(speed_kmh.numel())
+    if n_seg <= 0:
+        return speed_kmh
+    max_frac = float(max(0.0, args.smooth_speed_max_frac))
+    if max_frac <= 0.0:
+        return speed_kmh
+    corr = int(max(1, args.smooth_speed_corr_channels))
+    noise = torch.randn((n_seg,), generator=gen, dtype=torch.float32)
+    if corr > 1 and n_seg > 1:
+        kernel = torch.ones((1, 1, min(corr, n_seg)), dtype=torch.float32) / float(min(corr, n_seg))
+        pad_left = int(kernel.shape[-1] // 2)
+        pad_right = int(kernel.shape[-1] - 1 - pad_left)
+        padded = torch.nn.functional.pad(noise.view(1, 1, -1), (pad_left, pad_right), mode="replicate")
+        noise = torch.nn.functional.conv1d(padded, kernel).view(-1)
+    max_abs = float(torch.max(torch.abs(noise)).item())
+    if max_abs <= 1e-9:
+        return speed_kmh
+    amplitude = _rand_uniform(gen, 0.0, max_frac)
+    factor = 1.0 + noise / max_abs * float(amplitude)
+    return speed_kmh * factor
+
+
+def _integrate_segment_times(
+    segment_speed_kmh: torch.Tensor,
+    *,
+    n_ch: int,
+    dx_m: float,
+    anchor_pos: int,
+    anchor_time: float,
+) -> torch.Tensor:
+    t_path = torch.empty((n_ch,), dtype=torch.float32)
+    if n_ch <= 1:
+        t_path.fill_(float(anchor_time))
+        return t_path
+    speed_mps = torch.clamp(segment_speed_kmh.to(torch.float32) / 3.6, min=1e-6)
+    dt = float(dx_m) / speed_mps
+    anchor_pos = int(max(0, min(n_ch - 1, anchor_pos)))
+    t_path[anchor_pos] = float(anchor_time)
+    for pos in range(anchor_pos, n_ch - 1):
+        t_path[pos + 1] = t_path[pos] + dt[pos]
+    for pos in range(anchor_pos - 1, -1, -1):
+        t_path[pos] = t_path[pos + 1] - dt[pos]
+    return t_path
+
+
+def _effective_speed_kmh(t_center: torch.Tensor, dx_m: float, fallback_speed_kmh: float) -> float:
+    if int(t_center.numel()) <= 1:
+        return float(fallback_speed_kmh)
+    travel_s = float(torch.max(t_center).item() - torch.min(t_center).item())
+    if travel_s <= 1e-9:
+        return float(fallback_speed_kmh)
+    distance_m = float(int(t_center.numel()) - 1) * float(dx_m)
+    return float(3.6 * distance_m / travel_s)
+
+
+def _sample_track_times(
+    args: argparse.Namespace,
+    gen: torch.Generator,
+    n_ch: int,
+    is_primary: bool,
+    speed_kmh: float,
+    anchor_ch: int,
+    anchor_time: float,
+) -> tuple[torch.Tensor, torch.Tensor, float, str, torch.Tensor]:
+    n_seg = max(0, int(n_ch) - 1)
+    motion_model = _choose_motion_model(args, gen)
+    segment_speed = torch.full((n_seg,), float(speed_kmh), dtype=torch.float32)
+    stop_path_mask = torch.zeros((int(n_ch),), dtype=torch.bool)
+
+    if motion_model == "constant_sparse":
+        segment_speed = _apply_constant_sparse_perturbations(segment_speed, args, gen)
+    elif motion_model == "smooth_random":
+        segment_speed = _apply_smooth_random_speed(segment_speed, args, gen)
+    elif motion_model == "stop_go":
+        restart_ratio = _rand_uniform(gen, float(args.restart_speed_ratio_min), float(args.restart_speed_ratio_max))
+        if n_seg > 0:
+            stop_pos = int(torch.randint(0, int(n_ch) - 1, (1,), generator=gen).item())
+            segment_speed[stop_pos:] *= float(restart_ratio)
+        else:
+            stop_pos = 0
+    else:
+        raise ValueError(f"Unknown motion model: {motion_model}")
+
+    segment_speed = torch.clamp(
+        segment_speed,
+        min=float(args.speed_min_kmh),
+        max=float(args.speed_max_kmh),
+    )
+    anchor_pos = int(anchor_ch) if bool(is_primary) else int(n_ch) - 1 - int(anchor_ch)
+    t_path = _integrate_segment_times(
+        segment_speed,
+        n_ch=int(n_ch),
+        dx_m=float(args.dx_m),
+        anchor_pos=anchor_pos,
+        anchor_time=float(anchor_time),
+    )
+
+    if motion_model == "stop_go" and int(n_ch) > 1:
+        stop_duration = _rand_uniform(gen, float(args.stop_duration_min_s), float(args.stop_duration_max_s))
+        stop_pos = int(max(0, min(int(n_ch) - 1, stop_pos)))
+        t_path[stop_pos + 1 :] += float(stop_duration)
+        width_min = int(max(1, args.stop_channel_width_min))
+        width_max = int(max(width_min, args.stop_channel_width_max))
+        width = int(torch.randint(width_min, width_max + 1, (1,), generator=gen).item())
+        half_left = width // 2
+        start = max(0, stop_pos - half_left)
+        end = min(int(n_ch), start + width)
+        start = max(0, end - width)
+        stop_path_mask[start:end] = True
+
+    if bool(is_primary):
+        t_center = t_path
+        stop_mask = stop_path_mask
+    else:
+        order = torch.arange(int(n_ch) - 1, -1, -1, dtype=torch.long)
+        t_center = torch.empty((int(n_ch),), dtype=torch.float32)
+        stop_mask = torch.zeros((int(n_ch),), dtype=torch.bool)
+        t_center[order] = t_path
+        stop_mask[order] = stop_path_mask
+
+    effective_speed = _effective_speed_kmh(t_center, float(args.dx_m), float(speed_kmh))
+    return t_center, segment_speed, effective_speed, motion_model, stop_mask
+
+
 def _generate_one(args: argparse.Namespace, index: int) -> dict[str, torch.Tensor]:
     gen = torch.Generator(device="cpu")
     gen.manual_seed(int(args.seed) + int(index) * 1_000_003)
@@ -127,7 +338,6 @@ def _generate_one(args: argparse.Namespace, index: int) -> dict[str, torch.Tenso
     speed = torch.zeros((max_gt,), dtype=torch.float32)
     gt_valid = torch.zeros((max_gt,), dtype=torch.bool)
 
-    channel_index = torch.arange(n_ch, dtype=torch.float32)
     n_vehicles = int(torch.randint(int(args.vehicles_min), int(args.vehicles_max) + 1, (1,), generator=gen).item())
     track_id = 0
     attempts = 0
@@ -137,20 +347,28 @@ def _generate_one(args: argparse.Namespace, index: int) -> dict[str, torch.Tenso
         is_primary = bool(torch.rand((), generator=gen).item() < float(args.primary_ratio))
         direction_label = 0 if is_primary else 1
         speed_kmh = _rand_uniform(gen, float(args.speed_min_kmh), float(args.speed_max_kmh))
-        speed_mps = speed_kmh / 3.6
         sigma_s = _rand_uniform(gen, float(args.sigma_min_s), float(args.sigma_max_s))
         amp = _rand_uniform(gen, float(args.amp_min), float(args.amp_max))
-        dist_m = channel_index * float(args.dx_m) if is_primary else (n_ch - 1 - channel_index) * float(args.dx_m)
         anchor_ch = int(torch.randint(0, n_ch, (1,), generator=gen).item())
         anchor_time = float(torch.rand((), generator=gen).item() * float(args.window_seconds))
-        t_entry = anchor_time - float(dist_m[anchor_ch].item()) / max(1e-6, speed_mps)
-        t_center = t_entry + dist_m / max(1e-6, speed_mps)
+        t_center, _, effective_speed_kmh, motion_model, stop_mask = _sample_track_times(
+            args,
+            gen,
+            n_ch,
+            is_primary,
+            speed_kmh,
+            anchor_ch,
+            anchor_time,
+        )
         visible = (t_center >= 0.0) & (t_center < float(args.window_seconds))
         if int(visible.sum().item()) < int(args.min_visible_channels):
             continue
 
         for ch in torch.where(visible)[0].tolist():
-            pulse = amp * torch.exp(-0.5 * ((t_axis_s - float(t_center[ch].item())) / max(1e-6, sigma_s)) ** 2)
+            sigma_scale = float(args.stop_response_sigma_scale) if motion_model == "stop_go" and bool(stop_mask[ch]) else 1.0
+            amp_scale = float(args.stop_response_amp_scale) if motion_model == "stop_go" and bool(stop_mask[ch]) else 1.0
+            pulse_sigma = max(1e-6, sigma_s * sigma_scale)
+            pulse = amp * amp_scale * torch.exp(-0.5 * ((t_axis_s - float(t_center[ch].item())) / pulse_sigma) ** 2)
             data_ds[int(ch)] += pulse
         center_idx = torch.round(t_center * float(args.fs)).to(torch.long).clamp(0, window_samples - 1)
         time_label[track_id, visible] = (
@@ -158,7 +376,7 @@ def _generate_one(args: argparse.Namespace, index: int) -> dict[str, torch.Tenso
         ).clamp(0.0, 1.0)
         visibility[track_id] = visible.to(torch.float32)
         direction[track_id] = int(direction_label)
-        speed[track_id] = float(speed_kmh / max(1e-6, float(args.speed_norm_kmh)))
+        speed[track_id] = float(effective_speed_kmh / max(1e-6, float(args.speed_norm_kmh)))
         gt_valid[track_id] = True
         track_id += 1
 
@@ -209,10 +427,29 @@ def main() -> int:
         raise ValueError("--num-samples must be > 0")
     if int(args.shard_size) <= 0:
         raise ValueError("--shard-size must be > 0")
+    if int(args.n_ch) <= 0:
+        raise ValueError("--n-ch must be > 0")
     if int(args.vehicles_min) < 0 or int(args.vehicles_max) < int(args.vehicles_min):
         raise ValueError("--vehicles-max must be >= --vehicles-min >= 0")
     if float(args.speed_min_kmh) <= 0.0 or float(args.speed_max_kmh) < float(args.speed_min_kmh):
         raise ValueError("speed range must be positive and ordered")
+    motion_models, motion_weights = _motion_models_and_weights(args)
+    if not (0.0 <= float(args.constant_perturb_prob) <= 1.0):
+        raise ValueError("--constant-perturb-prob must be in [0, 1]")
+    if float(args.constant_perturb_max_frac) < 0.0 or float(args.smooth_speed_max_frac) < 0.0:
+        raise ValueError("speed variation fractions must be >= 0")
+    if int(args.constant_perturb_width_min) <= 0 or int(args.constant_perturb_width_max) < int(args.constant_perturb_width_min):
+        raise ValueError("constant perturb widths must be positive and ordered")
+    if int(args.smooth_speed_corr_channels) <= 0:
+        raise ValueError("--smooth-speed-corr-channels must be > 0")
+    if float(args.stop_duration_min_s) < 0.0 or float(args.stop_duration_max_s) < float(args.stop_duration_min_s):
+        raise ValueError("stop duration range must be non-negative and ordered")
+    if int(args.stop_channel_width_min) <= 0 or int(args.stop_channel_width_max) < int(args.stop_channel_width_min):
+        raise ValueError("stop channel widths must be positive and ordered")
+    if float(args.stop_response_sigma_scale) <= 0.0 or float(args.stop_response_amp_scale) <= 0.0:
+        raise ValueError("stop response scales must be > 0")
+    if float(args.restart_speed_ratio_min) <= 0.0 or float(args.restart_speed_ratio_max) < float(args.restart_speed_ratio_min):
+        raise ValueError("restart speed ratio range must be positive and ordered")
 
     out_dir = Path(args.out_dir).expanduser()
     if out_dir.exists() and any(out_dir.iterdir()) and not bool(args.overwrite):
@@ -278,6 +515,8 @@ def main() -> int:
         "downsampled_time": int(max(1, len(range(0, window_samples, int(max(1, args.time_downsample)))))),
         "dx_m": float(args.dx_m),
         "speed_norm_kmh": float(args.speed_norm_kmh),
+        "motion_models": motion_models,
+        "motion_weights": motion_weights,
         "clip_ratio": float(args.clip_ratio),
         "input_mode": str(args.input_mode),
         "generator_args": _args_payload(args),
