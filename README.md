@@ -36,6 +36,11 @@ Train on CUDA:
 DEVICE=cuda EPOCHS=2 BATCH_SIZE=64 sh train_track_slot_cuda.sh
 ```
 
+`train_track_slot_cuda.sh` defaults to `AUTO_RESUME=1`, so rerunning it will
+continue from `models/track_slot_cuda/checkpoint_last.pt` if that file exists.
+`EPOCHS` is the target total epoch count; to continue after epoch 180, set
+`EPOCHS` to a value larger than 180.
+
 Plot training history:
 
 ```sh

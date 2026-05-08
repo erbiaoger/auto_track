@@ -27,6 +27,7 @@ CHECKPOINT_EVERY=${CHECKPOINT_EVERY:-5}
 METRICS_EVERY=${METRICS_EVERY:-20}
 LOG_EVERY=${LOG_EVERY:-20}
 RESUME=${RESUME:-}
+AUTO_RESUME=${AUTO_RESUME:-1}
 RESUME_MODEL_ONLY=${RESUME_MODEL_ONLY:-0}
 SEED=${SEED:-42}
 
@@ -36,6 +37,8 @@ if [ -n "$RESUME" ]; then
   if [ "$RESUME_MODEL_ONLY" = "1" ] || [ "$RESUME_MODEL_ONLY" = "true" ]; then
     resume_args="$resume_args --resume-model-only"
   fi
+elif [ "$AUTO_RESUME" = "1" ] || [ "$AUTO_RESUME" = "true" ]; then
+  resume_args="--auto-resume"
 fi
 
 uv run python -m autotrack.dl.train_track_slot \

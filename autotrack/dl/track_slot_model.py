@@ -542,7 +542,11 @@ def save_checkpoint(
     }
     if optimizer is not None:
         payload["optimizer_state"] = optimizer.state_dict()
-    torch.save(payload, str(Path(path).expanduser()))
+    checkpoint_path = Path(path).expanduser()
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = checkpoint_path.with_name(checkpoint_path.name + ".tmp")
+    torch.save(payload, str(tmp_path))
+    tmp_path.replace(checkpoint_path)
 
 
 def load_checkpoint_model(

@@ -133,3 +133,8 @@ WORKERS=8 sh generate_track_slot_dataset.sh
 DEVICE=cuda EPOCHS=2 BATCH_SIZE=64 sh train_track_slot_cuda.sh
 DEVICE=cuda sh predict_track_slot_dataset.sh
 ```
+
+CUDA 快捷脚本默认启用 `AUTO_RESUME=1`，再次运行时会优先读取
+`models/track_slot_cuda/checkpoint_last.pt` 继续训练。`EPOCHS` 表示目标总
+epoch 数；如果 checkpoint 已经到 epoch 180，要继续到 200 就设置
+`EPOCHS=200`。

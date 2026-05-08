@@ -16,11 +16,21 @@ Example:
         --batch-size 64 \
         --matcher hungarian
 
+    Continue an interrupted run from <out-dir>/checkpoint_last.pt when it
+    exists. `--epochs` is the target total epoch count, not extra epochs:
+    uv run python -m autotrack.dl.train_track_slot \
+        --data-dir datasets/track_slot/train \
+        --out-dir models/track_slot_cuda \
+        --device cuda \
+        --epochs 200 \
+        --auto-resume
+
 Arguments:
     --data-dir points to a folder containing `meta.json` and `shard_*.pt`.
     --matcher hungarian uses exact slot-to-vehicle matching on small [Q, GT]
     matrices. --matcher greedy keeps assignment on the torch device.
-    --resume continues from `checkpoint_last.pt` or another checkpoint.
+    --resume continues from a chosen checkpoint path.
+    --auto-resume continues from <out-dir>/checkpoint_last.pt if it exists.
 
 Outputs:
     <out-dir>/checkpoint_last.pt
@@ -80,6 +90,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-every", type=int, default=1, help="Save checkpoint every N epochs.")
     parser.add_argument("--metrics-every", type=int, default=20, help="Collect detailed metrics every N batches; 0 disables intermediate metrics.")
     parser.add_argument("--resume", type=Path, default=None, help="Checkpoint path to resume.")
+    parser.add_argument(
+        "--auto-resume",
+        action="store_true",
+        help="Resume from <out-dir>/checkpoint_last.pt if it exists and --resume is not set.",
+    )
     parser.add_argument("--resume-model-only", action="store_true", help="Load model weights but reset optimizer.")
     parser.add_argument("--seed", type=int, default=42, help="Shuffle seed.")
     parser.add_argument("--grad-clip", type=float, default=1.0, help="Gradient clipping norm; <=0 disables.")
@@ -116,6 +131,47 @@ def _append_history_row(path: Path, row: dict[str, float | int | str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as fp:
         fp.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def _resolve_resume_path(args: argparse.Namespace) -> Optional[Path]:
+    if args.resume is not None:
+        resume_path = Path(args.resume).expanduser()
+        if not resume_path.is_file():
+            raise FileNotFoundError(f"Resume checkpoint does not exist: {resume_path}")
+        return resume_path
+    if not bool(args.auto_resume):
+        return None
+    candidate = Path(args.out_dir).expanduser() / "checkpoint_last.pt"
+    if candidate.is_file():
+        return candidate
+    print(f"Auto-resume requested, but no checkpoint found at {candidate}; starting a new run.", flush=True)
+    return None
+
+
+def _checkpoint_loss(checkpoint: dict, fallback: float = float("inf")) -> float:
+    metrics = dict(checkpoint.get("metrics", {}))
+    for key in ("val_loss", "loss"):
+        value = metrics.get(key)
+        if value is not None:
+            try:
+                loss = float(value)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(loss):
+                return loss
+    return float(fallback)
+
+
+def _initial_best_loss(out_dir: Path, resume_checkpoint: Optional[dict]) -> float:
+    best_loss = _checkpoint_loss(resume_checkpoint) if resume_checkpoint is not None else float("inf")
+    best_path = out_dir / "checkpoint_best.pt"
+    if best_path.is_file():
+        try:
+            best_checkpoint = torch.load(str(best_path), map_location="cpu", weights_only=False)
+            best_loss = min(best_loss, _checkpoint_loss(best_checkpoint, best_loss))
+        except Exception as exc:
+            print(f"Could not read existing best checkpoint {best_path}: {exc}", flush=True)
+    return float(best_loss)
 
 
 def _mean_metrics(items: list[dict[str, float]]) -> dict[str, float]:
@@ -233,6 +289,8 @@ def _evaluate(
 def main() -> int:
     args = parse_args()
     data_dir = Path(args.data_dir).expanduser()
+    args.data_dir = data_dir
+    args.out_dir = Path(args.out_dir).expanduser()
     meta = _load_meta(data_dir)
     shards = [str(item) for item in meta.get("shards", [])]
     train_shards, val_shards = _split_shards(shards, float(args.val_fraction))
@@ -245,11 +303,12 @@ def main() -> int:
 
     resume_checkpoint = None
     resume_epoch = 0
-    if args.resume is not None:
-        resume_checkpoint = torch.load(str(Path(args.resume).expanduser()), map_location="cpu", weights_only=False)
+    resume_path = _resolve_resume_path(args)
+    if resume_path is not None:
+        resume_checkpoint = torch.load(str(resume_path), map_location="cpu", weights_only=False)
         resume_epoch = int(resume_checkpoint.get("epoch", 0))
         model_config = ModelConfig(**dict(resume_checkpoint.get("model_config", {})))
-        print(f"Resuming from checkpoint: {args.resume} at epoch={resume_epoch}", flush=True)
+        print(f"Resuming from checkpoint: {resume_path} at epoch={resume_epoch}", flush=True)
     else:
         max_tracks = max(int(args.max_tracks), int(meta.get("max_gt", 0)))
         model_config = ModelConfig(
@@ -304,6 +363,7 @@ def main() -> int:
         "dataset_config": asdict(dataset_config),
         "model_config": asdict(model_config),
         "train_args": {key: (str(value) if isinstance(value, Path) else value) for key, value in vars(args).items()},
+        "resolved_resume": str(resume_path) if resume_path is not None else "",
         "device": device,
         "created_at_unix": time.time(),
     }
@@ -323,13 +383,13 @@ def main() -> int:
         f"amp={use_amp}, matcher={args.matcher}"
     )
 
-    best_loss = float("inf")
-    if resume_checkpoint is not None:
-        resume_metrics = dict(resume_checkpoint.get("metrics", {}))
-        best_loss = float(resume_metrics.get("val_loss", resume_metrics.get("loss", best_loss)))
+    best_loss = _initial_best_loss(args.out_dir, resume_checkpoint)
     start_epoch = resume_epoch + 1 if resume_checkpoint is not None else 1
     if start_epoch > int(args.epochs):
-        print(f"Checkpoint epoch={resume_epoch} is already >= target epochs={int(args.epochs)}; nothing to train.")
+        print(
+            f"Checkpoint epoch={resume_epoch} is already >= target epochs={int(args.epochs)}; nothing to train. "
+            "Increase --epochs to continue for more total epochs."
+        )
         return 0
 
     for epoch in range(start_epoch, int(args.epochs) + 1):

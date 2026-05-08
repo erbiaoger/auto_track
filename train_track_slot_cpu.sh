@@ -13,7 +13,20 @@ HIDDEN_DIM=${HIDDEN_DIM:-64}
 DECODER_LAYERS=${DECODER_LAYERS:-1}
 POOLED_TIME=${POOLED_TIME:-64}
 MATCHER=${MATCHER:-hungarian}
+RESUME=${RESUME:-}
+AUTO_RESUME=${AUTO_RESUME:-0}
+RESUME_MODEL_ONLY=${RESUME_MODEL_ONLY:-0}
 SEED=${SEED:-42}
+
+resume_args=""
+if [ -n "$RESUME" ]; then
+  resume_args="--resume $RESUME"
+  if [ "$RESUME_MODEL_ONLY" = "1" ] || [ "$RESUME_MODEL_ONLY" = "true" ]; then
+    resume_args="$resume_args --resume-model-only"
+  fi
+elif [ "$AUTO_RESUME" = "1" ] || [ "$AUTO_RESUME" = "true" ]; then
+  resume_args="--auto-resume"
+fi
 
 uv run python -m autotrack.dl.train_track_slot \
   --data-dir "$DATA_DIR" \
@@ -29,4 +42,5 @@ uv run python -m autotrack.dl.train_track_slot \
   --matcher "$MATCHER" \
   --metrics-every 1 \
   --log-every 1 \
-  --seed "$SEED"
+  --seed "$SEED" \
+  $resume_args

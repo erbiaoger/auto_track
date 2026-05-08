@@ -32,6 +32,10 @@ Deep-learning code for DAS vehicle trajectory recognition.
 ```sh
 uv run python -m autotrack.dl.generate_track_slot_dataset --out-dir datasets/track_slot/train --num-samples 1024 --shard-size 128 --workers 8 --overwrite
 uv run python -m autotrack.dl.train_track_slot --data-dir datasets/track_slot/train --out-dir models/track_slot_cuda --device cuda --amp on
+uv run python -m autotrack.dl.train_track_slot --data-dir datasets/track_slot/train --out-dir models/track_slot_cuda --device cuda --amp on --epochs 200 --auto-resume
 uv run python -m autotrack.dl.plot_track_slot_history --run-dir models/track_slot_cuda --separate
 uv run python -m autotrack.dl.predict_track_slot_dataset --data-dir datasets/track_slot/train --model models/track_slot_cuda/checkpoint_best.pt --out-dir /tmp/track_slot_prediction_check --device cuda --max-samples 128
 ```
+
+`--auto-resume` reads `<out-dir>/checkpoint_last.pt` when present. `--epochs`
+means the final total epoch count, not the number of additional epochs.

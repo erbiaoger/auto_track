@@ -619,6 +619,22 @@ WORKERS=8 sh generate_track_slot_dataset.sh
 DEVICE=cuda EPOCHS=50 BATCH_SIZE=64 sh train_track_slot_cuda.sh
 ```
 
+默认 CUDA 脚本设置 `AUTO_RESUME=1`。如果
+`models/track_slot_cuda/checkpoint_last.pt` 已存在，重新运行同一条命令会自动从
+这个 checkpoint 继续训练；如果不存在，则从头开始。
+
+也可以显式指定 checkpoint：
+
+```sh
+RESUME=models/track_slot_cuda/checkpoint_last.pt \
+EPOCHS=200 \
+sh train_track_slot_cuda.sh
+```
+
+注意：`EPOCHS` 是目标总 epoch 数，不是额外训练轮数。例如 checkpoint 已经在
+第 180 个 epoch，继续训练到第 200 个 epoch 时应设置 `EPOCHS=200`，不是
+`EPOCHS=20`。
+
 训练输出：
 
 ```text
