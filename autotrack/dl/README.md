@@ -8,7 +8,8 @@ Deep-learning code for DAS vehicle trajectory recognition.
   training. It writes `meta.json` and `shard_*.pt`; it does not write or read
   SAC files.
 - `predict_track_slot_dataset.py`: runs a trained TrackSlotNet checkpoint
-  directly on generated tensor shards and writes prediction CSV plus metrics.
+  directly on generated tensor shards and writes prediction CSV, metrics, and
+  heatmap overlay figures.
 - `track_slot_model.py`: model, Hungarian/greedy set loss, metrics, inference,
   NMS, and checkpoint helpers for `model_family=track_slot`.
 - `train_track_slot.py`: trains TrackSlotNet from generated shards.

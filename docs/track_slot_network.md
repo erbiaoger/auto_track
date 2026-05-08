@@ -103,7 +103,7 @@ generate_track_slot_dataset.py
 train_track_slot.py
     -> checkpoint_last.pt / checkpoint_best.pt
 predict_track_slot_dataset.py
-    -> summary.json / predicted_tracks.csv / sample_summary.csv
+    -> summary.json / predicted_tracks.csv / sample_summary.csv / plots/*.png
 infer_trajectory_model.py --model-family track_slot
     -> auto_tracks_deep.csv
 evaluate_trajectory_model.py --model-family track_slot

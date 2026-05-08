@@ -46,6 +46,9 @@ Predict directly on generated tensor shards:
 MODEL=/tmp/track_slot_smoke/checkpoint_best.pt DATA_DIR=/tmp/track_slot_data OUT_DIR=/tmp/track_slot_predict sh predict_track_slot_dataset.sh
 ```
 
+This writes `summary.json`, prediction CSV files, and heatmap overlay figures
+under `<OUT_DIR>/plots/`.
+
 Infer on SAC data with a trained checkpoint:
 
 ```sh

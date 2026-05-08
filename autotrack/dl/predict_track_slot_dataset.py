@@ -21,6 +21,7 @@ Arguments:
     --model points to a TrackSlotNet checkpoint produced by `train_track_slot.py`.
     --max-samples limits how many shard samples are evaluated; use 0 for all.
     --max-csv-samples limits detailed per-channel CSV output; use 0 to disable.
+    --plot-samples limits how many heatmap overlay figures are written.
     --objectness-threshold and --visibility-threshold control which predicted
     slots and channel points are written to CSV.
 
@@ -34,6 +35,8 @@ Outputs:
     <out-dir>/ground_truth_tracks.csv
         Per-channel rows for GT vehicle trajectories on the first CSV samples,
         unless `--no-ground-truth-csv` is set.
+    <out-dir>/plots/sample_000000.png, ...
+        Heatmap figures with predicted and GT trajectories overlaid.
 """
 
 from __future__ import annotations
@@ -67,6 +70,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=16, help="Evaluation batch size.")
     parser.add_argument("--max-samples", type=int, default=256, help="Maximum evaluated samples; 0 evaluates all samples.")
     parser.add_argument("--max-csv-samples", type=int, default=32, help="Detailed CSV sample limit; 0 disables detailed CSV.")
+    parser.add_argument("--plot-samples", type=int, default=16, help="Number of heatmap overlay figures to write; 0 disables plots.")
+    parser.add_argument("--plot-dpi", type=int, default=160, help="DPI for overlay PNG figures.")
     parser.add_argument("--objectness-threshold", type=float, default=0.5, help="Predicted slot objectness threshold.")
     parser.add_argument("--visibility-threshold", type=float, default=0.5, help="Predicted per-channel visibility threshold.")
     parser.add_argument("--min-visible-channels", type=int, default=3, help="Minimum visible channels for a predicted track.")
@@ -258,6 +263,106 @@ def _write_ground_truth_rows(
             )
 
 
+def _plot_sample_overlay(
+    out_path: Path,
+    *,
+    heatmap: torch.Tensor,
+    sample_index: int,
+    predictions: list[dict[str, Any]],
+    targets_cpu: dict[str, torch.Tensor],
+    batch_index: int,
+    window_seconds: float,
+    speed_norm_kmh: float,
+    dpi: int,
+) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    plt.rcParams.update(
+        {
+            "font.family": "Times New Roman",
+            "axes.unicode_minus": False,
+        }
+    )
+    arr = heatmap.detach().cpu().to(torch.float32).numpy()
+    if arr.ndim != 2:
+        raise ValueError("heatmap must have shape [channel, time]")
+    n_ch, n_t = int(arr.shape[0]), int(arr.shape[1])
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    finite = arr[np.isfinite(arr)]
+    if finite.size:
+        vmax = float(np.quantile(np.abs(finite), 0.995))
+        vmax = max(vmax, 1e-6)
+    else:
+        vmax = 1.0
+
+    fig, ax = plt.subplots(figsize=(12.0, 7.0))
+    im = ax.imshow(
+        arr,
+        origin="lower",
+        aspect="auto",
+        cmap="gray_r",
+        vmin=-vmax,
+        vmax=vmax,
+        extent=(0.0, float(window_seconds), -0.5, float(n_ch) - 0.5),
+        interpolation="nearest",
+    )
+    valid = targets_cpu["gt_valid"][batch_index]
+    valid_indices = torch.where(valid)[0].tolist()
+    gt_label_added = False
+    for gt_idx in valid_indices:
+        visible_channels = torch.where(targets_cpu["visibility"][batch_index, gt_idx] > 0.5)[0].tolist()
+        if len(visible_channels) < 2:
+            continue
+        time_s = [
+            float(targets_cpu["time"][batch_index, gt_idx, ch].item()) * float(window_seconds)
+            for ch in visible_channels
+        ]
+        ax.plot(
+            time_s,
+            visible_channels,
+            color="#00a651",
+            linewidth=1.0,
+            alpha=0.35,
+            label="GT" if not gt_label_added else None,
+        )
+        gt_label_added = True
+
+    pred_label_added = False
+    for pred in predictions:
+        channels = list(pred["channels"])
+        if len(channels) < 2:
+            continue
+        time_s = [float(pred["time_norm"][ch].item()) * float(window_seconds) for ch in channels]
+        ax.plot(
+            time_s,
+            channels,
+            color="#d62728",
+            linewidth=1.6,
+            alpha=0.9,
+            label="Prediction" if not pred_label_added else None,
+        )
+        ax.scatter(time_s, channels, s=8, color="#ffd23f", edgecolors="#7a0019", linewidths=0.25, alpha=0.9)
+        pred_label_added = True
+
+    gt_count = int(targets_cpu["gt_valid"][batch_index].sum().item())
+    ax.set_title(f"TrackSlotNet prediction overlay, sample {sample_index}  GT={gt_count}  Pred={len(predictions)}")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Channel index")
+    ax.set_xlim(0.0, float(window_seconds))
+    ax.set_ylim(-0.5, float(n_ch) - 0.5)
+    ax.grid(False)
+    if gt_label_added or pred_label_added:
+        ax.legend(loc="upper right", frameon=True)
+    cbar = fig.colorbar(im, ax=ax, fraction=0.025, pad=0.02)
+    cbar.set_label("Normalized heatmap amplitude")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=int(dpi), bbox_inches="tight")
+    plt.close(fig)
+
+
 def _weighted_add(
     sums: defaultdict[str, float],
     weights: defaultdict[str, float],
@@ -297,6 +402,7 @@ def main() -> int:
     sample_summary_path = out_dir / "sample_summary.csv"
     pred_csv_path = out_dir / "predicted_tracks.csv"
     gt_csv_path = out_dir / "ground_truth_tracks.csv"
+    plots_dir = out_dir / "plots"
 
     metric_sums: defaultdict[str, float] = defaultdict(float)
     metric_weights: defaultdict[str, float] = defaultdict(float)
@@ -312,6 +418,7 @@ def main() -> int:
     sample_count = 0
     batch_count = 0
     csv_sample_count = 0
+    plot_sample_count = 0
     t0 = time.perf_counter()
 
     pred_fields = [
@@ -425,6 +532,19 @@ def main() -> int:
                                     speed_norm_kmh=float(speed_norm_kmh),
                                 )
                             csv_sample_count += 1
+                        if int(args.plot_samples) > 0 and plot_sample_count < int(args.plot_samples):
+                            _plot_sample_overlay(
+                                plots_dir / f"sample_{int(sample_index):06d}.png",
+                                heatmap=x_cpu[b, 0],
+                                sample_index=int(sample_index),
+                                predictions=predictions,
+                                targets_cpu=targets_cpu,
+                                batch_index=b,
+                                window_seconds=float(meta.get("window_seconds", 1.0)),
+                                speed_norm_kmh=float(speed_norm_kmh),
+                                dpi=int(args.plot_dpi),
+                            )
+                            plot_sample_count += 1
                     sample_count += batch_n
                     batch_count += 1
         finally:
@@ -474,6 +594,7 @@ def main() -> int:
             "sample_summary_csv": str(sample_summary_path),
             "predicted_tracks_csv": str(pred_csv_path),
             "ground_truth_tracks_csv": None if bool(args.no_ground_truth_csv) else str(gt_csv_path),
+            "plots_dir": str(plots_dir) if int(args.plot_samples) > 0 else None,
         },
     }
     summary_path.write_text(json.dumps(_json_ready(summary), indent=2, ensure_ascii=False), encoding="utf-8")
