@@ -102,6 +102,8 @@ generate_track_slot_dataset.py
     -> meta.json + shard_*.pt
 train_track_slot.py
     -> checkpoint_last.pt / checkpoint_best.pt
+predict_track_slot_dataset.py
+    -> summary.json / predicted_tracks.csv / sample_summary.csv
 infer_trajectory_model.py --model-family track_slot
     -> auto_tracks_deep.csv
 evaluate_trajectory_model.py --model-family track_slot
@@ -115,6 +117,7 @@ CPU smoke test:
 ```sh
 uv run python -m autotrack.dl.generate_track_slot_dataset --out-dir /tmp/track_slot_data --num-samples 32 --shard-size 16 --window-seconds 10 --time-downsample 20 --workers 2 --overwrite
 uv run python -m autotrack.dl.train_track_slot --data-dir /tmp/track_slot_data --out-dir /tmp/track_slot_smoke --device cpu --epochs 1 --batch-size 2
+uv run python -m autotrack.dl.predict_track_slot_dataset --data-dir /tmp/track_slot_data --model /tmp/track_slot_smoke/checkpoint_best.pt --out-dir /tmp/track_slot_predict --device cpu --max-samples 16
 ```
 
 CUDA training:
@@ -122,4 +125,5 @@ CUDA training:
 ```sh
 WORKERS=8 sh generate_track_slot_dataset.sh
 DEVICE=cuda EPOCHS=2 BATCH_SIZE=64 sh train_track_slot_cuda.sh
+DEVICE=cuda sh predict_track_slot_dataset.sh
 ```

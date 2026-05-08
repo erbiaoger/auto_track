@@ -40,6 +40,12 @@ uv run python -m autotrack.dl.generate_track_slot_dataset --out-dir /tmp/track_s
 uv run python -m autotrack.dl.train_track_slot --data-dir /tmp/track_slot_data --out-dir /tmp/track_slot_smoke --device cpu --epochs 1 --batch-size 2
 ```
 
+Predict directly on generated tensor shards:
+
+```sh
+MODEL=/tmp/track_slot_smoke/checkpoint_best.pt DATA_DIR=/tmp/track_slot_data OUT_DIR=/tmp/track_slot_predict sh predict_track_slot_dataset.sh
+```
+
 Infer on SAC data with a trained checkpoint:
 
 ```sh
