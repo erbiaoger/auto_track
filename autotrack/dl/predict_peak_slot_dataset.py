@@ -156,6 +156,7 @@ def _active_predictions(
     peak_threshold: float,
     min_visible_channels: int,
     max_predicted_tracks: int,
+    speed_norm_kmh: float,
 ) -> list[dict[str, Any]]:
     obj = torch.sigmoid(outputs_cpu["objectness_logits"][batch_index])
     peak_prob = torch.softmax(outputs_cpu["peak_logits"][batch_index], dim=-1)
@@ -195,6 +196,7 @@ def _active_predictions(
                 "direction_label": direction_label,
                 "direction": LABEL_TO_DIRECTION.get(direction_label, str(direction_label)),
                 "speed": float(speed[slot].item()),
+                "speed_kmh": float(speed[slot].item() * float(speed_norm_kmh)),
                 "channels": channels,
                 "peak_indices": peak_indices,
                 "peak_probs": probs,
@@ -214,6 +216,7 @@ def _write_prediction_rows(writer: csv.DictWriter, *, sample_index: int, predict
                     "rank": int(pred["rank"]),
                     "score": f"{float(pred['score']):.6f}",
                     "direction": str(pred["direction"]),
+                    "speed_kmh": f"{float(pred['speed_kmh']):.6f}",
                     "channel": int(ch),
                     "peak_index": int(peak_idx),
                     "time_norm": f"{float(targets_cpu['peak_time'][batch_index, ch, peak_idx].item()):.8f}",
@@ -290,16 +293,34 @@ def _plot_sample_overlay(
         if len(chs) >= 2:
             ax.plot(times, chs, color="#00a651", linewidth=1.0, alpha=0.35, label="GT" if not gt_label_added else None)
             gt_label_added = True
+    cmap = plt.get_cmap("tab20", max(1, len(predictions)))
+    x_span_plot = max(1e-6, float(window_seconds))
     pred_label_added = False
-    for pred in predictions:
+    for pred_id, pred in enumerate(predictions):
         chs = list(pred["channels"])
         times = [
             float(targets_cpu["peak_time"][batch_index, ch, peak_idx].item()) * float(window_seconds)
             for ch, peak_idx in zip(pred["channels"], pred["peak_indices"])
         ]
         if len(chs) >= 2:
-            ax.plot(times, chs, color="#d62728", linewidth=1.6, alpha=0.9, label="Prediction" if not pred_label_added else None)
-            ax.scatter(times, chs, s=8, color="#ffd23f", edgecolors="#7a0019", linewidths=0.25, alpha=0.9)
+            color = cmap(pred_id % max(1, cmap.N))
+            ax.plot(times, chs, color=color, linewidth=1.6, alpha=0.9, label="Prediction" if not pred_label_added else None)
+            ax.scatter(times, chs, s=9, color=[color], edgecolors="black", linewidths=0.2, alpha=0.95)
+            speed_kmh = float(pred.get("speed_kmh", float("nan")))
+            if math.isfinite(speed_kmh):
+                mid = len(times) // 2
+                x_text = min(float(window_seconds) - 0.02 * x_span_plot, float(times[mid]) + 0.01 * x_span_plot)
+                ax.text(
+                    x_text,
+                    float(chs[mid]),
+                    f"{speed_kmh:.1f} km/h",
+                    color=color,
+                    fontsize=8,
+                    ha="left",
+                    va="center",
+                    alpha=0.95,
+                    bbox={"facecolor": "white", "alpha": 0.55, "edgecolor": "none", "pad": 0.8},
+                )
             pred_label_added = True
     gt_count = int(targets_cpu["gt_valid"][batch_index].sum().item())
     ax.set_title(f"PeakSlotNet prediction overlay, sample {sample_index}  GT={gt_count}  Pred={len(predictions)}")
@@ -329,6 +350,7 @@ def main() -> int:
     model, checkpoint = load_checkpoint_model(args.model, device=device)
     if str(checkpoint.get("model_family", "peak_slot")) != "peak_slot":
         raise ValueError(f"Checkpoint is not peak_slot: model_family={checkpoint.get('model_family')}")
+    speed_norm_kmh = float(meta.get("speed_norm_kmh", 150.0))
     summary_path = out_dir / "summary.json"
     sample_summary_path = out_dir / "sample_summary.csv"
     pred_csv_path = out_dir / "predicted_tracks.csv"
@@ -347,7 +369,7 @@ def main() -> int:
     plot_sample_count = 0
     batch_count = 0
     t0 = time.perf_counter()
-    pred_fields = ["sample_index", "pred_track_id", "slot", "rank", "score", "direction", "channel", "peak_index", "time_norm", "peak_amp", "peak_prob"]
+    pred_fields = ["sample_index", "pred_track_id", "slot", "rank", "score", "direction", "speed_kmh", "channel", "peak_index", "time_norm", "peak_amp", "peak_prob"]
     gt_fields = ["sample_index", "gt_track_id", "direction", "channel", "peak_index", "time_norm"]
     sample_fields = ["sample_index", "gt_count", "pred_count", "max_objectness", "mean_objectness", "top_score"]
     with sample_summary_path.open("w", newline="", encoding="utf-8") as sample_fp, pred_csv_path.open("w", newline="", encoding="utf-8") as pred_fp:
@@ -398,6 +420,7 @@ def main() -> int:
                             peak_threshold=float(args.peak_threshold),
                             min_visible_channels=int(args.min_visible_channels),
                             max_predicted_tracks=int(args.max_predicted_tracks),
+                            speed_norm_kmh=float(speed_norm_kmh),
                         )
                         gt_count = int(targets_cpu["gt_valid"][b].sum().item())
                         pred_count = int(len(predictions))
@@ -447,6 +470,7 @@ def main() -> int:
         "model_family": str(checkpoint.get("model_family", "peak_slot")),
         "checkpoint_epoch": int(checkpoint.get("epoch", 0)),
         "device": device,
+        "speed_norm_kmh": float(speed_norm_kmh),
         "sample_count": int(sample_count),
         "batch_count": int(batch_count),
         "elapsed_seconds": float(time.perf_counter() - t0),
