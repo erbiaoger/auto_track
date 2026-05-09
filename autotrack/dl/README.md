@@ -19,6 +19,17 @@ Deep-learning code for DAS vehicle trajectory recognition.
 - `train_track_slot.py`: trains TrackSlotNet from generated shards, including
   objectness count calibration plus monotonic and smoothness trajectory losses.
 
+## PeakSlotNet Files
+
+- `convert_track_slot_to_peak_slot.py`: converts existing TrackSlotNet shards
+  into peak-candidate shards with `peak_time`, `peak_amp`, `peak_valid`, and
+  `gt_peak_index`.
+- `peak_slot_model.py`: PeakSlotNet model, Hungarian/greedy set loss, metrics,
+  checkpoint helpers, and SAC-window inference for `model_family=peak_slot`.
+- `train_peak_slot.py`: trains PeakSlotNet from converted peak-candidate shards.
+- `predict_peak_slot_dataset.py`: predicts selected peak candidates, writes
+  CSV files, and draws overlay figures where predictions lie on detected peaks.
+
 ## Legacy / Compatible Files
 
 - `trajectory_set_model.py`: older query polyline model and shared utilities.
@@ -37,6 +48,9 @@ uv run python -m autotrack.dl.train_track_slot --data-dir datasets/track_slot/tr
 uv run python -m autotrack.dl.train_track_slot --data-dir datasets/track_slot/train --out-dir models/track_slot_cuda --device cuda --amp on --epochs 200 --auto-resume
 uv run python -m autotrack.dl.plot_track_slot_history --run-dir models/track_slot_cuda --separate
 uv run python -m autotrack.dl.predict_track_slot_dataset --data-dir datasets/track_slot/train --model models/track_slot_cuda/checkpoint_best.pt --out-dir /tmp/track_slot_prediction_check --device cuda --max-samples 128
+uv run python -m autotrack.dl.convert_track_slot_to_peak_slot --in-dir datasets/track_slot/train --out-dir datasets/peak_slot/train --overwrite
+uv run python -m autotrack.dl.train_peak_slot --data-dir datasets/peak_slot/train --out-dir models/peak_slot_cuda --device cuda --amp on
+uv run python -m autotrack.dl.predict_peak_slot_dataset --data-dir datasets/peak_slot/train --model models/peak_slot_cuda/checkpoint_best.pt --out-dir /tmp/peak_slot_prediction_check --device cuda --max-samples 128
 ```
 
 `--auto-resume` reads `<out-dir>/checkpoint_last.pt` when present. `--epochs`

@@ -1,0 +1,680 @@
+"""PeakSlotNet for peak-candidate vehicle trajectory recognition.
+
+Purpose:
+    Predict vehicle instance slots by selecting per-channel peak candidates.
+    Unlike TrackSlotNet, this model never outputs an arbitrary time for a
+    channel. Each slot either chooses one detected peak candidate on that
+    channel or chooses the final `none` class.
+
+Example:
+    uv run python -m autotrack.dl.train_peak_slot \
+        --data-dir datasets/peak_slot/train \
+        --out-dir models/peak_slot_cuda \
+        --device cuda \
+        --amp on
+
+Outputs:
+    objectness_logits [B, Q]
+    direction_logits  [B, Q, 2]
+    speed             [B, Q]
+    peak_logits       [B, Q, C, K + 1], where K is candidate count and K is none.
+"""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Optional
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from scipy.optimize import linear_sum_assignment
+from scipy.signal import find_peaks
+from torch import nn
+
+from autotrack.core.track_extractor_graph import Track, TrackPoint
+from autotrack.dl.trajectory_set_model import (
+    LABEL_TO_DIRECTION,
+    WindowDatasetConfig,
+    auto_torch_device,
+    prepare_window_input,
+)
+
+
+@dataclass
+class PeakDetectionConfig:
+    candidates_per_channel: int = 64
+    min_distance_s: float = 0.5
+    min_height: float = 0.02
+    prominence: float = 0.02
+    match_tolerance_s: float = 0.25
+
+
+@dataclass
+class ModelConfig:
+    n_channels: int = 50
+    in_channels: int = 1
+    max_tracks: int = 96
+    peak_candidates: int = 64
+    hidden_dim: int = 128
+    num_heads: int = 4
+    decoder_layers: int = 2
+    pooled_channels: int = 8
+    pooled_time: int = 128
+    dropout: float = 0.1
+
+
+@dataclass
+class InferenceConfig:
+    time_downsample: int = 10
+    objectness_threshold: float = 0.5
+    peak_threshold: float = 0.4
+    min_visible_channels: int = 3
+    max_tracks: int = 96
+    dedup_tolerance_samples: int = 180
+    dedup_min_overlap_channels: int = 3
+    speed_norm_kmh: float = 150.0
+    clip_ratio: float = 1.35
+    peak_candidates: int = 64
+    peak_min_distance_s: float = 0.5
+    peak_min_height: float = 0.02
+    peak_prominence: float = 0.02
+
+
+class ConvBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, stride: tuple[int, int] = (1, 1)):
+        super().__init__()
+        groups = max(1, min(8, out_channels // 4))
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False),
+            nn.GroupNorm(groups, out_channels),
+            nn.GELU(),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(groups, out_channels),
+            nn.GELU(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+def detect_peak_candidates_from_tensor(
+    heatmap: torch.Tensor,
+    *,
+    fs: float,
+    time_downsample: int,
+    window_samples: int,
+    config: PeakDetectionConfig,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Detect peak candidates for one normalized heatmap [C, T_down]."""
+    arr = heatmap.detach().cpu().to(torch.float32).numpy()
+    if arr.ndim != 2:
+        raise ValueError("heatmap must have shape [channel, time]")
+    n_ch, t_down = int(arr.shape[0]), int(arr.shape[1])
+    k_count = int(config.candidates_per_channel)
+    peak_time = torch.zeros((n_ch, k_count), dtype=torch.float32)
+    peak_amp = torch.zeros((n_ch, k_count), dtype=torch.float32)
+    peak_valid = torch.zeros((n_ch, k_count), dtype=torch.bool)
+    peak_index = torch.full((n_ch, k_count), -1, dtype=torch.long)
+    distance = int(max(1, round(float(config.min_distance_s) * float(fs) / float(max(1, time_downsample)))))
+    for ch in range(n_ch):
+        row = np.abs(arr[ch]).astype(np.float32, copy=False)
+        peaks, props = find_peaks(
+            row,
+            height=float(config.min_height),
+            prominence=float(config.prominence),
+            distance=distance,
+        )
+        if peaks.size == 0:
+            peaks, props = find_peaks(row, distance=distance)
+        if peaks.size == 0:
+            continue
+        amps = row[peaks].astype(np.float32, copy=False)
+        prominences = props.get("prominences", amps).astype(np.float32, copy=False)
+        score = amps + 0.1 * prominences
+        if peaks.size > k_count:
+            keep = np.argsort(score)[-k_count:]
+            peaks = peaks[keep]
+            amps = amps[keep]
+        order = np.argsort(peaks)
+        peaks = peaks[order]
+        amps = amps[order]
+        take = min(k_count, int(peaks.size))
+        idx = torch.as_tensor(peaks[:take], dtype=torch.long)
+        peak_index[ch, :take] = idx
+        peak_time[ch, :take] = (
+            idx.to(torch.float32) * float(max(1, time_downsample)) / float(max(1, window_samples - 1))
+        ).clamp(0.0, 1.0)
+        peak_amp[ch, :take] = torch.as_tensor(amps[:take], dtype=torch.float32)
+        peak_valid[ch, :take] = True
+    return peak_time, peak_amp, peak_valid, peak_index
+
+
+class PeakSlotPredictor(nn.Module):
+    """Predict fixed vehicle slots that select per-channel peak candidates."""
+
+    def __init__(self, config: Optional[ModelConfig] = None):
+        super().__init__()
+        self.config = config or ModelConfig()
+        c = self.config
+        hidden = int(c.hidden_dim)
+        self.backbone = nn.Sequential(
+            ConvBlock(int(c.in_channels), 32, stride=(1, 2)),
+            ConvBlock(32, 64, stride=(1, 2)),
+            ConvBlock(64, hidden, stride=(2, 2)),
+            ConvBlock(hidden, hidden, stride=(2, 2)),
+        )
+        self.pool_size = (int(c.pooled_channels), int(c.pooled_time))
+        token_count = int(c.pooled_channels) * int(c.pooled_time)
+        self.pos_embed = nn.Parameter(torch.randn(1, token_count, hidden) * 0.02)
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=hidden,
+            nhead=int(c.num_heads),
+            dim_feedforward=hidden * 4,
+            dropout=float(c.dropout),
+            batch_first=True,
+            activation="gelu",
+        )
+        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=int(c.decoder_layers))
+        self.slot_embed = nn.Embedding(int(c.max_tracks), hidden)
+        self.channel_embed = nn.Embedding(int(c.n_channels), hidden)
+        self.peak_encoder = nn.Sequential(
+            nn.Linear(4, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, hidden),
+            nn.LayerNorm(hidden),
+        )
+        self.slot_peak_proj = nn.Sequential(nn.LayerNorm(hidden), nn.Linear(hidden, hidden))
+        self.none_head = nn.Sequential(nn.LayerNorm(hidden), nn.Linear(hidden, 1))
+        self.objectness_head = nn.Sequential(nn.LayerNorm(hidden), nn.Linear(hidden, 1))
+        self.direction_head = nn.Sequential(nn.LayerNorm(hidden), nn.Linear(hidden, 2))
+        self.speed_head = nn.Sequential(nn.LayerNorm(hidden), nn.Linear(hidden, 1))
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        peak_time: torch.Tensor,
+        peak_amp: torch.Tensor,
+        peak_valid: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        feat = F.interpolate(
+            self.backbone(x),
+            size=self.pool_size,
+            mode="bilinear",
+            align_corners=False,
+        )
+        memory = feat.flatten(2).transpose(1, 2)
+        memory = memory + self.pos_embed[:, : memory.shape[1], :]
+        query = self.slot_embed.weight.unsqueeze(0).expand(x.shape[0], -1, -1)
+        hs = self.decoder(tgt=query, memory=memory)
+
+        bsz, n_ch, k_count = int(peak_time.shape[0]), int(peak_time.shape[1]), int(peak_time.shape[2])
+        ch_pos = torch.linspace(0.0, 1.0, n_ch, device=peak_time.device, dtype=peak_time.dtype)
+        ch_pos = ch_pos.view(1, n_ch, 1).expand(bsz, n_ch, k_count)
+        valid_f = peak_valid.to(dtype=peak_time.dtype)
+        peak_feat = torch.stack([peak_time, peak_amp, valid_f, ch_pos], dim=-1)
+        peak_tokens = self.peak_encoder(peak_feat)
+        ch_ids = torch.arange(n_ch, device=peak_time.device, dtype=torch.long)
+        peak_tokens = peak_tokens + self.channel_embed(ch_ids).view(1, n_ch, 1, -1)
+
+        slot_peak = self.slot_peak_proj(hs)
+        peak_scores = torch.einsum("bqh,bckh->bqck", slot_peak, peak_tokens) / float(max(1, slot_peak.shape[-1])) ** 0.5
+        peak_scores = peak_scores.masked_fill(~peak_valid[:, None, :, :], -1e4)
+        none_context = hs[:, :, None, :] + self.channel_embed(ch_ids).view(1, 1, n_ch, -1)
+        none_scores = self.none_head(none_context).squeeze(-1).unsqueeze(-1)
+        peak_logits = torch.cat([peak_scores, none_scores], dim=-1)
+        return {
+            "num_regular_queries": int(self.config.max_tracks),
+            "objectness_logits": self.objectness_head(hs).squeeze(-1),
+            "direction_logits": self.direction_head(hs),
+            "speed": self.speed_head(hs).squeeze(-1),
+            "peak_logits": peak_logits,
+        }
+
+
+def _expected_peak_time(logits: torch.Tensor, peak_time: torch.Tensor, peak_valid: torch.Tensor) -> torch.Tensor:
+    probs = torch.softmax(logits[..., :-1], dim=-1) * peak_valid[:, None, :, :].to(logits.dtype)
+    denom = torch.clamp(probs.sum(dim=-1), min=1e-6)
+    return (probs * peak_time[:, None, :, :].to(logits.dtype)).sum(dim=-1) / denom
+
+
+def _greedy_match_cost(cost: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    q_count, g_count = int(cost.shape[0]), int(cost.shape[1])
+    k = min(q_count, g_count)
+    if k <= 0:
+        empty = torch.empty((0,), dtype=torch.long, device=cost.device)
+        return empty, empty
+    work = cost.clone()
+    large = torch.finfo(work.dtype).max
+    rows: list[torch.Tensor] = []
+    cols: list[torch.Tensor] = []
+    for _ in range(k):
+        idx = torch.argmin(work)
+        row = torch.div(idx, g_count, rounding_mode="floor").long()
+        col = (idx - row * g_count).long()
+        rows.append(row)
+        cols.append(col)
+        work[row, :] = large
+        work[:, col] = large
+    return torch.stack(rows), torch.stack(cols)
+
+
+def _match_single(
+    outputs: dict[str, torch.Tensor],
+    targets: dict[str, torch.Tensor],
+    b: int,
+    *,
+    matcher: str,
+    w_peak: float,
+    w_obj: float,
+    w_dir: float,
+    w_speed: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    device = outputs["objectness_logits"].device
+    q_count = int(outputs["num_regular_queries"])
+    gt_valid = targets["gt_valid"][b].to(device=device, dtype=torch.bool)
+    g_count = int(gt_valid.sum().item())
+    if g_count <= 0:
+        empty = torch.empty((0,), dtype=torch.long, device=device)
+        return empty, empty
+    logp = torch.log_softmax(outputs["peak_logits"][b, :q_count].detach(), dim=-1)
+    gt_peak = targets["gt_peak_index"][b, gt_valid].to(device=device, dtype=torch.long)
+    gt_vis = targets["visibility"][b, gt_valid].to(device=device, dtype=torch.float32)
+    gather_idx = gt_peak.clamp(0, logp.shape[-1] - 1)
+    logp_expanded = logp[:, None, :, :].expand(q_count, g_count, -1, -1)
+    nll = -logp_expanded.gather(-1, gather_idx[None, :, :, None].expand(q_count, g_count, -1, 1)).squeeze(-1)
+    peak_cost = (nll * gt_vis[None, :, :]).sum(dim=-1) / torch.clamp(gt_vis.sum(dim=-1)[None, :], min=1.0)
+    pred_obj = torch.sigmoid(outputs["objectness_logits"][b, :q_count].detach())
+    pred_dir = torch.softmax(outputs["direction_logits"][b, :q_count].detach(), dim=-1)
+    pred_speed = outputs["speed"][b, :q_count].detach()
+    gt_dir = targets["direction"][b, gt_valid].to(device=device, dtype=torch.long)
+    gt_speed = targets["speed"][b, gt_valid].to(device=device, dtype=torch.float32)
+    cost = (
+        float(w_peak) * peak_cost
+        - float(w_obj) * pred_obj[:, None]
+        - float(w_dir) * pred_dir[:, gt_dir]
+        + float(w_speed) * torch.abs(pred_speed[:, None] - gt_speed[None, :])
+    )
+    if str(matcher).lower() == "greedy":
+        return _greedy_match_cost(cost)
+    rows, cols = linear_sum_assignment(cost.detach().cpu().numpy())
+    return torch.as_tensor(rows, dtype=torch.long, device=device), torch.as_tensor(cols, dtype=torch.long, device=device)
+
+
+def peak_slot_set_loss(
+    outputs: dict[str, torch.Tensor],
+    targets: dict[str, torch.Tensor],
+    *,
+    no_object_weight: float = 0.15,
+    none_weight: float = 0.35,
+    matcher: str = "hungarian",
+    collect_metrics: bool = True,
+    w_peak: float = 3.0,
+    w_obj: float = 1.0,
+    w_dir: float = 0.2,
+    w_speed: float = 0.1,
+    peak_loss_weight: float = 1.0,
+    count_loss_weight: float = 0.05,
+    direction_loss_weight: float = 0.5,
+    speed_loss_weight: float = 0.25,
+    monotonic_loss_weight: float = 0.2,
+    smoothness_loss_weight: float = 0.05,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    device = outputs["objectness_logits"].device
+    batch_size = int(outputs["objectness_logits"].shape[0])
+    q_count = int(outputs["num_regular_queries"])
+    none_index = int(outputs["peak_logits"].shape[-1] - 1)
+    obj_target = torch.zeros((batch_size, q_count), dtype=torch.float32, device=device)
+    obj_weight = torch.full((batch_size, q_count), float(no_object_weight), dtype=torch.float32, device=device)
+    matched_b: list[torch.Tensor] = []
+    matched_q: list[torch.Tensor] = []
+    matched_g: list[torch.Tensor] = []
+    matched_total = 0
+    gt_total = int(targets["gt_valid"].sum().detach().cpu())
+
+    for b in range(batch_size):
+        rows, cols = _match_single(
+            outputs,
+            targets,
+            b,
+            matcher=matcher,
+            w_peak=w_peak,
+            w_obj=w_obj,
+            w_dir=w_dir,
+            w_speed=w_speed,
+        )
+        if rows.numel() == 0:
+            continue
+        obj_target[b, rows] = 1.0
+        obj_weight[b, rows] = 1.0
+        matched_total += int(rows.numel())
+        matched_b.append(torch.full_like(rows, b))
+        matched_q.append(rows)
+        matched_g.append(cols)
+
+    zero = torch.zeros((), dtype=torch.float32, device=device)
+    loss_obj = F.binary_cross_entropy_with_logits(
+        outputs["objectness_logits"][:, :q_count],
+        obj_target,
+        weight=obj_weight,
+        reduction="mean",
+    )
+
+    if matched_b:
+        b_sel = torch.cat(matched_b)
+        q_sel = torch.cat(matched_q)
+        g_sel = torch.cat(matched_g)
+        gt_valid = targets["gt_valid"].to(device=device, dtype=torch.bool)
+        mapped_items = []
+        for bi, gi in zip(b_sel.tolist(), g_sel.tolist()):
+            valid_idx = torch.where(gt_valid[int(bi)])[0]
+            mapped_items.append(valid_idx[int(gi)])
+        mapped_g = torch.stack(mapped_items)
+        pred_peak_logits = outputs["peak_logits"][b_sel, q_sel]
+        gt_peak = targets["gt_peak_index"][b_sel, mapped_g].to(device=device, dtype=torch.long).clamp(0, none_index)
+        ce = F.cross_entropy(pred_peak_logits.reshape(-1, none_index + 1), gt_peak.reshape(-1), reduction="none").view_as(gt_peak)
+        ce_weight = torch.where(
+            gt_peak == none_index,
+            torch.full_like(ce, float(none_weight)),
+            torch.ones_like(ce),
+        )
+        loss_peak = (ce * ce_weight).sum() / torch.clamp(ce_weight.sum(), min=1.0)
+        pred_dir = outputs["direction_logits"][b_sel, q_sel]
+        pred_speed = outputs["speed"][b_sel, q_sel]
+        gt_dir = targets["direction"][b_sel, mapped_g].to(device=device, dtype=torch.long)
+        gt_speed = targets["speed"][b_sel, mapped_g].to(device=device, dtype=torch.float32)
+        loss_dir = F.cross_entropy(pred_dir, gt_dir, reduction="mean")
+        loss_speed = F.smooth_l1_loss(pred_speed, gt_speed, reduction="mean")
+
+        exp_time = _expected_peak_time(outputs["peak_logits"], targets["peak_time"].to(device), targets["peak_valid"].to(device))
+        pred_time = exp_time[b_sel, q_sel]
+        gt_vis = targets["visibility"][b_sel, mapped_g].to(device=device, dtype=torch.float32)
+        pair_vis = gt_vis[:, 1:] * gt_vis[:, :-1]
+        dt = pred_time[:, 1:] - pred_time[:, :-1]
+        sign = torch.where(gt_dir[:, None] == 0, torch.ones_like(dt), -torch.ones_like(dt))
+        loss_mono = (torch.relu(-(dt * sign)) * pair_vis).sum() / torch.clamp(pair_vis.sum(), min=1.0)
+        if pred_time.shape[1] >= 3:
+            tri_vis = gt_vis[:, 2:] * gt_vis[:, 1:-1] * gt_vis[:, :-2]
+            d2 = pred_time[:, 2:] - 2.0 * pred_time[:, 1:-1] + pred_time[:, :-2]
+            smooth_raw = F.smooth_l1_loss(d2, torch.zeros_like(d2), reduction="none")
+            loss_smooth = (smooth_raw * tri_vis).sum() / torch.clamp(tri_vis.sum(), min=1.0)
+        else:
+            loss_smooth = zero
+    else:
+        loss_peak = zero
+        loss_dir = zero
+        loss_speed = zero
+        loss_mono = zero
+        loss_smooth = zero
+
+    obj_prob = torch.sigmoid(outputs["objectness_logits"][:, :q_count])
+    gt_count = targets["gt_valid"].to(device=device, dtype=torch.float32).sum(dim=1)
+    loss_count = F.smooth_l1_loss(obj_prob.sum(dim=1), gt_count, reduction="mean")
+    total = (
+        loss_obj
+        + float(peak_loss_weight) * loss_peak
+        + float(count_loss_weight) * loss_count
+        + float(direction_loss_weight) * loss_dir
+        + float(speed_loss_weight) * loss_speed
+        + float(monotonic_loss_weight) * loss_mono
+        + float(smoothness_loss_weight) * loss_smooth
+    )
+    if not collect_metrics:
+        return total, {}
+    metrics = {
+        "loss": float(total.detach().cpu()),
+        "loss_obj": float(loss_obj.detach().cpu()),
+        "loss_peak": float(loss_peak.detach().cpu()),
+        "loss_count": float(loss_count.detach().cpu()),
+        "loss_dir": float(loss_dir.detach().cpu()),
+        "loss_speed": float(loss_speed.detach().cpu()),
+        "loss_monotonic": float(loss_mono.detach().cpu()),
+        "loss_smooth": float(loss_smooth.detach().cpu()),
+        "matched": float(matched_total),
+        "gt": float(gt_total),
+        "max_objectness": float(torch.max(obj_prob).detach().cpu()),
+        "mean_objectness": float(torch.mean(obj_prob).detach().cpu()),
+    }
+    return total, metrics
+
+
+def peak_slot_detection_metrics(
+    outputs: dict[str, torch.Tensor],
+    targets: dict[str, torch.Tensor],
+    *,
+    objectness_threshold: float = 0.5,
+    point_threshold: float = 0.05,
+    matcher: str = "hungarian",
+) -> dict[str, float]:
+    device = outputs["objectness_logits"].device
+    q_count = int(outputs["num_regular_queries"])
+    none_index = int(outputs["peak_logits"].shape[-1] - 1)
+    obj = torch.sigmoid(outputs["objectness_logits"][:, :q_count])
+    active = obj >= float(objectness_threshold)
+    selected = torch.argmax(outputs["peak_logits"][:, :q_count], dim=-1)
+    pred_total = int(active.sum().detach().cpu())
+    gt_valid = targets["gt_valid"].to(device=device, dtype=torch.bool)
+    gt_total = int(gt_valid.sum().detach().cpu())
+    good_total = 0
+    count_abs_error = 0.0
+    count_exact = 0
+    time_errors: list[float] = []
+    peak_time = targets["peak_time"].to(device=device, dtype=torch.float32)
+    for b in range(int(obj.shape[0])):
+        pred_count = int(active[b].sum().item())
+        gt_count = int(gt_valid[b].sum().item())
+        count_abs_error += abs(pred_count - gt_count)
+        count_exact += int(pred_count == gt_count)
+        if gt_count <= 0:
+            continue
+        rows, cols = _match_single(
+            outputs,
+            targets,
+            b,
+            matcher=matcher,
+            w_peak=3.0,
+            w_obj=1.0,
+            w_dir=0.2,
+            w_speed=0.1,
+        )
+        valid_idx = torch.where(gt_valid[b])[0]
+        for r, c in zip(rows.tolist(), cols.tolist()):
+            if not bool(active[b, r]):
+                continue
+            gi = int(valid_idx[c].item())
+            vis = targets["visibility"][b, gi].to(device=device, dtype=torch.float32) > 0.5
+            if not torch.any(vis):
+                continue
+            pred_idx = selected[b, r].clamp(0, none_index)
+            valid_pred = vis & (pred_idx < none_index)
+            if not torch.any(valid_pred):
+                continue
+            pred_t = peak_time[b].gather(1, pred_idx[:, None].clamp(0, none_index - 1)).squeeze(1)
+            gt_idx = targets["gt_peak_index"][b, gi].to(device=device, dtype=torch.long).clamp(0, none_index - 1)
+            gt_t = peak_time[b].gather(1, gt_idx[:, None]).squeeze(1)
+            err = torch.mean(torch.abs(pred_t[valid_pred] - gt_t[valid_pred])).detach()
+            err_f = float(err.cpu())
+            time_errors.append(err_f)
+            if err_f <= float(point_threshold):
+                good_total += 1
+    precision = float(good_total / max(1, pred_total))
+    recall = float(good_total / max(1, gt_total))
+    f1 = float(2.0 * precision * recall / max(1e-12, precision + recall))
+    batch_size = int(obj.shape[0])
+    return {
+        "track_precision": precision,
+        "track_recall": recall,
+        "track_f1": f1,
+        "track_tp": float(good_total),
+        "pred_count": float(pred_total),
+        "gt_count": float(gt_total),
+        "count_mae": float(count_abs_error / max(1, batch_size)),
+        "count_acc": float(count_exact / max(1, batch_size)),
+        "time_mae_norm": float(np.mean(time_errors)) if time_errors else float("nan"),
+    }
+
+
+def _local_speed_series(points: list[TrackPoint]) -> list[float]:
+    speeds = [float("nan")] * len(points)
+    for i, point in enumerate(points):
+        vals = []
+        if i > 0:
+            prev = points[i - 1]
+            vals.append(3.6 * abs(point.offset_m - prev.offset_m) / max(1e-9, abs(point.time_s - prev.time_s)))
+        if i + 1 < len(points):
+            nxt = points[i + 1]
+            vals.append(3.6 * abs(nxt.offset_m - point.offset_m) / max(1e-9, abs(nxt.time_s - point.time_s)))
+        vals = [v for v in vals if np.isfinite(v)]
+        speeds[i] = float(np.mean(vals)) if vals else float("nan")
+    return speeds
+
+
+def _track_stats(track_id: int, direction: str, points: list[TrackPoint]) -> Track:
+    points_sorted = sorted(points, key=lambda p: p.ch_idx)
+    speeds = [v for v in _local_speed_series(points_sorted) if np.isfinite(v)]
+    return Track(
+        track_id=int(track_id),
+        direction=direction,
+        points=points_sorted,
+        total_score=float(np.sum([p.score for p in points_sorted])),
+        mean_speed_kmh=float(np.mean(speeds)) if speeds else float("nan"),
+    )
+
+
+def _deduplicate_tracks(tracks: list[Track], tol_samples: int, min_overlap: int) -> list[Track]:
+    kept: list[Track] = []
+    for track in sorted(tracks, key=lambda item: item.total_score, reverse=True):
+        tmap = {int(p.ch_idx): int(p.t_idx) for p in track.points}
+        duplicate = False
+        for existing in kept:
+            emap = {int(p.ch_idx): int(p.t_idx) for p in existing.points}
+            common = sorted(set(tmap) & set(emap))
+            if len(common) < int(min_overlap):
+                continue
+            diffs = np.array([abs(tmap[ch] - emap[ch]) for ch in common], dtype=np.float64)
+            if float(np.median(diffs)) <= float(tol_samples):
+                duplicate = True
+                break
+        if not duplicate:
+            kept.append(track)
+    return [_track_stats(i, track.direction, track.points) for i, track in enumerate(kept)]
+
+
+def predict_tracks_from_window(
+    model: PeakSlotPredictor,
+    data_window: np.ndarray,
+    fs: float,
+    x_axis_m: np.ndarray,
+    config: Optional[InferenceConfig] = None,
+    device: Optional[str] = None,
+) -> list[Track]:
+    cfg = config or InferenceConfig()
+    arr = np.asarray(data_window, dtype=np.float32)
+    x = prepare_window_input(
+        arr,
+        int(cfg.time_downsample),
+        clip_ratio=float(cfg.clip_ratio),
+        input_mode="raw" if int(model.config.in_channels) == 1 else "raw_abs",
+    )
+    peak_cfg = PeakDetectionConfig(
+        candidates_per_channel=int(model.config.peak_candidates),
+        min_distance_s=float(cfg.peak_min_distance_s),
+        min_height=float(cfg.peak_min_height),
+        prominence=float(cfg.peak_prominence),
+    )
+    peak_time, peak_amp, peak_valid, peak_index = detect_peak_candidates_from_tensor(
+        x[0],
+        fs=float(fs),
+        time_downsample=int(cfg.time_downsample),
+        window_samples=int(arr.shape[1]),
+        config=peak_cfg,
+    )
+    resolved_device = device or next(model.parameters()).device
+    model.eval()
+    with torch.no_grad():
+        outputs = model(
+            x.unsqueeze(0).to(resolved_device),
+            peak_time.unsqueeze(0).to(resolved_device),
+            peak_amp.unsqueeze(0).to(resolved_device),
+            peak_valid.unsqueeze(0).to(resolved_device),
+        )
+    obj = torch.sigmoid(outputs["objectness_logits"][0]).detach().cpu().numpy()
+    peak_prob = torch.softmax(outputs["peak_logits"][0], dim=-1).detach().cpu().numpy()
+    dirs = torch.argmax(outputs["direction_logits"][0], dim=-1).detach().cpu().numpy()
+    max_tracks = min(int(cfg.max_tracks), int(obj.shape[0]))
+    order = np.argsort(obj)[::-1][:max_tracks]
+    tracks: list[Track] = []
+    for q_idx in order.tolist():
+        score = float(obj[q_idx])
+        if score < float(cfg.objectness_threshold):
+            continue
+        points: list[TrackPoint] = []
+        for ch in range(int(model.config.n_channels)):
+            choice = int(np.argmax(peak_prob[q_idx, ch]))
+            if choice >= int(model.config.peak_candidates):
+                continue
+            if not bool(peak_valid[ch, choice]):
+                continue
+            prob = float(peak_prob[q_idx, ch, choice])
+            if prob < float(cfg.peak_threshold):
+                continue
+            t_idx = int(peak_index[ch, choice].item()) * int(cfg.time_downsample)
+            t_idx = int(max(0, min(int(arr.shape[1]) - 1, t_idx)))
+            offset = float(x_axis_m[int(ch)]) if int(ch) < len(x_axis_m) else float(ch)
+            points.append(
+                TrackPoint(
+                    ch_idx=int(ch),
+                    t_idx=t_idx,
+                    time_s=float(t_idx) / float(fs),
+                    offset_m=offset,
+                    amp=float(abs(arr[int(ch), t_idx])),
+                    score=score * prob,
+                )
+            )
+        if len(points) >= int(cfg.min_visible_channels):
+            tracks.append(_track_stats(len(tracks), LABEL_TO_DIRECTION.get(int(dirs[q_idx]), "forward"), points))
+    return _deduplicate_tracks(
+        tracks,
+        tol_samples=int(cfg.dedup_tolerance_samples),
+        min_overlap=int(cfg.dedup_min_overlap_channels),
+    )
+
+
+def save_checkpoint(
+    path: str | Path,
+    model: PeakSlotPredictor,
+    optimizer: Optional[torch.optim.Optimizer],
+    model_config: ModelConfig,
+    dataset_config: WindowDatasetConfig,
+    epoch: int,
+    metrics: dict[str, float],
+    dataset_meta: Optional[dict[str, Any]] = None,
+) -> None:
+    payload: dict[str, Any] = {
+        "model_family": "peak_slot",
+        "model_state": model.state_dict(),
+        "model_config": asdict(model_config),
+        "dataset_config": asdict(dataset_config),
+        "epoch": int(epoch),
+        "metrics": dict(metrics),
+    }
+    if dataset_meta is not None:
+        payload["dataset_meta"] = dict(dataset_meta)
+    if optimizer is not None:
+        payload["optimizer_state"] = optimizer.state_dict()
+    checkpoint_path = Path(path).expanduser()
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = checkpoint_path.with_name(checkpoint_path.name + ".tmp")
+    torch.save(payload, str(tmp_path))
+    tmp_path.replace(checkpoint_path)
+
+
+def load_checkpoint_model(checkpoint_path: str | Path, device: Optional[str] = None) -> tuple[PeakSlotPredictor, dict[str, Any]]:
+    resolved_device = device or auto_torch_device()
+    checkpoint = torch.load(str(Path(checkpoint_path).expanduser()), map_location="cpu", weights_only=False)
+    model_config = ModelConfig(**dict(checkpoint.get("model_config", {})))
+    model = PeakSlotPredictor(model_config).to(resolved_device)
+    model.load_state_dict(checkpoint["model_state"], strict=True)
+    model.eval()
+    return model, checkpoint

@@ -39,7 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model-family",
         default="query_masks",
-        choices=["auto", "query_points", "query_masks", "track_slot"],
+        choices=["auto", "query_points", "query_masks", "track_slot", "peak_slot"],
         help="Model family. auto reads from checkpoint metadata.",
     )
     parser.add_argument("--out-csv", default="", help="Output CSV path; default is <data-folder>/auto_tracks_deep.csv.")

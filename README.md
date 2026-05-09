@@ -76,6 +76,36 @@ Infer on SAC data with a trained checkpoint:
 uv run python -m autotrack.dl.infer_trajectory_model --model-family track_slot --model models/track_slot_cuda/checkpoint_best.pt --data-folder datasets/test/sim_1001
 ```
 
+## PeakSlotNet Workflow
+
+PeakSlotNet first detects peak candidates on each DAS channel, then predicts
+which peaks belong to the same vehicle slot. Predicted tracks therefore pass
+through detected peaks rather than arbitrary regressed times.
+
+Convert existing TrackSlotNet shards:
+
+```sh
+sh convert_track_slot_to_peak_slot.sh
+```
+
+Train on CUDA:
+
+```sh
+DEVICE=cuda EPOCHS=20 BATCH_SIZE=32 sh train_peak_slot_cuda.sh
+```
+
+Predict directly on converted shards:
+
+```sh
+MODEL=models/peak_slot_cuda/checkpoint_best.pt DATA_DIR=datasets/peak_slot/train sh predict_peak_slot_dataset.sh
+```
+
+Infer on SAC data:
+
+```sh
+uv run python -m autotrack.dl.infer_trajectory_model --model-family peak_slot --model models/peak_slot_cuda/checkpoint_best.pt --data-folder datasets/test/sim_1001
+```
+
 ## Python Environment
 
 Use the project environment through `uv run`. Do not invoke a different Python
