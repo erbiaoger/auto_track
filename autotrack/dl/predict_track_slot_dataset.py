@@ -404,21 +404,39 @@ def _plot_sample_overlay(
         )
         gt_label_added = True
 
+    cmap = plt.get_cmap("tab20", max(1, len(predictions)))
+    x_span_plot = max(1e-6, float(window_seconds))
     pred_label_added = False
-    for pred in predictions:
+    for pred_id, pred in enumerate(predictions):
         channels = list(pred["channels"])
         if len(channels) < 2:
             continue
         time_s = [float(pred["time_norm"][ch].item()) * float(window_seconds) for ch in channels]
+        color = cmap(pred_id % max(1, cmap.N))
         ax.plot(
             time_s,
             channels,
-            color="#d62728",
+            color=color,
             linewidth=1.6,
             alpha=0.9,
             label="Prediction" if not pred_label_added else None,
         )
-        ax.scatter(time_s, channels, s=8, color="#ffd23f", edgecolors="#7a0019", linewidths=0.25, alpha=0.9)
+        ax.scatter(time_s, channels, s=9, color=[color], edgecolors="black", linewidths=0.2, alpha=0.95)
+        speed_kmh = float(pred.get("speed_kmh", float("nan")))
+        if math.isfinite(speed_kmh):
+            mid = len(time_s) // 2
+            x_text = min(float(window_seconds) - 0.02 * x_span_plot, float(time_s[mid]) + 0.01 * x_span_plot)
+            ax.text(
+                x_text,
+                float(channels[mid]),
+                f"{speed_kmh:.1f} km/h",
+                color=color,
+                fontsize=8,
+                ha="left",
+                va="center",
+                alpha=0.95,
+                bbox={"facecolor": "white", "alpha": 0.55, "edgecolor": "none", "pad": 0.8},
+            )
         pred_label_added = True
 
     gt_count = int(targets_cpu["gt_valid"][batch_index].sum().item())
