@@ -125,6 +125,11 @@ def _convert_one_sample(
     injected = 0
     matched = 0
     tolerance_norm = float(peak_cfg.match_tolerance_s) * float(fs) / float(max(1, window_samples - 1))
+
+    # First make sure every visible GT point has a candidate in the per-channel
+    # candidate table. Candidate insertion sorts the table by time, so GT indices
+    # cannot be finalized during this pass without becoming stale after later
+    # insertions on the same channel.
     for g in torch.where(gt_valid)[0].tolist():
         for ch in torch.where(visibility[g] > 0.5)[0].tolist():
             t_norm = float(time_label[g, ch].item())
@@ -133,12 +138,11 @@ def _convert_one_sample(
                 diffs = torch.abs(peak_time[ch, valid] - float(t_norm))
                 min_pos = int(torch.argmin(diffs).item())
                 if float(diffs[min_pos].item()) <= tolerance_norm:
-                    gt_peak_index[g, ch] = int(valid[min_pos].item())
                     matched += 1
                     continue
             down_idx = int(round(float(t_norm) * float(max(1, window_samples - 1)) / float(max(1, time_downsample))))
             down_idx = max(0, min(int(heatmap.shape[1]) - 1, down_idx))
-            slot = _insert_candidate(
+            _insert_candidate(
                 peak_time,
                 peak_amp,
                 peak_valid,
@@ -148,8 +152,21 @@ def _convert_one_sample(
                 down_idx=int(down_idx),
                 amp=float(heatmap[int(ch), int(down_idx)].item()),
             )
-            gt_peak_index[g, ch] = int(slot)
             injected += 1
+
+    # Now that all per-channel candidate arrays have their final sorted order,
+    # map each GT point to the nearest candidate. This avoids stale indices when
+    # a later injected point shifted previously assigned candidate slots.
+    for g in torch.where(gt_valid)[0].tolist():
+        for ch in torch.where(visibility[g] > 0.5)[0].tolist():
+            valid = torch.where(peak_valid[ch])[0]
+            if valid.numel() <= 0:
+                continue
+            t_norm = float(time_label[g, ch].item())
+            diffs = torch.abs(peak_time[ch, valid] - float(t_norm))
+            min_pos = int(torch.argmin(diffs).item())
+            if float(diffs[min_pos].item()) <= max(tolerance_norm, 1.0 / float(max(1, window_samples - 1))):
+                gt_peak_index[g, ch] = int(valid[min_pos].item())
     return peak_time, peak_amp, peak_valid, peak_index, gt_peak_index, int(matched), int(injected)
 
 

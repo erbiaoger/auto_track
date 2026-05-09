@@ -47,6 +47,13 @@ Plot training history:
 RUN_DIR=models/track_slot_cuda sh plot_track_slot_history.sh
 ```
 
+Plot data and GT labels for manual checking:
+
+```sh
+DATA_DIR=datasets/track_slot/train SAMPLE_INDICES=6 OUT_DIR=/tmp/track_slot_label_check sh plot_dataset_labels.sh
+DATA_DIR=datasets/peak_slot/train SAMPLE_INDICES=6 OUT_DIR=/tmp/peak_slot_label_check PLOT_PEAKS=1 sh plot_dataset_labels.sh
+```
+
 Run a CPU smoke test:
 
 ```sh

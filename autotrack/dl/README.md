@@ -14,6 +14,9 @@ Deep-learning code for DAS vehicle trajectory recognition.
   default before writing predictions.
 - `plot_track_slot_history.py`: reads `train_history.jsonl` and plots epoch
   curves for loss, F1, count error, objectness, and other metrics.
+- `plot_dataset_labels.py`: plots tensor-shard heatmaps with GT labels. It can
+  inspect both raw TrackSlotNet `time` labels and converted PeakSlotNet
+  `gt_peak_index` labels.
 - `track_slot_model.py`: model, Hungarian/greedy set loss, metrics, inference,
   NMS, and checkpoint helpers for `model_family=track_slot`.
 - `train_track_slot.py`: trains TrackSlotNet from generated shards, including
@@ -47,8 +50,10 @@ uv run python -m autotrack.dl.generate_track_slot_dataset --out-dir datasets/tra
 uv run python -m autotrack.dl.train_track_slot --data-dir datasets/track_slot/train --out-dir models/track_slot_cuda --device cuda --amp on
 uv run python -m autotrack.dl.train_track_slot --data-dir datasets/track_slot/train --out-dir models/track_slot_cuda --device cuda --amp on --epochs 200 --auto-resume
 uv run python -m autotrack.dl.plot_track_slot_history --run-dir models/track_slot_cuda --separate
+uv run python -m autotrack.dl.plot_dataset_labels --data-dir datasets/track_slot/train --out-dir /tmp/track_slot_label_check --sample-indices 6
 uv run python -m autotrack.dl.predict_track_slot_dataset --data-dir datasets/track_slot/train --model models/track_slot_cuda/checkpoint_best.pt --out-dir /tmp/track_slot_prediction_check --device cuda --max-samples 128
 uv run python -m autotrack.dl.convert_track_slot_to_peak_slot --in-dir datasets/track_slot/train --out-dir datasets/peak_slot/train --overwrite
+uv run python -m autotrack.dl.plot_dataset_labels --data-dir datasets/peak_slot/train --out-dir /tmp/peak_slot_label_check --sample-indices 6 --plot-peaks
 uv run python -m autotrack.dl.train_peak_slot --data-dir datasets/peak_slot/train --out-dir models/peak_slot_cuda --device cuda --amp on
 uv run python -m autotrack.dl.predict_peak_slot_dataset --data-dir datasets/peak_slot/train --model models/peak_slot_cuda/checkpoint_best.pt --out-dir /tmp/peak_slot_prediction_check --device cuda --max-samples 128
 ```
