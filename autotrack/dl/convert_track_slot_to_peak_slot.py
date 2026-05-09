@@ -11,6 +11,7 @@ Example:
         --in-dir datasets/track_slot/train \
         --out-dir datasets/peak_slot/train \
         --peak-candidates-per-channel 64 \
+        --workers 8 \
         --peak-min-distance-s 0.5 \
         --peak-match-tolerance-s 0.25 \
         --overwrite
@@ -19,6 +20,7 @@ Arguments:
     --in-dir must contain a `track_slot` `meta.json` and `shard_*.pt`.
     --out-dir receives `peak_slot` `meta.json` and converted shards.
     --peak-candidates-per-channel is K; gt_peak_index == K means none.
+    --workers parallelizes conversion at shard granularity.
 
 Outputs:
     x, peak_time, peak_amp, peak_valid, gt_peak_index, visibility, direction,
@@ -28,6 +30,7 @@ Outputs:
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import json
 import shutil
 import time
@@ -48,6 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--peak-min-height", type=float, default=0.02, help="Minimum normalized absolute heatmap height.")
     parser.add_argument("--peak-prominence", type=float, default=0.02, help="Minimum normalized peak prominence.")
     parser.add_argument("--peak-match-tolerance-s", type=float, default=0.25, help="Max GT-to-candidate match distance before GT injection.")
+    parser.add_argument("--workers", type=int, default=1, help="Parallel shard workers. 1 runs sequentially.")
     parser.add_argument("--overwrite", action="store_true", help="Allow replacing an existing output directory.")
     return parser.parse_args()
 
@@ -209,6 +213,18 @@ def _convert_shard(
     }
 
 
+def _convert_shard_task(
+    shard_idx: int,
+    shard_name: str,
+    in_dir: Path,
+    out_dir: Path,
+    meta: dict[str, Any],
+    peak_cfg: PeakDetectionConfig,
+) -> tuple[int, str, dict[str, int]]:
+    stats = _convert_shard(in_dir / shard_name, out_dir / shard_name, meta=meta, peak_cfg=peak_cfg)
+    return int(shard_idx), str(shard_name), stats
+
+
 def main() -> int:
     args = parse_args()
     in_dir = Path(args.in_dir).expanduser()
@@ -227,20 +243,40 @@ def main() -> int:
     )
     t0 = time.perf_counter()
     converted_shards = []
+    shard_results: list[tuple[int, str, dict[str, int]]] = []
     total_samples = 0
     total_matched = 0
     total_injected = 0
-    for shard in shards:
-        stats = _convert_shard(in_dir / shard, out_dir / shard, meta=meta, peak_cfg=peak_cfg)
+    workers = int(max(1, args.workers))
+    if workers <= 1:
+        for idx, shard in enumerate(shards):
+            shard_results.append(_convert_shard_task(idx, shard, in_dir, out_dir, meta, peak_cfg))
+            _, done_shard, stats = shard_results[-1]
+            print(
+                f"converted {done_shard}: samples={stats['samples']}, matched={stats['matched_gt_points']}, "
+                f"injected={stats['injected_gt_points']}, elapsed={time.perf_counter() - t0:.1f}s",
+                flush=True,
+            )
+    else:
+        with ProcessPoolExecutor(max_workers=min(workers, len(shards))) as executor:
+            futures = [
+                executor.submit(_convert_shard_task, idx, shard, in_dir, out_dir, meta, peak_cfg)
+                for idx, shard in enumerate(shards)
+            ]
+            for future in as_completed(futures):
+                result = future.result()
+                shard_results.append(result)
+                _, done_shard, stats = result
+                print(
+                    f"converted {done_shard}: samples={stats['samples']}, matched={stats['matched_gt_points']}, "
+                    f"injected={stats['injected_gt_points']}, elapsed={time.perf_counter() - t0:.1f}s",
+                    flush=True,
+                )
+    for _, shard, stats in sorted(shard_results, key=lambda item: item[0]):
         converted_shards.append(shard)
         total_samples += int(stats["samples"])
         total_matched += int(stats["matched_gt_points"])
         total_injected += int(stats["injected_gt_points"])
-        print(
-            f"converted {shard}: samples={stats['samples']}, matched={stats['matched_gt_points']}, "
-            f"injected={stats['injected_gt_points']}, elapsed={time.perf_counter() - t0:.1f}s",
-            flush=True,
-        )
     out_meta = dict(meta)
     out_meta.update(
         {
@@ -261,6 +297,7 @@ def main() -> int:
                 "samples": int(total_samples),
                 "matched_gt_points": int(total_matched),
                 "injected_gt_points": int(total_injected),
+                "workers": int(workers),
             },
         }
     )

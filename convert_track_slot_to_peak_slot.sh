@@ -11,6 +11,7 @@ PEAK_MIN_DISTANCE_S=${PEAK_MIN_DISTANCE_S:-0.5}
 PEAK_MIN_HEIGHT=${PEAK_MIN_HEIGHT:-0.02}
 PEAK_PROMINENCE=${PEAK_PROMINENCE:-0.02}
 PEAK_MATCH_TOLERANCE_S=${PEAK_MATCH_TOLERANCE_S:-0.25}
+WORKERS=${WORKERS:-8}
 OVERWRITE=${OVERWRITE:-1}
 
 overwrite_args=""
@@ -26,4 +27,5 @@ uv run python -m autotrack.dl.convert_track_slot_to_peak_slot \
   --peak-min-height "$PEAK_MIN_HEIGHT" \
   --peak-prominence "$PEAK_PROMINENCE" \
   --peak-match-tolerance-s "$PEAK_MATCH_TOLERANCE_S" \
+  --workers "$WORKERS" \
   $overwrite_args
