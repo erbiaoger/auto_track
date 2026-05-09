@@ -13,6 +13,11 @@ HIDDEN_DIM=${HIDDEN_DIM:-64}
 DECODER_LAYERS=${DECODER_LAYERS:-1}
 POOLED_TIME=${POOLED_TIME:-64}
 MATCHER=${MATCHER:-hungarian}
+NO_OBJECT_WEIGHT=${NO_OBJECT_WEIGHT:-0.15}
+COUNT_LOSS_WEIGHT=${COUNT_LOSS_WEIGHT:-0.05}
+MONOTONIC_LOSS_WEIGHT=${MONOTONIC_LOSS_WEIGHT:-1.0}
+SMOOTHNESS_LOSS_WEIGHT=${SMOOTHNESS_LOSS_WEIGHT:-0.2}
+VISIBILITY_NEGATIVE_WEIGHT=${VISIBILITY_NEGATIVE_WEIGHT:-2.0}
 RESUME=${RESUME:-}
 AUTO_RESUME=${AUTO_RESUME:-0}
 RESUME_MODEL_ONLY=${RESUME_MODEL_ONLY:-0}
@@ -40,6 +45,11 @@ uv run python -m autotrack.dl.train_track_slot \
   --decoder-layers "$DECODER_LAYERS" \
   --pooled-time "$POOLED_TIME" \
   --matcher "$MATCHER" \
+  --no-object-weight "$NO_OBJECT_WEIGHT" \
+  --count-loss-weight "$COUNT_LOSS_WEIGHT" \
+  --monotonic-loss-weight "$MONOTONIC_LOSS_WEIGHT" \
+  --smoothness-loss-weight "$SMOOTHNESS_LOSS_WEIGHT" \
+  --visibility-negative-weight "$VISIBILITY_NEGATIVE_WEIGHT" \
   --metrics-every 1 \
   --log-every 1 \
   --seed "$SEED" \

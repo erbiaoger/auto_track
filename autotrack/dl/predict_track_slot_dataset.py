@@ -24,6 +24,9 @@ Arguments:
     --plot-samples limits how many heatmap overlay figures are written.
     --objectness-threshold and --visibility-threshold control which predicted
     slots and channel points are written to CSV.
+    By default predictions are also monotonic-trimmed and deduplicated before
+    CSV/plot output, so repeated slots and edge curls are less likely to
+    dominate the inspection figures.
 
 Outputs:
     <out-dir>/summary.json
@@ -76,8 +79,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--visibility-threshold", type=float, default=0.5, help="Predicted per-channel visibility threshold.")
     parser.add_argument("--min-visible-channels", type=int, default=3, help="Minimum visible channels for a predicted track.")
     parser.add_argument("--max-predicted-tracks", type=int, default=96, help="Maximum tracks kept per sample for CSV/counts.")
+    parser.add_argument("--no-track-nms", action="store_true", help="Disable duplicate predicted-track suppression.")
+    parser.add_argument("--dedup-time-tolerance-norm", type=float, default=0.003, help="NMS median time tolerance in normalized window units.")
+    parser.add_argument("--dedup-min-overlap-channels", type=int, default=3, help="Minimum common visible channels before NMS can suppress a track.")
+    parser.add_argument("--dedup-min-overlap-ratio", type=float, default=0.6, help="Minimum overlap ratio before NMS can suppress a track.")
+    parser.add_argument("--no-monotonic-trim", action="store_true", help="Disable per-slot monotonic channel trimming before NMS.")
+    parser.add_argument("--monotonic-tolerance-norm", type=float, default=0.002, help="Allowed normalized time reversal before trimming a predicted track.")
     parser.add_argument("--matcher", default="hungarian", choices=["hungarian", "greedy"], help="Metric matching strategy.")
-    parser.add_argument("--no-object-weight", type=float, default=0.05, help="Unmatched slot weight for set loss.")
+    parser.add_argument("--no-object-weight", type=float, default=0.15, help="Unmatched slot weight for set loss.")
     parser.add_argument("--metric-point-threshold", type=float, default=0.05, help="Normalized time-error threshold for TP.")
     parser.add_argument(
         "--speed-norm-kmh",
@@ -209,6 +218,71 @@ def _active_predictions(
             }
         )
     return predictions
+
+
+def _trim_monotonic_prediction(pred: dict[str, Any], *, tolerance_norm: float, min_visible_channels: int) -> Optional[dict[str, Any]]:
+    channels = sorted(int(ch) for ch in pred["channels"])
+    if len(channels) < int(min_visible_channels):
+        return None
+    if len(channels) < 3:
+        trimmed = dict(pred)
+        trimmed["channels"] = channels
+        return trimmed
+
+    time_norm = pred["time_norm"]
+    sign = 1.0 if int(pred.get("direction_label", 0)) == 0 else -1.0
+    best_start = 0
+    best_end = 1
+    start = 0
+    tol = float(max(0.0, tolerance_norm))
+    for i in range(len(channels) - 1):
+        t0 = float(time_norm[channels[i]].item())
+        t1 = float(time_norm[channels[i + 1]].item())
+        if sign * (t1 - t0) < -tol:
+            if i + 1 - start > best_end - best_start:
+                best_start, best_end = start, i + 1
+            start = i + 1
+    if len(channels) - start > best_end - best_start:
+        best_start, best_end = start, len(channels)
+    kept = channels[best_start:best_end]
+    if len(kept) < int(min_visible_channels):
+        return None
+    trimmed = dict(pred)
+    trimmed["channels"] = kept
+    return trimmed
+
+
+def _prediction_time_map(pred: dict[str, Any]) -> dict[int, float]:
+    time_norm = pred["time_norm"]
+    return {int(ch): float(time_norm[int(ch)].item()) for ch in pred["channels"]}
+
+
+def _deduplicate_predictions(
+    predictions: list[dict[str, Any]],
+    *,
+    tolerance_norm: float,
+    min_overlap_channels: int,
+    min_overlap_ratio: float,
+) -> list[dict[str, Any]]:
+    kept: list[dict[str, Any]] = []
+    for pred in sorted(predictions, key=lambda item: float(item["score"]), reverse=True):
+        pred_map = _prediction_time_map(pred)
+        duplicate = False
+        for existing in kept:
+            existing_map = _prediction_time_map(existing)
+            common = sorted(set(pred_map) & set(existing_map))
+            if len(common) < int(min_overlap_channels):
+                continue
+            overlap_ratio = len(common) / max(1, min(len(pred_map), len(existing_map)))
+            if overlap_ratio < float(min_overlap_ratio):
+                continue
+            diffs = np.array([abs(pred_map[ch] - existing_map[ch]) for ch in common], dtype=np.float64)
+            if float(np.median(diffs)) <= float(tolerance_norm):
+                duplicate = True
+                break
+        if not duplicate:
+            kept.append(pred)
+    return kept
 
 
 def _write_prediction_rows(
@@ -504,6 +578,27 @@ def main() -> int:
                             max_predicted_tracks=int(args.max_predicted_tracks),
                             speed_norm_kmh=float(speed_norm_kmh),
                         )
+                        if not bool(args.no_monotonic_trim):
+                            trimmed_predictions = [
+                                item
+                                for item in (
+                                    _trim_monotonic_prediction(
+                                        pred,
+                                        tolerance_norm=float(args.monotonic_tolerance_norm),
+                                        min_visible_channels=int(args.min_visible_channels),
+                                    )
+                                    for pred in predictions
+                                )
+                                if item is not None
+                            ]
+                            predictions = trimmed_predictions
+                        if not bool(args.no_track_nms):
+                            predictions = _deduplicate_predictions(
+                                predictions,
+                                tolerance_norm=float(args.dedup_time_tolerance_norm),
+                                min_overlap_channels=int(args.dedup_min_overlap_channels),
+                                min_overlap_ratio=float(args.dedup_min_overlap_ratio),
+                            )
                         gt_count = int(targets_cpu["gt_valid"][b].sum().item())
                         pred_count = int(len(predictions))
                         filtered_gt_total += gt_count
@@ -572,6 +667,12 @@ def main() -> int:
             "visibility_threshold": float(args.visibility_threshold),
             "min_visible_channels": int(args.min_visible_channels),
             "metric_point_threshold": float(args.metric_point_threshold),
+            "track_nms": not bool(args.no_track_nms),
+            "dedup_time_tolerance_norm": float(args.dedup_time_tolerance_norm),
+            "dedup_min_overlap_channels": int(args.dedup_min_overlap_channels),
+            "dedup_min_overlap_ratio": float(args.dedup_min_overlap_ratio),
+            "monotonic_trim": not bool(args.no_monotonic_trim),
+            "monotonic_tolerance_norm": float(args.monotonic_tolerance_norm),
         },
         "loss_metrics": _weighted_mean(loss_sums, loss_weights),
         "batch_mean_detection_metrics": _weighted_mean(metric_sums, metric_weights),

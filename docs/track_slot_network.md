@@ -81,10 +81,16 @@ loss =
 + 1.0 * loss_visibility
 + 0.5 * loss_direction
 + 0.5 * loss_speed
++ 0.05 * loss_count
++ 1.0 * loss_monotonic
++ 0.2 * loss_smooth
 ```
 
 `loss_time` is weighted by GT visibility, so invisible channel entries do not
 contribute to the time regression.
+`loss_count` calibrates the sum of objectness probabilities against the GT
+vehicle count. `loss_monotonic` and `loss_smooth` reduce edge curls and local
+time reversals without forcing every generated track to be perfectly straight.
 
 ## Inference
 
@@ -95,7 +101,8 @@ Inference does not use graph search or clustering.
 3. For each kept slot, keep channel points with
    `sigmoid(visibility) >= threshold`.
 4. Drop slots with too few visible channels.
-5. Apply trajectory NMS: if two slots overlap on enough channels and their
+5. Trim each slot to its longest direction-consistent monotonic channel run.
+6. Apply trajectory NMS: if two slots overlap on enough channels and their
    median time difference is below the tolerance, keep the higher-score slot.
 
 The remaining slots are converted directly into `Track` and `TrackPoint`

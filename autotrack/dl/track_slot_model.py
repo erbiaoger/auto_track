@@ -228,6 +228,10 @@ def track_slot_set_loss(
     visibility_loss_weight: float = 1.0,
     direction_loss_weight: float = 0.5,
     speed_loss_weight: float = 0.5,
+    count_loss_weight: float = 0.05,
+    monotonic_loss_weight: float = 1.0,
+    smoothness_loss_weight: float = 0.2,
+    visibility_negative_weight: float = 2.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     device = outputs["objectness_logits"].device
     batch_size = int(outputs["objectness_logits"].shape[0])
@@ -291,14 +295,41 @@ def track_slot_set_loss(
         gt_speed = targets["speed"][b_sel, mapped_g].to(device=device, dtype=torch.float32)
 
         loss_time = _weighted_smooth_l1(pred_time, gt_time, gt_vis)
-        loss_vis = F.binary_cross_entropy_with_logits(pred_vis_logits, gt_vis, reduction="mean")
+        vis_raw = F.binary_cross_entropy_with_logits(pred_vis_logits, gt_vis, reduction="none")
+        vis_weight = torch.where(
+            gt_vis > 0.5,
+            torch.ones_like(gt_vis),
+            torch.full_like(gt_vis, float(visibility_negative_weight)),
+        )
+        loss_vis = (vis_raw * vis_weight).sum() / torch.clamp(vis_weight.sum(), min=1.0)
         loss_dir = F.cross_entropy(pred_dir, gt_dir, reduction="mean")
         loss_speed = F.smooth_l1_loss(pred_speed, gt_speed, reduction="mean")
+
+        pair_vis = gt_vis[:, 1:] * gt_vis[:, :-1]
+        dt = pred_time[:, 1:] - pred_time[:, :-1]
+        sign = torch.where(gt_dir[:, None] == 0, torch.ones_like(dt), -torch.ones_like(dt))
+        signed_dt = dt * sign
+        loss_monotonic = (torch.relu(-signed_dt) * pair_vis).sum() / torch.clamp(pair_vis.sum(), min=1.0)
+
+        if pred_time.shape[1] >= 3:
+            tri_vis = gt_vis[:, 2:] * gt_vis[:, 1:-1] * gt_vis[:, :-2]
+            d2 = pred_time[:, 2:] - 2.0 * pred_time[:, 1:-1] + pred_time[:, :-2]
+            smooth_raw = F.smooth_l1_loss(d2, torch.zeros_like(d2), reduction="none")
+            loss_smooth = (smooth_raw * tri_vis).sum() / torch.clamp(tri_vis.sum(), min=1.0)
+        else:
+            loss_smooth = zero
     else:
         loss_time = zero
         loss_vis = zero
         loss_dir = zero
         loss_speed = zero
+        loss_monotonic = zero
+        loss_smooth = zero
+
+    obj_prob = torch.sigmoid(outputs["objectness_logits"][:, :q_count])
+    gt_count = targets["gt_valid"].to(device=device, dtype=torch.float32).sum(dim=1)
+    pred_count_soft = obj_prob.sum(dim=1)
+    loss_count = F.smooth_l1_loss(pred_count_soft, gt_count, reduction="mean")
 
     total = (
         loss_obj
@@ -306,11 +337,13 @@ def track_slot_set_loss(
         + float(visibility_loss_weight) * loss_vis
         + float(direction_loss_weight) * loss_dir
         + float(speed_loss_weight) * loss_speed
+        + float(count_loss_weight) * loss_count
+        + float(monotonic_loss_weight) * loss_monotonic
+        + float(smoothness_loss_weight) * loss_smooth
     )
     if not collect_metrics:
         return total, {}
 
-    obj_prob = torch.sigmoid(outputs["objectness_logits"][:, :q_count])
     metrics = {
         "loss": float(total.detach().cpu()),
         "loss_obj": float(loss_obj.detach().cpu()),
@@ -318,6 +351,9 @@ def track_slot_set_loss(
         "loss_vis": float(loss_vis.detach().cpu()),
         "loss_dir": float(loss_dir.detach().cpu()),
         "loss_speed": float(loss_speed.detach().cpu()),
+        "loss_count": float(loss_count.detach().cpu()),
+        "loss_monotonic": float(loss_monotonic.detach().cpu()),
+        "loss_smooth": float(loss_smooth.detach().cpu()),
         "matched": float(matched_total),
         "gt": float(gt_total),
         "max_objectness": float(torch.max(obj_prob).detach().cpu()),

@@ -10,12 +10,14 @@ Deep-learning code for DAS vehicle trajectory recognition.
   with rare stop-go events.
 - `predict_track_slot_dataset.py`: runs a trained TrackSlotNet checkpoint
   directly on generated tensor shards and writes prediction CSV, metrics, and
-  heatmap overlay figures.
+  heatmap overlay figures. It applies monotonic trimming and trajectory NMS by
+  default before writing predictions.
 - `plot_track_slot_history.py`: reads `train_history.jsonl` and plots epoch
   curves for loss, F1, count error, objectness, and other metrics.
 - `track_slot_model.py`: model, Hungarian/greedy set loss, metrics, inference,
   NMS, and checkpoint helpers for `model_family=track_slot`.
-- `train_track_slot.py`: trains TrackSlotNet from generated shards.
+- `train_track_slot.py`: trains TrackSlotNet from generated shards, including
+  objectness count calibration plus monotonic and smoothness trajectory losses.
 
 ## Legacy / Compatible Files
 

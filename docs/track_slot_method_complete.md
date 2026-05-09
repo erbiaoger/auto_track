@@ -362,6 +362,9 @@ Hungarian matching 求解：
 +\lambda_v\mathcal{L}_{vis}
 +\lambda_d\mathcal{L}_{dir}
 +\lambda_s\mathcal{L}_{speed}
++\lambda_c\mathcal{L}_{count}
++\lambda_m\mathcal{L}_{mono}
++\lambda_r\mathcal{L}_{smooth}
 ```
 
 当前默认：
@@ -372,6 +375,9 @@ Hungarian matching 求解：
 | `lambda_v` | 1.0 |
 | `lambda_d` | 0.5 |
 | `lambda_s` | 0.5 |
+| `lambda_c` | 0.05 |
+| `lambda_m` | 1.0 |
+| `lambda_r` | 0.2 |
 
 ### Objectness loss
 
@@ -385,7 +391,7 @@ objectness 使用 binary cross entropy：
 其中 `z_q=1` 表示 slot `q` 匹配到某条 GT 车辆，否则 `z_q=0`。未匹配 slot 的权重默认较低：
 
 ```math
-w_{\text{no-object}}=0.05
+w_{\text{no-object}}=0.15
 ```
 
 这样可以避免大量空 slot 主导损失。
@@ -411,6 +417,14 @@ w_{\text{no-object}}=0.05
 =\operatorname{BCEWithLogits}(\hat{l}^{v}_{q,c},m_g(c))
 ```
 
+默认对 GT 不可见通道使用更高的负样本权重：
+
+```math
+w_{vis}^{neg}=2.0
+```
+
+这会减少边界外不可见通道被误判为可见，从而降低绘图时边界弯曲和乱连。
+
 方向使用交叉熵：
 
 ```math
@@ -424,6 +438,38 @@ w_{\text{no-object}}=0.05
 \mathcal{L}_{speed}
 =\operatorname{SmoothL1}(\hat{s}_{q},y^s_g)
 ```
+
+### Count、单调和平滑 loss
+
+为了减少 `Pred > GT` 的过预测问题，训练额外约束 soft objectness 总数接近 GT 数量：
+
+```math
+\mathcal{L}_{count}
+=\operatorname{SmoothL1}\left(\sum_q\sigma(\hat{o}_q),G\right)
+```
+
+其中 `G` 是当前窗口的 GT 车辆数。
+
+对每条匹配轨迹，相邻通道的时间应符合方向单调性。forward 方向要求
+`\hat{\tau}_{c+1}-\hat{\tau}_c\ge 0`，reverse 方向要求
+`\hat{\tau}_{c+1}-\hat{\tau}_c\le 0`。违反方向的部分被惩罚：
+
+```math
+\mathcal{L}_{mono}
+=\frac{\sum_c m(c)m(c+1)\max(0,-s_d(\hat{\tau}_{c+1}-\hat{\tau}_c))}
+{\sum_c m(c)m(c+1)}
+```
+
+其中 `s_d=1` 表示 forward，`s_d=-1` 表示 reverse。
+
+平滑项约束相邻速度变化不要剧烈震荡：
+
+```math
+\mathcal{L}_{smooth}
+=\operatorname{SmoothL1}(\hat{\tau}_{c+2}-2\hat{\tau}_{c+1}+\hat{\tau}_{c},0)
+```
+
+这个项权重较小，目的是抑制边界扭曲和局部回勾，不强制所有轨迹完全直线。
 
 ## 为什么这样能识别不同数量车辆
 

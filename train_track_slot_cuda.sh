@@ -20,7 +20,11 @@ POOLED_TIME=${POOLED_TIME:-128}
 AMP=${AMP:-on}
 AMP_DTYPE=${AMP_DTYPE:-float16}
 MATCHER=${MATCHER:-hungarian}
-NO_OBJECT_WEIGHT=${NO_OBJECT_WEIGHT:-0.05}
+NO_OBJECT_WEIGHT=${NO_OBJECT_WEIGHT:-0.15}
+COUNT_LOSS_WEIGHT=${COUNT_LOSS_WEIGHT:-0.05}
+MONOTONIC_LOSS_WEIGHT=${MONOTONIC_LOSS_WEIGHT:-1.0}
+SMOOTHNESS_LOSS_WEIGHT=${SMOOTHNESS_LOSS_WEIGHT:-0.2}
+VISIBILITY_NEGATIVE_WEIGHT=${VISIBILITY_NEGATIVE_WEIGHT:-2.0}
 VAL_FRACTION=${VAL_FRACTION:-0}
 VAL_EVERY=${VAL_EVERY:-5}
 CHECKPOINT_EVERY=${CHECKPOINT_EVERY:-5}
@@ -60,6 +64,10 @@ uv run python -m autotrack.dl.train_track_slot \
   --channels-last \
   --matcher "$MATCHER" \
   --no-object-weight "$NO_OBJECT_WEIGHT" \
+  --count-loss-weight "$COUNT_LOSS_WEIGHT" \
+  --monotonic-loss-weight "$MONOTONIC_LOSS_WEIGHT" \
+  --smoothness-loss-weight "$SMOOTHNESS_LOSS_WEIGHT" \
+  --visibility-negative-weight "$VISIBILITY_NEGATIVE_WEIGHT" \
   --val-fraction "$VAL_FRACTION" \
   --val-every "$VAL_EVERY" \
   --checkpoint-every "$CHECKPOINT_EVERY" \

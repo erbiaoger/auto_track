@@ -82,7 +82,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--amp-dtype", default="float16", choices=["float16", "bfloat16"], help="CUDA AMP dtype.")
     parser.add_argument("--channels-last", action="store_true", help="Use channels-last input/model layout on CUDA.")
     parser.add_argument("--matcher", default="hungarian", choices=["hungarian", "greedy"], help="Slot-to-GT assignment.")
-    parser.add_argument("--no-object-weight", type=float, default=0.05, help="Object loss weight for unmatched slots.")
+    parser.add_argument("--no-object-weight", type=float, default=0.15, help="Object loss weight for unmatched slots.")
+    parser.add_argument("--count-loss-weight", type=float, default=0.05, help="Soft count loss weight for sum(objectness) versus GT count.")
+    parser.add_argument("--monotonic-loss-weight", type=float, default=1.0, help="Penalty weight for direction-inconsistent adjacent track times.")
+    parser.add_argument("--smoothness-loss-weight", type=float, default=0.2, help="Penalty weight for second-difference track time roughness.")
+    parser.add_argument("--visibility-negative-weight", type=float, default=2.0, help="Visibility BCE weight for GT-invisible channels.")
     parser.add_argument("--metric-objectness-threshold", type=float, default=0.5, help="Objectness threshold for metrics.")
     parser.add_argument("--metric-point-threshold", type=float, default=0.05, help="Normalized mean time error threshold for TP metrics.")
     parser.add_argument("--val-fraction", type=float, default=0.0, help="Fraction of shards reserved for validation.")
@@ -271,6 +275,10 @@ def _evaluate(
                 targets,
                 no_object_weight=float(args.no_object_weight),
                 matcher=str(args.matcher),
+                count_loss_weight=float(args.count_loss_weight),
+                monotonic_loss_weight=float(args.monotonic_loss_weight),
+                smoothness_loss_weight=float(args.smoothness_loss_weight),
+                visibility_negative_weight=float(args.visibility_negative_weight),
                 collect_metrics=True,
             )
             metrics.update(
@@ -418,6 +426,10 @@ def main() -> int:
                     targets,
                     no_object_weight=float(args.no_object_weight),
                     matcher=str(args.matcher),
+                    count_loss_weight=float(args.count_loss_weight),
+                    monotonic_loss_weight=float(args.monotonic_loss_weight),
+                    smoothness_loss_weight=float(args.smoothness_loss_weight),
+                    visibility_negative_weight=float(args.visibility_negative_weight),
                     collect_metrics=bool(collect_metrics),
                 )
             scaler.scale(loss).backward()
@@ -442,6 +454,7 @@ def main() -> int:
                     f"epoch={epoch:03d} batch={batch_idx:04d}/{batches_per_epoch:04d} "
                     f"loss={metrics.get('loss', float('nan')):.4f} "
                     f"obj={metrics.get('loss_obj', float('nan')):.4f} "
+                    f"cnt_loss={metrics.get('loss_count', float('nan')):.2f} "
                     f"time={metrics.get('loss_time', float('nan')):.4f} "
                     f"vis={metrics.get('loss_vis', float('nan')):.4f} "
                     f"f1={metrics.get('track_f1', float('nan')):.3f} "
@@ -459,6 +472,7 @@ def main() -> int:
             f"epoch={epoch:03d} loss={mean_metrics.get('loss', float('nan')):.4f} "
             f"time={mean_metrics.get('loss_time', float('nan')):.4f} "
             f"obj={mean_metrics.get('loss_obj', float('nan')):.4f} "
+            f"cnt_loss={mean_metrics.get('loss_count', float('nan')):.2f} "
             f"f1={mean_metrics.get('track_f1', float('nan')):.3f} "
             f"cnt_mae={mean_metrics.get('count_mae', float('nan')):.2f} "
             f"gt={mean_metrics.get('gt', 0.0):.1f} "

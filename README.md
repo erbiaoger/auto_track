@@ -61,7 +61,8 @@ MODEL=/tmp/track_slot_smoke/checkpoint_best.pt DATA_DIR=/tmp/track_slot_data OUT
 ```
 
 This writes `summary.json`, prediction CSV files, and heatmap overlay figures
-under `<OUT_DIR>/plots/`.
+under `<OUT_DIR>/plots/`. Shard prediction applies per-slot monotonic trimming
+and trajectory NMS by default before writing CSV and overlay figures.
 
 Full method documentation:
 
