@@ -106,6 +106,38 @@ Infer on SAC data:
 uv run python -m autotrack.dl.infer_trajectory_model --model-family peak_slot --model models/peak_slot_cuda/checkpoint_best.pt --data-folder datasets/test/sim_1001
 ```
 
+## PeakLineNet Workflow
+
+PeakLineNet maps a rendered sparse peak-point image to a trajectory polyline
+label image. It does not assign vehicle IDs; it is meant to suppress false peaks
+and recover likely line regions before later instance-level assignment.
+
+Generate point/line tensor shards:
+
+```sh
+WORKERS=8 sh generate_peak_line_dataset.sh
+```
+
+Train on CUDA:
+
+```sh
+DEVICE=cuda EPOCHS=50 BATCH_SIZE=32 sh train_peak_line_cuda.sh
+```
+
+Run a CPU smoke test:
+
+```sh
+uv run python -m autotrack.dl.generate_peak_line_dataset --out-dir /tmp/peak_line_data --num-samples 32 --shard-size 16 --window-seconds 10 --time-downsample 20 --vehicles-min 2 --vehicles-max 4 --workers 2 --overwrite
+uv run python -m autotrack.dl.train_peak_line --data-dir /tmp/peak_line_data --out-dir /tmp/peak_line_smoke --device cpu --epochs 1 --batch-size 2
+uv run python -m autotrack.dl.predict_peak_line_dataset --data-dir /tmp/peak_line_data --model /tmp/peak_line_smoke/checkpoint_best.pt --out-dir /tmp/peak_line_pred --device cpu --plot-samples 8
+```
+
+Method documentation:
+
+```text
+docs/peak_line_network.md
+```
+
 ## Python Environment
 
 Use the project environment through `uv run`. Do not invoke a different Python

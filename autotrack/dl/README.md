@@ -30,6 +30,21 @@ Deep-learning code for DAS vehicle trajectory recognition.
 - `predict_peak_slot_dataset.py`: predicts selected peak candidates, writes
   CSV files, and draws overlay figures where predictions lie on detected peaks.
 
+## PeakLineNet Files
+
+- `generate_peak_line_dataset.py`: creates rendered sparse peak-point inputs and
+  per-vehicle trajectory polyline labels. It adds dropout, nearby distractor
+  points, isolated false peaks, and optional weak input noise only to the input
+  tensor.
+- `peak_line_model.py`: lightweight U-Net style semantic line segmentation
+  model, loss functions, metrics, and checkpoint helpers for
+  `model_family=peak_line`.
+- `train_peak_line.py`: trains PeakLineNet from generated point/line shards
+  with weighted BCE, Dice, and Focal losses plus optional validation and resume.
+- `predict_peak_line_dataset.py`: evaluates a PeakLineNet checkpoint and writes
+  four-panel PNG diagnostics for input points, GT line, predicted probability,
+  and threshold overlay.
+
 ## Legacy / Compatible Files
 
 - `trajectory_set_model.py`: older query polyline model and shared utilities.
@@ -51,6 +66,9 @@ uv run python -m autotrack.dl.predict_track_slot_dataset --data-dir datasets/tra
 uv run python -m autotrack.dl.convert_track_slot_to_peak_slot --in-dir datasets/track_slot/train --out-dir datasets/peak_slot/train --overwrite
 uv run python -m autotrack.dl.train_peak_slot --data-dir datasets/peak_slot/train --out-dir models/peak_slot_cuda --device cuda --amp on
 uv run python -m autotrack.dl.predict_peak_slot_dataset --data-dir datasets/peak_slot/train --model models/peak_slot_cuda/checkpoint_best.pt --out-dir /tmp/peak_slot_prediction_check --device cuda --max-samples 128
+uv run python -m autotrack.dl.generate_peak_line_dataset --out-dir datasets/peak_line/train --num-samples 1024 --shard-size 128 --workers 8 --overwrite
+uv run python -m autotrack.dl.train_peak_line --data-dir datasets/peak_line/train --out-dir models/peak_line_cuda --device cuda --amp on
+uv run python -m autotrack.dl.predict_peak_line_dataset --data-dir datasets/peak_line/train --model models/peak_line_cuda/checkpoint_best.pt --out-dir /tmp/peak_line_prediction_check --device cuda --max-samples 128
 ```
 
 `--auto-resume` reads `<out-dir>/checkpoint_last.pt` when present. `--epochs`
