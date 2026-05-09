@@ -7,7 +7,7 @@ cd "$SCRIPT_DIR"
 DATA_DIR=${DATA_DIR:-datasets/peak_slot/train}
 MODEL=${MODEL:-models/peak_slot_cuda/checkpoint_best.pt}
 OUT_DIR=${OUT_DIR:-models/peak_slot_cuda/prediction_check}
-DEVICE=${DEVICE:-auto}
+DEVICE=${DEVICE:-cpu}
 BATCH_SIZE=${BATCH_SIZE:-16}
 MAX_SAMPLES=${MAX_SAMPLES:-256}
 MAX_CSV_SAMPLES=${MAX_CSV_SAMPLES:-32}
