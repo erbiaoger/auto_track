@@ -50,6 +50,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-csv-samples", type=int, default=32, help="Detailed CSV sample limit; 0 disables detailed CSV.")
     parser.add_argument("--plot-samples", type=int, default=16, help="Number of overlay figures to write.")
     parser.add_argument("--plot-dpi", type=int, default=160, help="DPI for overlay PNG figures.")
+    parser.add_argument("--plot-style", default="waveform", choices=["waveform", "heatmap"], help="Overlay plot style: GUI-like waveform or heatmap.")
     parser.add_argument("--objectness-threshold", type=float, default=0.5, help="Predicted slot objectness threshold.")
     parser.add_argument("--peak-threshold", type=float, default=0.4, help="Minimum selected peak probability.")
     parser.add_argument("--min-visible-channels", type=int, default=3, help="Minimum selected peaks for a predicted track.")
@@ -256,6 +257,8 @@ def _plot_sample_overlay(
     targets_cpu: dict[str, torch.Tensor],
     batch_index: int,
     window_seconds: float,
+    dx_m: float,
+    plot_style: str,
     dpi: int,
 ) -> None:
     import matplotlib
@@ -265,21 +268,54 @@ def _plot_sample_overlay(
 
     plt.rcParams.update({"font.family": "Times New Roman", "axes.unicode_minus": False})
     arr = heatmap.detach().cpu().to(torch.float32).numpy()
-    n_ch = int(arr.shape[0])
+    if arr.ndim != 2:
+        raise ValueError("heatmap must have shape [channel, time]")
+    n_ch, n_t = int(arr.shape[0]), int(arr.shape[1])
     out_path.parent.mkdir(parents=True, exist_ok=True)
     finite = arr[np.isfinite(arr)]
     vmax = max(float(np.quantile(np.abs(finite), 0.995)), 1e-6) if finite.size else 1.0
     fig, ax = plt.subplots(figsize=(12.0, 7.0))
-    im = ax.imshow(
-        arr,
-        origin="lower",
-        aspect="auto",
-        cmap="gray_r",
-        vmin=-vmax,
-        vmax=vmax,
-        extent=(0.0, float(window_seconds), -0.5, float(n_ch) - 0.5),
-        interpolation="nearest",
-    )
+    plot_style = str(plot_style).lower()
+    if plot_style == "waveform":
+        if float(dx_m) > 0.0:
+            x_axis = np.arange(n_ch, dtype=np.float64) * float(dx_m) * 1e-3
+            x_label = "Offset [km]"
+        else:
+            x_axis = np.arange(n_ch, dtype=np.float64)
+            x_label = "Channel index"
+        t_axis = np.linspace(0.0, float(window_seconds), n_t, dtype=np.float64)
+        spacing = float(np.median(np.diff(x_axis))) if x_axis.size >= 2 else 1.0
+        if not np.isfinite(spacing) or spacing <= 0.0:
+            spacing = 1.0
+        wiggle_amp = 0.27 * spacing
+        clip_ratio = 1.35
+        for ch in range(n_ch):
+            ratio = np.clip(arr[ch].astype(np.float64) / max(vmax, 1e-12), -clip_ratio, clip_ratio)
+            ax.plot(x_axis[ch] + ratio * wiggle_amp, t_axis, color="0.45", linewidth=0.8, alpha=0.9)
+        pad = 0.4 * spacing
+        x_min_plot = float(x_axis[0] - pad)
+        x_max_plot = float(x_axis[-1] + pad)
+        x_span_full = max(1e-6, x_max_plot - x_min_plot)
+        ax.set_xlim(x_min_plot, x_max_plot)
+        ax.set_ylim(0.0, float(window_seconds))
+        ax.invert_yaxis()
+        ax.set_xlabel(x_label)
+        ax.set_ylabel("Time (s)")
+        im = None
+    else:
+        im = ax.imshow(
+            arr,
+            origin="lower",
+            aspect="auto",
+            cmap="gray_r",
+            vmin=-vmax,
+            vmax=vmax,
+            extent=(0.0, float(window_seconds), -0.5, float(n_ch) - 0.5),
+            interpolation="nearest",
+        )
+        x_axis = np.arange(n_ch, dtype=np.float64)
+        x_max_plot = float(window_seconds)
+        x_span_full = max(1e-6, float(window_seconds))
     gt_label_added = False
     for gt_idx in torch.where(targets_cpu["gt_valid"][batch_index])[0].tolist():
         chs = []
@@ -291,10 +327,15 @@ def _plot_sample_overlay(
             chs.append(int(ch))
             times.append(float(targets_cpu["peak_time"][batch_index, ch, peak_idx].item()) * float(window_seconds))
         if len(chs) >= 2:
-            ax.plot(times, chs, color="#00a651", linewidth=1.0, alpha=0.35, label="GT" if not gt_label_added else None)
+            if plot_style == "waveform":
+                xs = [float(x_axis[int(ch)]) for ch in chs]
+                ys = times
+            else:
+                xs = times
+                ys = chs
+            ax.plot(xs, ys, color="#00a651", linewidth=1.0, alpha=0.35, label="GT" if not gt_label_added else None)
             gt_label_added = True
     cmap = plt.get_cmap("tab20", max(1, len(predictions)))
-    x_span_plot = max(1e-6, float(window_seconds))
     pred_label_added = False
     for pred_id, pred in enumerate(predictions):
         chs = list(pred["channels"])
@@ -304,15 +345,21 @@ def _plot_sample_overlay(
         ]
         if len(chs) >= 2:
             color = cmap(pred_id % max(1, cmap.N))
-            ax.plot(times, chs, color=color, linewidth=1.6, alpha=0.9, label="Prediction" if not pred_label_added else None)
-            ax.scatter(times, chs, s=9, color=[color], edgecolors="black", linewidths=0.2, alpha=0.95)
+            if plot_style == "waveform":
+                xs = [float(x_axis[int(ch)]) for ch in chs]
+                ys = times
+            else:
+                xs = times
+                ys = chs
+            ax.plot(xs, ys, color=color, linewidth=1.6, alpha=0.9, label="Prediction" if not pred_label_added else None)
+            ax.scatter(xs, ys, s=9, color=[color], edgecolors="black", linewidths=0.2, alpha=0.95)
             speed_kmh = float(pred.get("speed_kmh", float("nan")))
             if math.isfinite(speed_kmh):
-                mid = len(times) // 2
-                x_text = min(float(window_seconds) - 0.02 * x_span_plot, float(times[mid]) + 0.01 * x_span_plot)
+                mid = len(xs) // 2
+                x_text = min(x_max_plot - 0.02 * x_span_full, float(xs[mid]) + 0.01 * x_span_full)
                 ax.text(
                     x_text,
-                    float(chs[mid]),
+                    float(ys[mid]),
                     f"{speed_kmh:.1f} km/h",
                     color=color,
                     fontsize=8,
@@ -324,14 +371,16 @@ def _plot_sample_overlay(
             pred_label_added = True
     gt_count = int(targets_cpu["gt_valid"][batch_index].sum().item())
     ax.set_title(f"PeakSlotNet prediction overlay, sample {sample_index}  GT={gt_count}  Pred={len(predictions)}")
-    ax.set_xlabel("Time (s)")
-    ax.set_ylabel("Channel index")
-    ax.set_xlim(0.0, float(window_seconds))
-    ax.set_ylim(-0.5, float(n_ch) - 0.5)
+    if plot_style != "waveform":
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Channel index")
+        ax.set_xlim(0.0, float(window_seconds))
+        ax.set_ylim(-0.5, float(n_ch) - 0.5)
     if gt_label_added or pred_label_added:
         ax.legend(loc="upper right", frameon=True)
-    cbar = fig.colorbar(im, ax=ax, fraction=0.025, pad=0.02)
-    cbar.set_label("Normalized heatmap amplitude")
+    if im is not None:
+        cbar = fig.colorbar(im, ax=ax, fraction=0.025, pad=0.02)
+        cbar.set_label("Normalized heatmap amplitude")
     fig.tight_layout()
     fig.savefig(out_path, dpi=int(dpi), bbox_inches="tight")
     plt.close(fig)
@@ -453,6 +502,8 @@ def main() -> int:
                                 targets_cpu=targets_cpu,
                                 batch_index=b,
                                 window_seconds=float(meta.get("window_seconds", 1.0)),
+                                dx_m=float(meta.get("dx_m", 0.0)),
+                                plot_style=str(args.plot_style),
                                 dpi=int(args.plot_dpi),
                             )
                             plot_sample_count += 1

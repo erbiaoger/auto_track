@@ -13,6 +13,7 @@ MAX_SAMPLES=${MAX_SAMPLES:-256}
 MAX_CSV_SAMPLES=${MAX_CSV_SAMPLES:-32}
 PLOT_SAMPLES=${PLOT_SAMPLES:-16}
 PLOT_DPI=${PLOT_DPI:-160}
+PLOT_STYLE=${PLOT_STYLE:-waveform}
 OBJECTNESS_THRESHOLD=${OBJECTNESS_THRESHOLD:-0.3}
 VISIBILITY_THRESHOLD=${VISIBILITY_THRESHOLD:-0.3}
 MIN_VISIBLE_CHANNELS=${MIN_VISIBLE_CHANNELS:-3}
@@ -29,6 +30,7 @@ uv run python -m autotrack.dl.predict_track_slot_dataset \
   --max-csv-samples "$MAX_CSV_SAMPLES" \
   --plot-samples "$PLOT_SAMPLES" \
   --plot-dpi "$PLOT_DPI" \
+  --plot-style "$PLOT_STYLE" \
   --objectness-threshold "$OBJECTNESS_THRESHOLD" \
   --visibility-threshold "$VISIBILITY_THRESHOLD" \
   --min-visible-channels "$MIN_VISIBLE_CHANNELS" \
