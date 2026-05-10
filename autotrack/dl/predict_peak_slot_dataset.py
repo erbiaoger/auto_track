@@ -80,7 +80,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--viterbi-smoothness-penalty", type=float, default=0.6, help="Soft penalty for slope changes.")
     parser.add_argument("--viterbi-inertia-penalty", type=float, default=2.5, help="Penalty for deviating from the previous speed prediction.")
     parser.add_argument("--viterbi-slope-memory", type=float, default=0.75, help="Exponential memory for the slot's running slope.")
-    parser.add_argument("--matcher", default="hungarian", choices=["hungarian", "greedy"], help="Metric matching strategy.")
+    parser.add_argument("--matcher", default="hungarian", choices=["hungarian", "greedy", "auction"], help="Metric matching strategy.")
     parser.add_argument("--none-weight", type=float, default=0.35, help="GT-none weight for loss reporting.")
     parser.add_argument("--no-object-weight", type=float, default=0.15, help="Unmatched slot weight for loss reporting.")
     parser.add_argument("--metric-point-threshold", type=float, default=0.05, help="Normalized time-error threshold for TP.")

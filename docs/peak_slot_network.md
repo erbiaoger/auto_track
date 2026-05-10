@@ -65,8 +65,10 @@ high-scoring path that steals peaks from another trajectory.
 
 ## Matching and Loss
 
-Training still uses Hungarian matching on the small `[Q, GT]` matrix. The
-matching cost is:
+Training uses one-to-one matching on the small `[Q, GT]` matrix. The default is
+exact CPU/SciPy Hungarian matching; `--matcher auction` enables a torch auction
+matcher that stays on the tensor device and is useful when CPU matching stalls
+GPU training. The matching cost is:
 
 ```text
 3.0 * visible_peak_nll
@@ -111,7 +113,8 @@ visibility per channel. The slot competition loss discourages different slots
 from assigning high probability to the same peak candidates. The crossing
 margin term raises the margin between the matched GT candidate and other
 candidate peaks on the same channel, which is targeted at crossing and
-near-crossing switch errors.
+near-crossing switch errors. It reuses the main matching result, so enabling it
+does not run a second Hungarian/auction assignment.
 
 ## Synthetic Interaction Data
 

@@ -65,7 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--amp", default="auto", choices=["auto", "on", "off"], help="Use CUDA automatic mixed precision.")
     parser.add_argument("--amp-dtype", default="float16", choices=["float16", "bfloat16"], help="CUDA AMP dtype.")
     parser.add_argument("--channels-last", action="store_true", help="Use channels-last input/model layout on CUDA.")
-    parser.add_argument("--matcher", default="hungarian", choices=["hungarian", "greedy"], help="Slot-to-GT assignment.")
+    parser.add_argument("--matcher", default="hungarian", choices=["hungarian", "greedy", "auction"], help="Slot-to-GT assignment.")
     parser.add_argument("--no-object-weight", type=float, default=0.15, help="Object loss weight for unmatched slots.")
     parser.add_argument("--none-weight", type=float, default=0.35, help="Peak CE weight for GT-none channel targets.")
     parser.add_argument("--count-loss-weight", type=float, default=0.05, help="Soft count loss weight.")
