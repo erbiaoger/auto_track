@@ -283,11 +283,12 @@ def _greedy_match_cost(cost: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def _auction_match_cost(cost: torch.Tensor, *, eps: float = 1e-3, max_iter: Optional[int] = None) -> tuple[torch.Tensor, torch.Tensor]:
-    """Approximate one-to-one assignment with a torch auction loop.
+    """Approximate one-to-one assignment with a parallel torch auction loop.
 
     This is intended as a GPU-friendly alternative to SciPy Hungarian during
     training. It is not guaranteed to return the exact global optimum, but it
-    avoids converting the cost matrix to CPU NumPy.
+    avoids converting the cost matrix to CPU NumPy and avoids per-bidder
+    `.item()` synchronization.
     """
     q_count, g_count = int(cost.shape[0]), int(cost.shape[1])
     if q_count <= 0 or g_count <= 0:
@@ -296,61 +297,65 @@ def _auction_match_cost(cost: torch.Tensor, *, eps: float = 1e-3, max_iter: Opti
     if q_count >= g_count:
         values = -cost.transpose(0, 1).detach()  # bidders: GT, items: slots
         bidder_count, item_count = int(values.shape[0]), int(values.shape[1])
-        prices = torch.zeros((item_count,), dtype=values.dtype, device=values.device)
-        owner = torch.full((item_count,), -1, dtype=torch.long, device=values.device)
-        assigned_item = torch.full((bidder_count,), -1, dtype=torch.long, device=values.device)
-        limit = int(max_iter or max(32, bidder_count * item_count * 2))
-        for _ in range(limit):
-            unassigned = torch.where(assigned_item < 0)[0]
-            if int(unassigned.numel()) == 0:
-                break
-            for bidder in unassigned:
-                scores = values[bidder] - prices
-                if item_count == 1:
-                    best_item = torch.argmax(scores)
-                    increment = torch.as_tensor(float(eps), dtype=values.dtype, device=values.device)
-                else:
-                    top = torch.topk(scores, k=2)
-                    best_item = top.indices[0]
-                    increment = top.values[0] - top.values[1] + float(eps)
-                prev_owner = owner[best_item]
-                if int(prev_owner.item()) >= 0:
-                    assigned_item[prev_owner] = -1
-                owner[best_item] = bidder
-                assigned_item[bidder] = best_item
-                prices[best_item] = prices[best_item] + increment
+        assigned_item = _parallel_auction_assign(values, eps=eps, max_iter=max_iter)
         cols = torch.where(assigned_item >= 0)[0]
         rows = assigned_item[cols]
         return rows.to(torch.long), cols.to(torch.long)
 
     values = -cost.detach()  # bidders: slots, items: GT
-    bidder_count, item_count = int(values.shape[0]), int(values.shape[1])
-    prices = torch.zeros((item_count,), dtype=values.dtype, device=values.device)
-    owner = torch.full((item_count,), -1, dtype=torch.long, device=values.device)
-    assigned_item = torch.full((bidder_count,), -1, dtype=torch.long, device=values.device)
-    limit = int(max_iter or max(32, bidder_count * item_count * 2))
-    for _ in range(limit):
-        unassigned = torch.where(assigned_item < 0)[0]
-        if int(unassigned.numel()) == 0:
-            break
-        for bidder in unassigned:
-            scores = values[bidder] - prices
-            if item_count == 1:
-                best_item = torch.argmax(scores)
-                increment = torch.as_tensor(float(eps), dtype=values.dtype, device=values.device)
-            else:
-                top = torch.topk(scores, k=2)
-                best_item = top.indices[0]
-                increment = top.values[0] - top.values[1] + float(eps)
-            prev_owner = owner[best_item]
-            if int(prev_owner.item()) >= 0:
-                assigned_item[prev_owner] = -1
-            owner[best_item] = bidder
-            assigned_item[bidder] = best_item
-            prices[best_item] = prices[best_item] + increment
+    assigned_item = _parallel_auction_assign(values, eps=eps, max_iter=max_iter)
     rows = torch.where(assigned_item >= 0)[0]
     cols = assigned_item[rows]
     return rows.to(torch.long), cols.to(torch.long)
+
+
+def _parallel_auction_assign(values: torch.Tensor, *, eps: float = 1e-3, max_iter: Optional[int] = None) -> torch.Tensor:
+    bidder_count, item_count = int(values.shape[0]), int(values.shape[1])
+    device = values.device
+    if bidder_count <= 0 or item_count <= 0:
+        return torch.empty((0,), dtype=torch.long, device=device)
+    if item_count == 1:
+        return torch.zeros((bidder_count,), dtype=torch.long, device=device)
+    prices = torch.zeros((item_count,), dtype=values.dtype, device=device)
+    owner = torch.full((item_count,), -1, dtype=torch.long, device=device)
+    assigned_item = torch.full((bidder_count,), -1, dtype=torch.long, device=device)
+    bidder_ids = torch.arange(bidder_count, dtype=torch.long, device=device)
+    min_score = torch.finfo(values.dtype).min
+    limit = int(max_iter or max(8, min(64, bidder_count * 3)))
+    eps_value = torch.as_tensor(float(eps), dtype=values.dtype, device=device)
+    for _ in range(limit):
+        unassigned = assigned_item < 0
+        scores = values - prices[None, :]
+        scores = scores.masked_fill(~unassigned[:, None], min_score)
+        top = torch.topk(scores, k=2, dim=1)
+        best_item = top.indices[:, 0]
+        bid_increment = top.values[:, 0] - top.values[:, 1] + eps_value
+        bid_increment = torch.where(unassigned, bid_increment, torch.full_like(bid_increment, min_score))
+
+        best_bid = torch.full((item_count,), min_score, dtype=values.dtype, device=device)
+        best_bid.scatter_reduce_(0, best_item, bid_increment, reduce="amax", include_self=True)
+        has_bid = best_bid > (min_score * 0.5)
+        is_top_bid = unassigned & (bid_increment == best_bid.gather(0, best_item))
+
+        winner_by_item = torch.full((item_count,), -1, dtype=torch.long, device=device)
+        winner_candidate = torch.where(is_top_bid, bidder_ids, torch.full_like(bidder_ids, -1))
+        winner_by_item.scatter_reduce_(0, best_item, winner_candidate, reduce="amax", include_self=True)
+        won_items = torch.where(has_bid)[0]
+        if won_items.numel() == 0:
+            continue
+        winners = winner_by_item[won_items]
+        valid_winners = winners >= 0
+        won_items = won_items[valid_winners]
+        winners = winners[valid_winners]
+        if winners.numel() == 0:
+            continue
+        previous = owner[won_items]
+        prev_valid = previous >= 0
+        assigned_item[previous[prev_valid]] = -1
+        owner[won_items] = winners
+        assigned_item[winners] = won_items
+        prices[won_items] = prices[won_items] + best_bid[won_items]
+    return assigned_item
 
 
 def _match_single(
@@ -402,12 +407,22 @@ def _slot_peak_competition_loss(outputs: dict[str, torch.Tensor], q_count: int) 
     obj = torch.sigmoid(outputs["objectness_logits"][:, :q_count])
     peak_prob = torch.softmax(outputs["peak_logits"][:, :q_count, :, :-1], dim=-1)
     weighted = peak_prob * obj[:, :, None, None]
-    overlap = torch.einsum("bqck,brck->bqr", weighted, weighted)
-    q = int(overlap.shape[-1])
+    q = int(weighted.shape[1])
     if q <= 1:
-        return torch.zeros((), dtype=overlap.dtype, device=overlap.device)
-    eye = torch.eye(q, dtype=torch.bool, device=overlap.device).unsqueeze(0).expand_as(overlap)
-    return overlap.masked_select(~eye).mean()
+        return torch.zeros((), dtype=weighted.dtype, device=weighted.device)
+    sum_by_peak = weighted.sum(dim=1)
+    offdiag_sum = (sum_by_peak.square() - weighted.square().sum(dim=1)).sum(dim=(1, 2))
+    return offdiag_sum.mean() / float(q * (q - 1))
+
+
+def _valid_rank_to_gt_index(gt_valid: torch.Tensor) -> torch.Tensor:
+    batch_size, max_gt = int(gt_valid.shape[0]), int(gt_valid.shape[1])
+    rank_map = torch.full((batch_size, max_gt), -1, dtype=torch.long, device=gt_valid.device)
+    valid_rank = torch.cumsum(gt_valid.to(torch.long), dim=1) - 1
+    batch_idx, gt_idx = torch.where(gt_valid)
+    if batch_idx.numel() > 0:
+        rank_map[batch_idx, valid_rank[batch_idx, gt_idx]] = gt_idx
+    return rank_map
 
 
 def _peak_switch_margin_loss(
@@ -422,22 +437,20 @@ def _peak_switch_margin_loss(
     q_count = int(outputs["num_regular_queries"])
     none_index = int(outputs["peak_logits"].shape[-1] - 1)
     logp = torch.log_softmax(outputs["peak_logits"][:, :q_count], dim=-1)
-    terms: list[torch.Tensor] = []
-    for bi, qi, gi in zip(b_sel.tolist(), q_sel.tolist(), mapped_g.tolist()):
-        gt_peak = targets["gt_peak_index"][int(bi), int(gi)].to(device=device, dtype=torch.long)
-        gt_vis = targets["visibility"][int(bi), int(gi)].to(device=device, dtype=torch.float32)
-        valid = (gt_vis > 0.5) & (gt_peak < none_index)
-        if not torch.any(valid):
-            continue
-        good = logp[int(bi), int(qi), :, :].gather(1, gt_peak.clamp(0, none_index)[:, None]).squeeze(1)
-        masked = logp[int(bi), int(qi), :, :none_index].clone()
-        masked[torch.arange(int(masked.shape[0]), device=device), gt_peak.clamp(0, none_index - 1)] = -1e4
-        bad = torch.max(masked, dim=-1).values
-        margin = 0.75
-        terms.append((torch.relu(margin + bad[valid] - good[valid])).mean())
-    if not terms:
+    if b_sel.numel() == 0:
         return torch.zeros((), dtype=logp.dtype, device=device)
-    return torch.stack(terms).mean()
+    matched_logp = logp[b_sel, q_sel]
+    gt_peak = targets["gt_peak_index"][b_sel, mapped_g].to(device=device, dtype=torch.long)
+    gt_vis = targets["visibility"][b_sel, mapped_g].to(device=device, dtype=torch.float32)
+    valid = (gt_vis > 0.5) & (gt_peak < none_index)
+    if not torch.any(valid):
+        return torch.zeros((), dtype=logp.dtype, device=device)
+    good = matched_logp.gather(2, gt_peak.clamp(0, none_index)[:, :, None]).squeeze(-1)
+    bad_logits = matched_logp[:, :, :none_index].clone()
+    bad_logits.scatter_(2, gt_peak.clamp(0, none_index - 1)[:, :, None], -1e4)
+    bad = torch.max(bad_logits, dim=-1).values
+    margin = 0.75
+    return torch.relu(margin + bad[valid] - good[valid]).mean()
 
 
 def peak_slot_set_loss(
@@ -473,7 +486,7 @@ def peak_slot_set_loss(
     matched_q: list[torch.Tensor] = []
     matched_g: list[torch.Tensor] = []
     matched_total = 0
-    gt_total = int(targets["gt_valid"].sum().detach().cpu())
+    gt_total = 0
 
     for b in range(batch_size):
         rows, cols = _match_single(
@@ -508,11 +521,7 @@ def peak_slot_set_loss(
         q_sel = torch.cat(matched_q)
         g_sel = torch.cat(matched_g)
         gt_valid = targets["gt_valid"].to(device=device, dtype=torch.bool)
-        mapped_items = []
-        for bi, gi in zip(b_sel.tolist(), g_sel.tolist()):
-            valid_idx = torch.where(gt_valid[int(bi)])[0]
-            mapped_items.append(valid_idx[int(gi)])
-        mapped_g = torch.stack(mapped_items)
+        mapped_g = _valid_rank_to_gt_index(gt_valid)[b_sel, g_sel]
         pred_peak_logits = outputs["peak_logits"][b_sel, q_sel]
         gt_peak = targets["gt_peak_index"][b_sel, mapped_g].to(device=device, dtype=torch.long).clamp(0, none_index)
         ce = F.cross_entropy(pred_peak_logits.reshape(-1, none_index + 1), gt_peak.reshape(-1), reduction="none").view_as(gt_peak)
@@ -587,6 +596,7 @@ def peak_slot_set_loss(
     )
     if not collect_metrics:
         return total, {}
+    gt_total = int(targets["gt_valid"].sum().detach().cpu())
     metrics = {
         "loss": float(total.detach().cpu()),
         "loss_obj": float(loss_obj.detach().cpu()),
