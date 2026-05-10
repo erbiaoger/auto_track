@@ -406,7 +406,7 @@ def _plot_sample_overlay(
             else:
                 xs = times
                 ys = chs
-            ax.plot(xs, ys, color="#00a651", linewidth=1.0, alpha=0.35, label="GT" if not gt_label_added else None)
+            ax.plot(xs, ys, color="black", linewidth=0.6, alpha=0.9, label="GT" if not gt_label_added else None)
             gt_label_added = True
     cmap = plt.get_cmap("tab20", max(1, len(predictions)))
     pred_label_added = False
