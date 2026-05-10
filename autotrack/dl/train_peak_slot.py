@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -33,6 +34,7 @@ from typing import Iterator, Optional
 
 import numpy as np
 import torch
+from torch.utils.data import DataLoader, Dataset
 
 from autotrack.dl.peak_slot_model import (
     ModelConfig,
@@ -52,6 +54,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=50, help="Target total training epochs.")
     parser.add_argument("--batch-size", type=int, default=32, help="Batch size.")
     parser.add_argument("--max-samples", type=int, default=0, help="Limit samples per epoch for smoke tests; 0 uses all.")
+    parser.add_argument("--num-workers", type=int, default=0, help="DataLoader workers. 0 uses the legacy synchronous shard iterator.")
+    parser.add_argument("--pin-memory", action="store_true", help="Use pinned CPU memory for CUDA input transfer.")
+    parser.add_argument("--persistent-workers", action="store_true", help="Keep DataLoader workers alive between epochs.")
+    parser.add_argument("--prefetch-factor", type=int, default=2, help="DataLoader prefetch factor when num-workers > 0.")
     parser.add_argument("--lr", type=float, default=2e-4, help="AdamW learning rate.")
     parser.add_argument("--weight-decay", type=float, default=1e-4, help="AdamW weight decay.")
     parser.add_argument("--max-tracks", type=int, default=96, help="Output slots Q.")
@@ -176,6 +182,196 @@ def _shard_batch_count(meta: dict, all_shards: list[str], shards: list[str], bat
     return total
 
 
+def _shard_sample_count(meta: dict, all_shards: list[str], shard: str) -> int:
+    shard_idx = all_shards.index(shard)
+    shard_size = int(meta.get("shard_size", 1))
+    sample_count = int(meta.get("num_samples", 0))
+    if shard_idx == len(all_shards) - 1:
+        return max(0, sample_count - shard_idx * shard_size)
+    return int(shard_size)
+
+
+def _convert_x_dtype(x: torch.Tensor, x_transfer_dtype: str) -> torch.Tensor:
+    if str(x_transfer_dtype) == "float32":
+        return x.to(torch.float32)
+    if str(x_transfer_dtype) == "float16":
+        return x.to(torch.float16)
+    return x
+
+
+class PeakSlotShardDataset(Dataset):
+    """Map-style dataset backed by peak-slot shard .pt files.
+
+    Each worker keeps a small per-process shard cache, so shuffled sample access
+    does not reload the same shard for every item.
+    """
+
+    def __init__(
+        self,
+        data_dir: Path,
+        *,
+        meta: dict,
+        all_shards: list[str],
+        shards: list[str],
+        max_samples: int,
+        x_transfer_dtype: str,
+    ):
+        self.data_dir = Path(data_dir)
+        self.x_transfer_dtype = str(x_transfer_dtype)
+        self._cache: dict[str, dict[str, torch.Tensor]] = {}
+        refs: list[tuple[str, int]] = []
+        limit = int(max_samples)
+        for shard in shards:
+            n = _shard_sample_count(meta, all_shards, shard)
+            for idx in range(n):
+                if limit > 0 and len(refs) >= limit:
+                    break
+                refs.append((str(shard), int(idx)))
+            if limit > 0 and len(refs) >= limit:
+                break
+        self.refs = refs
+
+    def __len__(self) -> int:
+        return len(self.refs)
+
+    def _payload(self, shard: str) -> dict[str, torch.Tensor]:
+        payload = self._cache.get(shard)
+        if payload is None:
+            payload = torch.load(str(self.data_dir / shard), map_location="cpu", weights_only=False)
+            self._cache[shard] = payload
+        return payload
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        shard, sample_idx = self.refs[int(index)]
+        payload = self._payload(shard)
+        x = _convert_x_dtype(payload["x"][sample_idx], self.x_transfer_dtype)
+        target = {
+            "peak_time": payload["peak_time"][sample_idx].to(torch.float32),
+            "peak_amp": payload["peak_amp"][sample_idx].to(torch.float32),
+            "peak_valid": payload["peak_valid"][sample_idx].to(torch.bool),
+            "peak_index": payload["peak_index"][sample_idx].to(torch.long),
+            "gt_peak_index": payload["gt_peak_index"][sample_idx].to(torch.long),
+            "visibility": payload["visibility"][sample_idx].to(torch.float32),
+            "direction": payload["direction"][sample_idx].to(torch.long),
+            "speed": payload["speed"][sample_idx].to(torch.float32),
+            "gt_valid": payload["gt_valid"][sample_idx].to(torch.bool),
+        }
+        target["gt_count"] = target["gt_valid"].sum().to(torch.long)
+        return x, target
+
+
+def _collate_peak_slot_batch(items: list[tuple[torch.Tensor, dict[str, torch.Tensor]]]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    xs = torch.stack([item[0] for item in items], dim=0).contiguous()
+    keys = list(items[0][1].keys())
+    targets = {key: torch.stack([item[1][key] for item in items], dim=0).contiguous() for key in keys}
+    return xs, targets
+
+
+def _seed_worker(worker_id: int) -> None:
+    torch.set_num_threads(1)
+    np.random.seed((torch.initial_seed() + int(worker_id)) % (2**32))
+
+
+def _shutdown_dataloader(loader: Optional[DataLoader]) -> None:
+    if loader is None:
+        return
+    iterator = getattr(loader, "_iterator", None)
+    shutdown = getattr(iterator, "_shutdown_workers", None)
+    if callable(shutdown):
+        shutdown()
+
+
+def _make_batch_iter(
+    data_dir: Path,
+    *,
+    meta: dict,
+    all_shards: list[str],
+    shards: list[str],
+    batch_size: int,
+    shuffle: bool,
+    seed: int,
+    epoch: int,
+    max_samples: int,
+    x_transfer_dtype: str,
+    num_workers: int,
+    pin_memory: bool,
+    persistent_workers: bool,
+    prefetch_factor: int,
+) -> Iterator[tuple[torch.Tensor, dict[str, torch.Tensor]]]:
+    if int(num_workers) <= 0:
+        return _iter_batches(
+            data_dir,
+            shards=shards,
+            batch_size=int(batch_size),
+            shuffle=bool(shuffle),
+            seed=int(seed),
+            epoch=int(epoch),
+            max_samples=int(max_samples),
+            x_transfer_dtype=str(x_transfer_dtype),
+        )
+    loader = _make_dataloader(
+        data_dir,
+        meta=meta,
+        all_shards=all_shards,
+        shards=shards,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        seed=seed,
+        epoch=epoch,
+        max_samples=int(max_samples),
+        x_transfer_dtype=str(x_transfer_dtype),
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
+    )
+    return iter(loader)
+
+
+def _make_dataloader(
+    data_dir: Path,
+    *,
+    meta: dict,
+    all_shards: list[str],
+    shards: list[str],
+    batch_size: int,
+    shuffle: bool,
+    seed: int,
+    epoch: int,
+    max_samples: int,
+    x_transfer_dtype: str,
+    num_workers: int,
+    pin_memory: bool,
+    persistent_workers: bool,
+    prefetch_factor: int,
+) -> DataLoader:
+    dataset = PeakSlotShardDataset(
+        data_dir,
+        meta=meta,
+        all_shards=all_shards,
+        shards=shards,
+        max_samples=int(max_samples),
+        x_transfer_dtype=str(x_transfer_dtype),
+    )
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(int(seed) + int(epoch) * 97_531)
+    loader_kwargs = {
+        "dataset": dataset,
+        "batch_size": int(batch_size),
+        "shuffle": bool(shuffle),
+        "num_workers": int(num_workers),
+        "pin_memory": bool(pin_memory),
+        "persistent_workers": bool(persistent_workers),
+        "prefetch_factor": max(1, int(prefetch_factor)),
+        "collate_fn": _collate_peak_slot_batch,
+        "worker_init_fn": _seed_worker,
+        "generator": generator,
+    }
+    if hasattr(os, "fork"):
+        loader_kwargs["multiprocessing_context"] = "fork"
+    return DataLoader(**loader_kwargs)
+
+
 def _iter_batches(
     data_dir: Path,
     shards: list[str],
@@ -219,11 +415,7 @@ def _iter_batches(
                 "gt_valid": payload["gt_valid"][idx].to(torch.bool),
             }
             targets["gt_count"] = targets["gt_valid"].sum(dim=1).to(torch.long)
-            x = payload["x"][idx]
-            if str(x_transfer_dtype) == "float32":
-                x = x.to(torch.float32)
-            elif str(x_transfer_dtype) == "float16":
-                x = x.to(torch.float16)
+            x = _convert_x_dtype(payload["x"][idx], str(x_transfer_dtype))
             yield x, targets
 
 
@@ -249,15 +441,22 @@ def _evaluate(model: PeakSlotPredictor, data_dir: Path, shards: list[str], devic
     model.eval()
     metrics_items: list[dict[str, float]] = []
     with torch.no_grad():
-        for x, targets in _iter_batches(
+        all_shards = [str(item) for item in meta.get("shards", [])]
+        for x, targets in _make_batch_iter(
             data_dir,
-            shards,
+            meta=meta,
+            all_shards=all_shards,
+            shards=shards,
             batch_size=int(args.batch_size),
             shuffle=False,
             seed=int(args.seed),
             epoch=0,
             max_samples=int(args.max_samples),
             x_transfer_dtype="float32",
+            num_workers=int(args.num_workers),
+            pin_memory=bool(args.pin_memory and str(device).startswith("cuda")),
+            persistent_workers=bool(args.persistent_workers and int(args.num_workers) > 0),
+            prefetch_factor=int(args.prefetch_factor),
         ):
             x, targets = _batch_to_device(x, targets, device, channels_last=bool(args.channels_last and str(device).startswith("cuda")))
             outputs = _forward(model, x, targets)
@@ -390,7 +589,8 @@ def main() -> int:
     print(
         "Dataset: "
         f"samples={meta.get('num_samples')}, train_shards={len(train_shards)}, val_shards={len(val_shards)}, "
-        f"batch_size={int(args.batch_size)}, batches_per_epoch={batches_per_epoch}, peaks={model_config.peak_candidates}"
+        f"batch_size={int(args.batch_size)}, batches_per_epoch={batches_per_epoch}, peaks={model_config.peak_candidates}, "
+        f"workers={int(args.num_workers)}, pin_memory={bool(args.pin_memory and str(device).startswith('cuda'))}"
     )
     print(
         "Model: "
@@ -407,21 +607,50 @@ def main() -> int:
         print(f"Checkpoint epoch={resume_epoch} is already >= target epochs={int(args.epochs)}; nothing to train.")
         return 0
 
+    train_loader: Optional[DataLoader] = None
+    if int(args.num_workers) > 0:
+        train_loader = _make_dataloader(
+            data_dir,
+            meta=meta,
+            all_shards=shards,
+            shards=train_shards,
+            batch_size=int(args.batch_size),
+            shuffle=True,
+            seed=int(args.seed),
+            epoch=int(start_epoch),
+            max_samples=int(args.max_samples),
+            x_transfer_dtype=str(x_transfer_dtype),
+            num_workers=int(args.num_workers),
+            pin_memory=bool(args.pin_memory and str(device).startswith("cuda")),
+            persistent_workers=bool(args.persistent_workers),
+            prefetch_factor=int(args.prefetch_factor),
+        )
+
     for epoch in range(start_epoch, int(args.epochs) + 1):
         model.train()
         t0 = time.perf_counter()
         epoch_metrics: list[dict[str, float]] = []
-        for batch_idx, (x, targets) in enumerate(
-            _iter_batches(
+        if train_loader is None:
+            batch_iter = _make_batch_iter(
                 data_dir,
-                train_shards,
+                meta=meta,
+                all_shards=shards,
+                shards=train_shards,
                 batch_size=int(args.batch_size),
                 shuffle=True,
                 seed=int(args.seed),
                 epoch=epoch,
                 max_samples=int(args.max_samples),
                 x_transfer_dtype=str(x_transfer_dtype),
-            ),
+                num_workers=0,
+                pin_memory=False,
+                persistent_workers=False,
+                prefetch_factor=int(args.prefetch_factor),
+            )
+        else:
+            batch_iter = iter(train_loader)
+        for batch_idx, (x, targets) in enumerate(
+            batch_iter,
             start=1,
         ):
             should_log = int(args.log_every) > 0 and (batch_idx == 1 or batch_idx % int(args.log_every) == 0 or batch_idx == batches_per_epoch)
@@ -527,6 +756,7 @@ def main() -> int:
                 best_path = out_dir / "checkpoint_best.pt"
                 save_checkpoint(best_path, model, optimizer, model_config, dataset_config, epoch, checkpoint_metrics, dataset_meta=meta)
                 print(f"Saved new best checkpoint: {best_path}", flush=True)
+    _shutdown_dataloader(train_loader)
     print(f"Done. Best loss={best_loss:.4f}. Output: {out_dir}")
     return 0
 

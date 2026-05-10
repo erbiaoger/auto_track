@@ -8,8 +8,12 @@ DATA_DIR=${DATA_DIR:-datasets/peak_slot_v2_120s/train}
 OUT_DIR=${OUT_DIR:-models/peak_slot_v2_120s_cuda}
 DEVICE=${DEVICE:-cuda}
 EPOCHS=${EPOCHS:-1000}
-BATCH_SIZE=${BATCH_SIZE:-32}
+BATCH_SIZE=${BATCH_SIZE:-42}
 MAX_SAMPLES=${MAX_SAMPLES:-0}
+NUM_WORKERS=${NUM_WORKERS:-16}
+PIN_MEMORY=${PIN_MEMORY:-1}
+PERSISTENT_WORKERS=${PERSISTENT_WORKERS:-1}
+PREFETCH_FACTOR=${PREFETCH_FACTOR:-4}
 LR=${LR:-0.0002}
 WEIGHT_DECAY=${WEIGHT_DECAY:-0.0001}
 MAX_TRACKS=${MAX_TRACKS:-96}
@@ -51,6 +55,14 @@ elif [ "$AUTO_RESUME" = "1" ] || [ "$AUTO_RESUME" = "true" ]; then
   resume_args="--auto-resume"
 fi
 
+loader_args="--num-workers $NUM_WORKERS --prefetch-factor $PREFETCH_FACTOR"
+if [ "$PIN_MEMORY" = "1" ] || [ "$PIN_MEMORY" = "true" ]; then
+  loader_args="$loader_args --pin-memory"
+fi
+if [ "$PERSISTENT_WORKERS" = "1" ] || [ "$PERSISTENT_WORKERS" = "true" ]; then
+  loader_args="$loader_args --persistent-workers"
+fi
+
 uv run python -m autotrack.dl.train_peak_slot \
   --data-dir "$DATA_DIR" \
   --out-dir "$OUT_DIR" \
@@ -58,6 +70,7 @@ uv run python -m autotrack.dl.train_peak_slot \
   --epochs "$EPOCHS" \
   --batch-size "$BATCH_SIZE" \
   --max-samples "$MAX_SAMPLES" \
+  $loader_args \
   --lr "$LR" \
   --weight-decay "$WEIGHT_DECAY" \
   --max-tracks "$MAX_TRACKS" \
