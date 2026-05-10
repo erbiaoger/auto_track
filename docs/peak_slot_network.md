@@ -23,6 +23,25 @@ The class `K` means no vehicle point on that channel. This means exported
 trajectory points can only be detected peaks; empty boundary channels are not
 forced to receive a regressed time.
 
+## Inference Decoding
+
+Prediction now defaults to a Viterbi-style physical decoder instead of
+independent per-channel argmax. For each active slot, the decoder searches a
+peak path using:
+
+```text
+emission = log_softmax(peak_logits[q, ch, k])
+hard speed window = 60-100 km/h
+max channel skip = 4
+soft penalties = speed mismatch + skipped channels + slope changes
+```
+
+This is a post-processing step, not part of the neural network and not
+backpropagated during training. It keeps selected points on detected peak
+candidates while reducing local reversals, cross-car jumps, and zigzag paths.
+Use `--no-viterbi-decoder` in `predict_peak_slot_dataset.py` to compare with
+the legacy argmax decoder.
+
 ## Matching and Loss
 
 Training still uses Hungarian matching on the small `[Q, GT]` matrix. The
@@ -44,8 +63,8 @@ loss =
 + 0.05 * loss_count
 + 0.5 * loss_direction
 + 0.25 * loss_speed
-+ 0.2 * loss_monotonic
-+ 0.05 * loss_smooth
++ 1.0 * loss_monotonic
++ 0.2 * loss_smooth
 ```
 
 `loss_peak_ce` is the main term. Visible GT channel points are supervised to

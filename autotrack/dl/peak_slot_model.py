@@ -80,6 +80,17 @@ class InferenceConfig:
     peak_min_distance_s: float = 0.5
     peak_min_height: float = 0.02
     peak_prominence: float = 0.02
+    use_viterbi_decoder: bool = True
+    viterbi_topk: int = 16
+    viterbi_speed_min_kmh: float = 60.0
+    viterbi_speed_max_kmh: float = 100.0
+    viterbi_max_skip_channels: int = 4
+    viterbi_point_bonus: float = 1.0
+    viterbi_skip_penalty: float = 0.7
+    viterbi_speed_penalty: float = 1.0
+    viterbi_smoothness_penalty: float = 0.6
+    viterbi_fallback_speed_kmh: float = 80.0
+    physics_smooth_tolerance_s: float = 2.0
 
 
 class ConvBlock(nn.Module):
@@ -515,6 +526,278 @@ def peak_slot_detection_metrics(
     }
 
 
+def _direction_sign(direction_label: int) -> float:
+    return 1.0 if LABEL_TO_DIRECTION.get(int(direction_label), "forward") == "forward" else -1.0
+
+
+def _slot_peak_candidates(
+    peak_prob: np.ndarray,
+    peak_valid: torch.Tensor,
+    peak_index: torch.Tensor,
+    *,
+    peak_threshold: float,
+    topk: int,
+) -> list[list[dict[str, float | int]]]:
+    candidates: list[list[dict[str, float | int]]] = []
+    n_ch = int(peak_prob.shape[0])
+    none_idx = int(peak_prob.shape[1] - 1)
+    for ch in range(n_ch):
+        ch_items: list[dict[str, float | int]] = []
+        for k in range(none_idx):
+            if not bool(peak_valid[ch, k]):
+                continue
+            prob = float(peak_prob[ch, k])
+            if prob < float(peak_threshold):
+                continue
+            ch_items.append(
+                {
+                    "ch": int(ch),
+                    "peak_idx": int(k),
+                    "prob": prob,
+                    "logp": float(np.log(max(prob, 1e-12))),
+                    "t_down": int(peak_index[ch, k].item()),
+                }
+            )
+        ch_items.sort(key=lambda item: float(item["logp"]), reverse=True)
+        candidates.append(ch_items[: max(1, int(topk))])
+    return candidates
+
+
+def _transition_score(
+    prev: dict[str, float | int | None],
+    cur: dict[str, float | int],
+    *,
+    x_axis_m: np.ndarray,
+    time_downsample: int,
+    fs: float,
+    direction_label: int,
+    speed_min_kmh: float,
+    speed_max_kmh: float,
+    reference_speed_kmh: float,
+    skip_penalty: float,
+    speed_penalty: float,
+    smoothness_penalty: float,
+) -> tuple[bool, float, float]:
+    prev_ch = int(prev["ch"])  # type: ignore[arg-type]
+    cur_ch = int(cur["ch"])
+    ch_gap = cur_ch - prev_ch
+    if ch_gap <= 0:
+        return False, 0.0, 0.0
+    prev_t = int(prev["t_down"]) * int(time_downsample) / float(fs)  # type: ignore[arg-type]
+    cur_t = int(cur["t_down"]) * int(time_downsample) / float(fs)
+    dt_signed = cur_t - prev_t
+    if _direction_sign(int(direction_label)) * dt_signed < 0.0:
+        return False, 0.0, 0.0
+    if cur_ch < len(x_axis_m) and prev_ch < len(x_axis_m):
+        dx = abs(float(x_axis_m[cur_ch]) - float(x_axis_m[prev_ch]))
+    else:
+        dx = float(ch_gap) * 100.0
+    if dx <= 1e-9:
+        return False, 0.0, 0.0
+    dt_abs = abs(dt_signed)
+    if dt_abs <= 1e-9:
+        return False, 0.0, 0.0
+    speed_kmh = 3.6 * dx / dt_abs
+    if speed_kmh < float(speed_min_kmh) or speed_kmh > float(speed_max_kmh):
+        return False, 0.0, 0.0
+    ref_speed = float(reference_speed_kmh)
+    if not np.isfinite(ref_speed) or ref_speed <= 1e-6:
+        ref_speed = 0.5 * (float(speed_min_kmh) + float(speed_max_kmh))
+    trans = -float(skip_penalty) * float(max(0, ch_gap - 1))
+    trans -= float(speed_penalty) * abs(speed_kmh - ref_speed) / max(1e-6, float(speed_max_kmh) - float(speed_min_kmh))
+    slope = dt_signed / dx
+    prev_slope = prev.get("slope")
+    if prev_slope is not None and np.isfinite(float(prev_slope)):
+        ref_slope = 3.6 / max(1e-6, ref_speed)
+        trans -= float(smoothness_penalty) * abs(slope - float(prev_slope)) / max(1e-6, ref_slope)
+    return True, float(trans), float(slope)
+
+
+def decode_peak_slot_path(
+    peak_prob: np.ndarray,
+    peak_time: torch.Tensor,
+    peak_valid: torch.Tensor,
+    peak_index: torch.Tensor,
+    *,
+    direction_label: int,
+    predicted_speed_kmh: float,
+    x_axis_m: np.ndarray,
+    time_downsample: int,
+    fs: float,
+    config: InferenceConfig,
+) -> list[dict[str, float | int]]:
+    """Decode one slot as a physically consistent peak path.
+
+    The model still supplies per-channel peak probabilities. This function is a
+    non-differentiable inference-time Viterbi pass that replaces independent
+    per-channel argmax with a speed-window-constrained path search.
+    """
+    del peak_time
+    candidates = _slot_peak_candidates(
+        peak_prob,
+        peak_valid,
+        peak_index,
+        peak_threshold=float(config.peak_threshold),
+        topk=int(config.viterbi_topk),
+    )
+    states: list[list[dict[str, float | int | None]]] = []
+    ref_speed = float(predicted_speed_kmh)
+    if not np.isfinite(ref_speed) or ref_speed <= 1e-6:
+        ref_speed = float(config.viterbi_fallback_speed_kmh)
+    for ch, ch_candidates in enumerate(candidates):
+        ch_states: list[dict[str, float | int | None]] = []
+        for item in ch_candidates:
+            best_score = float(item["logp"]) + float(config.viterbi_point_bonus)
+            best_prev_ch: Optional[int] = None
+            best_prev_idx: Optional[int] = None
+            best_slope: Optional[float] = None
+            start_ch = max(0, ch - int(config.viterbi_max_skip_channels))
+            for prev_ch in range(start_ch, ch):
+                for prev_idx, prev in enumerate(states[prev_ch]):
+                    ok, trans, slope = _transition_score(
+                        prev,
+                        item,
+                        x_axis_m=x_axis_m,
+                        time_downsample=int(time_downsample),
+                        fs=float(fs),
+                        direction_label=int(direction_label),
+                        speed_min_kmh=float(config.viterbi_speed_min_kmh),
+                        speed_max_kmh=float(config.viterbi_speed_max_kmh),
+                        reference_speed_kmh=ref_speed,
+                        skip_penalty=float(config.viterbi_skip_penalty),
+                        speed_penalty=float(config.viterbi_speed_penalty),
+                        smoothness_penalty=float(config.viterbi_smoothness_penalty),
+                    )
+                    if not ok:
+                        continue
+                    cand_score = float(prev["score"]) + float(item["logp"]) + float(config.viterbi_point_bonus) + trans
+                    if cand_score > best_score:
+                        best_score = cand_score
+                        best_prev_ch = int(prev_ch)
+                        best_prev_idx = int(prev_idx)
+                        best_slope = float(slope)
+            state = dict(item)
+            state.update({"score": best_score, "prev_ch": best_prev_ch, "prev_idx": best_prev_idx, "slope": best_slope})
+            ch_states.append(state)
+        states.append(ch_states)
+    best: Optional[tuple[int, int, dict[str, float | int | None]]] = None
+    for ch, ch_states in enumerate(states):
+        for idx, state in enumerate(ch_states):
+            if best is None or float(state["score"]) > float(best[2]["score"]):
+                best = (ch, idx, state)
+    if best is None:
+        return []
+    path_rev: list[dict[str, float | int | None]] = []
+    ch, idx, state = best
+    while True:
+        path_rev.append(state)
+        prev_ch = state.get("prev_ch")
+        prev_idx = state.get("prev_idx")
+        if prev_ch is None or prev_idx is None:
+            break
+        ch = int(prev_ch)
+        idx = int(prev_idx)
+        state = states[ch][idx]
+    path = list(reversed(path_rev))
+    return [
+        {
+            "ch": int(item["ch"]),  # type: ignore[arg-type]
+            "peak_idx": int(item["peak_idx"]),  # type: ignore[arg-type]
+            "prob": float(item["prob"]),  # type: ignore[arg-type]
+        }
+        for item in path
+    ]
+
+
+def argmax_peak_slot_path(
+    peak_prob: np.ndarray,
+    peak_valid: torch.Tensor,
+    *,
+    peak_threshold: float,
+) -> list[dict[str, float | int]]:
+    none_idx = int(peak_prob.shape[-1] - 1)
+    path: list[dict[str, float | int]] = []
+    for ch in range(int(peak_prob.shape[0])):
+        choice = int(np.argmax(peak_prob[ch]))
+        if choice >= none_idx:
+            continue
+        if not bool(peak_valid[ch, choice]):
+            continue
+        prob = float(peak_prob[ch, choice])
+        if prob < float(peak_threshold):
+            continue
+        path.append({"ch": int(ch), "peak_idx": int(choice), "prob": prob})
+    return path
+
+
+def peak_slot_physics_metrics(
+    outputs: dict[str, torch.Tensor],
+    targets: dict[str, torch.Tensor],
+    *,
+    objectness_threshold: float = 0.5,
+    peak_threshold: float = 0.4,
+    speed_min_kmh: float = 60.0,
+    speed_max_kmh: float = 100.0,
+    time_downsample: int = 10,
+    fs: float = 1000.0,
+    dx_m: float = 100.0,
+    smooth_tolerance_s: float = 2.0,
+) -> dict[str, float]:
+    device = outputs["objectness_logits"].device
+    q_count = int(outputs["num_regular_queries"])
+    obj = torch.sigmoid(outputs["objectness_logits"][:, :q_count])
+    peak_prob = torch.softmax(outputs["peak_logits"][:, :q_count], dim=-1)
+    selected = torch.argmax(peak_prob, dim=-1)
+    selected_prob = torch.max(peak_prob, dim=-1).values
+    dirs = torch.argmax(outputs["direction_logits"][:, :q_count], dim=-1)
+    peak_index = targets["peak_index"].to(device=device, dtype=torch.long)
+    peak_valid = targets["peak_valid"].to(device=device, dtype=torch.bool)
+    pair_total = 0
+    direction_bad = 0
+    speed_bad = 0
+    triple_total = 0
+    smooth_bad = 0
+    active_tracks = 0
+    for b in range(int(obj.shape[0])):
+        active_slots = torch.where(obj[b] >= float(objectness_threshold))[0].tolist()
+        for q in active_slots:
+            points: list[tuple[int, float]] = []
+            for ch in range(int(peak_prob.shape[2])):
+                k = int(selected[b, q, ch].item())
+                if k >= int(peak_prob.shape[-1] - 1):
+                    continue
+                if not bool(peak_valid[b, ch, k]):
+                    continue
+                if float(selected_prob[b, q, ch].item()) < float(peak_threshold):
+                    continue
+                t = int(peak_index[b, ch, k].item()) * int(time_downsample) / float(fs)
+                points.append((int(ch), float(t)))
+            if len(points) < 2:
+                continue
+            active_tracks += 1
+            sign = _direction_sign(int(dirs[b, q].item()))
+            for (ch0, t0), (ch1, t1) in zip(points[:-1], points[1:]):
+                pair_total += 1
+                dt = t1 - t0
+                if sign * dt < 0.0:
+                    direction_bad += 1
+                dx = abs(float(ch1 - ch0)) * float(dx_m)
+                speed = 3.6 * dx / max(1e-9, abs(dt))
+                if speed < float(speed_min_kmh) or speed > float(speed_max_kmh):
+                    speed_bad += 1
+            for (_, t0), (_, t1), (_, t2) in zip(points[:-2], points[1:-1], points[2:]):
+                triple_total += 1
+                if abs(float(t2 - 2.0 * t1 + t0)) > float(smooth_tolerance_s):
+                    smooth_bad += 1
+    return {
+        "physics_tracks": float(active_tracks),
+        "physics_pair_count": float(pair_total),
+        "direction_violation_rate": float(direction_bad / max(1, pair_total)),
+        "speed_window_violation_rate": float(speed_bad / max(1, pair_total)),
+        "smoothness_violation_rate": float(smooth_bad / max(1, triple_total)),
+    }
+
+
 def _local_speed_series(points: list[TrackPoint]) -> list[float]:
     speeds = [float("nan")] * len(points)
     for i, point in enumerate(points):
@@ -602,6 +885,7 @@ def predict_tracks_from_window(
     obj = torch.sigmoid(outputs["objectness_logits"][0]).detach().cpu().numpy()
     peak_prob = torch.softmax(outputs["peak_logits"][0], dim=-1).detach().cpu().numpy()
     dirs = torch.argmax(outputs["direction_logits"][0], dim=-1).detach().cpu().numpy()
+    speeds = outputs["speed"][0].detach().cpu().numpy()
     max_tracks = min(int(cfg.max_tracks), int(obj.shape[0]))
     order = np.argsort(obj)[::-1][:max_tracks]
     tracks: list[Track] = []
@@ -609,16 +893,26 @@ def predict_tracks_from_window(
         score = float(obj[q_idx])
         if score < float(cfg.objectness_threshold):
             continue
+        if bool(cfg.use_viterbi_decoder):
+            decoded = decode_peak_slot_path(
+                peak_prob[q_idx],
+                peak_time,
+                peak_valid,
+                peak_index,
+                direction_label=int(dirs[q_idx]),
+                predicted_speed_kmh=float(speeds[q_idx]) * float(cfg.speed_norm_kmh),
+                x_axis_m=np.asarray(x_axis_m, dtype=np.float64),
+                time_downsample=int(cfg.time_downsample),
+                fs=float(fs),
+                config=cfg,
+            )
+        else:
+            decoded = argmax_peak_slot_path(peak_prob[q_idx], peak_valid, peak_threshold=float(cfg.peak_threshold))
         points: list[TrackPoint] = []
-        for ch in range(int(model.config.n_channels)):
-            choice = int(np.argmax(peak_prob[q_idx, ch]))
-            if choice >= int(model.config.peak_candidates):
-                continue
-            if not bool(peak_valid[ch, choice]):
-                continue
-            prob = float(peak_prob[q_idx, ch, choice])
-            if prob < float(cfg.peak_threshold):
-                continue
+        for item in decoded:
+            ch = int(item["ch"])
+            choice = int(item["peak_idx"])
+            prob = float(item["prob"])
             t_idx = int(peak_index[ch, choice].item()) * int(cfg.time_downsample)
             t_idx = int(max(0, min(int(arr.shape[1]) - 1, t_idx)))
             offset = float(x_axis_m[int(ch)]) if int(ch) < len(x_axis_m) else float(ch)

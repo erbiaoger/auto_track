@@ -38,6 +38,7 @@ from autotrack.dl.peak_slot_model import (
     ModelConfig,
     PeakSlotPredictor,
     peak_slot_detection_metrics,
+    peak_slot_physics_metrics,
     peak_slot_set_loss,
     save_checkpoint,
 )
@@ -68,8 +69,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-object-weight", type=float, default=0.15, help="Object loss weight for unmatched slots.")
     parser.add_argument("--none-weight", type=float, default=0.35, help="Peak CE weight for GT-none channel targets.")
     parser.add_argument("--count-loss-weight", type=float, default=0.05, help="Soft count loss weight.")
-    parser.add_argument("--monotonic-loss-weight", type=float, default=0.2, help="Weak monotonic loss weight.")
-    parser.add_argument("--smoothness-loss-weight", type=float, default=0.05, help="Weak smoothness loss weight.")
+    parser.add_argument("--monotonic-loss-weight", type=float, default=1.0, help="Monotonic loss weight.")
+    parser.add_argument("--smoothness-loss-weight", type=float, default=0.2, help="Smoothness loss weight.")
+    parser.add_argument("--physics-speed-min-kmh", type=float, default=60.0, help="Minimum speed for physics violation metrics.")
+    parser.add_argument("--physics-speed-max-kmh", type=float, default=100.0, help="Maximum speed for physics violation metrics.")
     parser.add_argument("--metric-objectness-threshold", type=float, default=0.5, help="Objectness threshold for metrics.")
     parser.add_argument("--metric-point-threshold", type=float, default=0.05, help="Normalized mean time error threshold for TP metrics.")
     parser.add_argument("--val-fraction", type=float, default=0.0, help="Fraction of shards reserved for validation.")
@@ -188,6 +191,7 @@ def _iter_batches(
                 "peak_time": payload["peak_time"][idx].to(torch.float32),
                 "peak_amp": payload["peak_amp"][idx].to(torch.float32),
                 "peak_valid": payload["peak_valid"][idx].to(torch.bool),
+                "peak_index": payload["peak_index"][idx].to(torch.long),
                 "gt_peak_index": payload["gt_peak_index"][idx].to(torch.long),
                 "visibility": payload["visibility"][idx].to(torch.float32),
                 "direction": payload["direction"][idx].to(torch.long),
@@ -216,7 +220,7 @@ def _forward(model: PeakSlotPredictor, x: torch.Tensor, targets: dict[str, torch
     return model(x, targets["peak_time"], targets["peak_amp"], targets["peak_valid"])
 
 
-def _evaluate(model: PeakSlotPredictor, data_dir: Path, shards: list[str], device: str, args: argparse.Namespace) -> dict[str, float]:
+def _evaluate(model: PeakSlotPredictor, data_dir: Path, shards: list[str], device: str, args: argparse.Namespace, meta: dict) -> dict[str, float]:
     model.eval()
     metrics_items: list[dict[str, float]] = []
     with torch.no_grad():
@@ -249,6 +253,19 @@ def _evaluate(model: PeakSlotPredictor, data_dir: Path, shards: list[str], devic
                     objectness_threshold=float(args.metric_objectness_threshold),
                     point_threshold=float(args.metric_point_threshold),
                     matcher=str(args.matcher),
+                )
+            )
+            metrics.update(
+                peak_slot_physics_metrics(
+                    outputs,
+                    targets,
+                    objectness_threshold=float(args.metric_objectness_threshold),
+                    peak_threshold=0.4,
+                    speed_min_kmh=float(args.physics_speed_min_kmh),
+                    speed_max_kmh=float(args.physics_speed_max_kmh),
+                    time_downsample=int(meta.get("time_downsample", 10)),
+                    fs=float(meta.get("fs", 1000.0)),
+                    dx_m=float(meta.get("dx_m", 100.0)),
                 )
             )
             metrics_items.append(metrics)
@@ -403,6 +420,19 @@ def main() -> int:
                         matcher=str(args.matcher),
                     )
                 )
+                metrics.update(
+                    peak_slot_physics_metrics(
+                        outputs,
+                        targets,
+                        objectness_threshold=float(args.metric_objectness_threshold),
+                        peak_threshold=0.4,
+                        speed_min_kmh=float(args.physics_speed_min_kmh),
+                        speed_max_kmh=float(args.physics_speed_max_kmh),
+                        time_downsample=int(meta.get("time_downsample", 10)),
+                        fs=float(meta.get("fs", 1000.0)),
+                        dx_m=float(meta.get("dx_m", 100.0)),
+                    )
+                )
                 epoch_metrics.append(metrics)
             if should_log and metrics:
                 print(
@@ -412,7 +442,8 @@ def main() -> int:
                     f"obj={metrics.get('loss_obj', float('nan')):.4f} "
                     f"cnt_loss={metrics.get('loss_count', float('nan')):.2f} "
                     f"f1={metrics.get('track_f1', float('nan')):.3f} "
-                    f"cnt_mae={metrics.get('count_mae', float('nan')):.2f}",
+                    f"cnt_mae={metrics.get('count_mae', float('nan')):.2f} "
+                    f"spd_bad={metrics.get('speed_window_violation_rate', float('nan')):.3f}",
                     flush=True,
                 )
         mean_metrics = _mean_metrics(epoch_metrics)
@@ -424,11 +455,12 @@ def main() -> int:
             f"peak={mean_metrics.get('loss_peak', float('nan')):.4f} "
             f"f1={mean_metrics.get('track_f1', float('nan')):.3f} "
             f"cnt_mae={mean_metrics.get('count_mae', float('nan')):.2f} "
+            f"spd_bad={mean_metrics.get('speed_window_violation_rate', float('nan')):.3f} "
             f"elapsed={elapsed:.1f}s"
         )
         val_metrics: dict[str, float] = {}
         if val_shards and epoch % int(max(1, args.val_every)) == 0:
-            val_metrics = _evaluate(model, data_dir, val_shards, device, args)
+            val_metrics = _evaluate(model, data_dir, val_shards, device, args, meta)
             print(
                 f"epoch={epoch:03d} val_loss={val_metrics.get('loss', float('nan')):.4f} "
                 f"val_f1={val_metrics.get('track_f1', float('nan')):.3f} "

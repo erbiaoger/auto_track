@@ -70,7 +70,7 @@ def extract_all_deep_learning(
     vmax_kmh: float,
     config: Optional[dict] = None,
 ) -> list[Track]:
-    del direction, vmin_kmh, vmax_kmh
+    del direction
     cfg = dict(config or {})
     model_path = str(cfg.get("model_path", "")).strip()
     if not model_path:
@@ -97,6 +97,16 @@ def extract_all_deep_learning(
             peak_min_distance_s=float(peak_detection.get("min_distance_s", 0.5)),
             peak_min_height=float(peak_detection.get("min_height", 0.02)),
             peak_prominence=float(peak_detection.get("prominence", 0.02)),
+            use_viterbi_decoder=bool(cfg.get("use_viterbi_decoder", True)),
+            viterbi_topk=int(cfg.get("viterbi_topk", 16)),
+            viterbi_speed_min_kmh=float(cfg.get("viterbi_speed_min_kmh", vmin_kmh)),
+            viterbi_speed_max_kmh=float(cfg.get("viterbi_speed_max_kmh", vmax_kmh)),
+            viterbi_max_skip_channels=int(cfg.get("viterbi_max_skip_channels", 4)),
+            viterbi_point_bonus=float(cfg.get("viterbi_point_bonus", 1.0)),
+            viterbi_skip_penalty=float(cfg.get("viterbi_skip_penalty", 0.7)),
+            viterbi_speed_penalty=float(cfg.get("viterbi_speed_penalty", 1.0)),
+            viterbi_smoothness_penalty=float(cfg.get("viterbi_smoothness_penalty", 0.6)),
+            viterbi_fallback_speed_kmh=float(cfg.get("viterbi_fallback_speed_kmh", 80.0)),
         )
         predict_fn = pk.predict_tracks_from_window
     elif model_family == "track_slot":
