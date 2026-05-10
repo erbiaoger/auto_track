@@ -20,6 +20,7 @@ POOLED_CHANNELS=${POOLED_CHANNELS:-8}
 POOLED_TIME=${POOLED_TIME:-128}
 AMP=${AMP:-on}
 AMP_DTYPE=${AMP_DTYPE:-float16}
+INPUT_TRANSFER_DTYPE=${INPUT_TRANSFER_DTYPE:-auto}
 MATCHER=${MATCHER:-auction}         #hungarian
 NO_OBJECT_WEIGHT=${NO_OBJECT_WEIGHT:-0.15}
 NONE_WEIGHT=${NONE_WEIGHT:-0.35}
@@ -67,6 +68,7 @@ uv run python -m autotrack.dl.train_peak_slot \
   --pooled-time "$POOLED_TIME" \
   --amp "$AMP" \
   --amp-dtype "$AMP_DTYPE" \
+  --input-transfer-dtype "$INPUT_TRANSFER_DTYPE" \
   --channels-last \
   --matcher "$MATCHER" \
   --no-object-weight "$NO_OBJECT_WEIGHT" \

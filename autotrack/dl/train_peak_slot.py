@@ -64,6 +64,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="auto", help="Torch device: cuda, mps, cpu, auto, or empty for auto.")
     parser.add_argument("--amp", default="auto", choices=["auto", "on", "off"], help="Use CUDA automatic mixed precision.")
     parser.add_argument("--amp-dtype", default="float16", choices=["float16", "bfloat16"], help="CUDA AMP dtype.")
+    parser.add_argument(
+        "--input-transfer-dtype",
+        default="auto",
+        choices=["auto", "preserve", "float32", "float16"],
+        help="CPU shard x dtype before GPU transfer. auto preserves shard dtype only for CUDA AMP training.",
+    )
     parser.add_argument("--channels-last", action="store_true", help="Use channels-last input/model layout on CUDA.")
     parser.add_argument("--matcher", default="hungarian", choices=["hungarian", "greedy", "auction"], help="Slot-to-GT assignment.")
     parser.add_argument("--no-object-weight", type=float, default=0.15, help="Object loss weight for unmatched slots.")
@@ -148,6 +154,15 @@ def _resolve_resume_path(args: argparse.Namespace) -> Optional[Path]:
     return None
 
 
+def _resolve_x_transfer_dtype(args: argparse.Namespace, *, device: str, use_amp: bool) -> str:
+    requested = str(args.input_transfer_dtype).lower()
+    if requested != "auto":
+        return requested
+    if str(device).startswith("cuda") and bool(use_amp):
+        return "preserve"
+    return "float32"
+
+
 def _shard_batch_count(meta: dict, all_shards: list[str], shards: list[str], batch_size: int, max_samples: int) -> int:
     if int(max_samples) > 0:
         return int(math.ceil(int(max_samples) / max(1, int(batch_size))))
@@ -170,6 +185,7 @@ def _iter_batches(
     seed: int,
     epoch: int,
     max_samples: int,
+    x_transfer_dtype: str = "float32",
 ) -> Iterator[tuple[torch.Tensor, dict[str, torch.Tensor]]]:
     gen = torch.Generator(device="cpu")
     gen.manual_seed(int(seed) + int(epoch) * 97_531)
@@ -203,7 +219,12 @@ def _iter_batches(
                 "gt_valid": payload["gt_valid"][idx].to(torch.bool),
             }
             targets["gt_count"] = targets["gt_valid"].sum(dim=1).to(torch.long)
-            yield payload["x"][idx].to(torch.float32), targets
+            x = payload["x"][idx]
+            if str(x_transfer_dtype) == "float32":
+                x = x.to(torch.float32)
+            elif str(x_transfer_dtype) == "float16":
+                x = x.to(torch.float16)
+            yield x, targets
 
 
 def _batch_to_device(
@@ -236,6 +257,7 @@ def _evaluate(model: PeakSlotPredictor, data_dir: Path, shards: list[str], devic
             seed=int(args.seed),
             epoch=0,
             max_samples=int(args.max_samples),
+            x_transfer_dtype="float32",
         ):
             x, targets = _batch_to_device(x, targets, device, channels_last=bool(args.channels_last and str(device).startswith("cuda")))
             outputs = _forward(model, x, targets)
@@ -346,6 +368,7 @@ def main() -> int:
         print("Loaded model weights only; optimizer starts from scratch.", flush=True)
     use_amp = (str(args.amp) == "on") or (str(args.amp) == "auto" and str(device).startswith("cuda"))
     amp_dtype = torch.float16 if str(args.amp_dtype) == "float16" else torch.bfloat16
+    x_transfer_dtype = _resolve_x_transfer_dtype(args, device=device, use_amp=bool(use_amp))
     scaler = torch.amp.GradScaler("cuda", enabled=bool(use_amp and str(device).startswith("cuda") and amp_dtype == torch.float16))
     out_dir.mkdir(parents=True, exist_ok=True)
     config_payload = {
@@ -373,7 +396,7 @@ def main() -> int:
         "Model: "
         f"slots={model_config.max_tracks}, hidden_dim={model_config.hidden_dim}, "
         f"decoder_layers={model_config.decoder_layers}, pooled=({model_config.pooled_channels}, {model_config.pooled_time}), "
-        f"amp={use_amp}, matcher={args.matcher}"
+        f"amp={use_amp}, matcher={args.matcher}, x_transfer_dtype={x_transfer_dtype}"
     )
     best_loss = float("inf")
     if resume_checkpoint is not None:
@@ -397,13 +420,13 @@ def main() -> int:
                 seed=int(args.seed),
                 epoch=epoch,
                 max_samples=int(args.max_samples),
+                x_transfer_dtype=str(x_transfer_dtype),
             ),
             start=1,
         ):
             should_log = int(args.log_every) > 0 and (batch_idx == 1 or batch_idx % int(args.log_every) == 0 or batch_idx == batches_per_epoch)
-            collect_metrics = should_log or batch_idx == 1 or batch_idx == batches_per_epoch or (
-                int(args.metrics_every) > 0 and batch_idx % int(args.metrics_every) == 0
-            )
+            should_collect_heavy_metrics = int(args.metrics_every) > 0 and batch_idx % int(args.metrics_every) == 0
+            collect_loss_metrics = should_log or batch_idx == 1 or batch_idx == batches_per_epoch or should_collect_heavy_metrics
             x, targets = _batch_to_device(x, targets, device, channels_last=bool(args.channels_last and str(device).startswith("cuda")))
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=bool(use_amp and str(device).startswith("cuda"))):
@@ -421,7 +444,7 @@ def main() -> int:
                     visibility_prior_loss_weight=float(args.visibility_prior_loss_weight),
                     slot_competition_loss_weight=float(args.slot_competition_loss_weight),
                     crossing_loss_weight=float(args.crossing_loss_weight),
-                    collect_metrics=bool(collect_metrics),
+                    collect_metrics=bool(collect_loss_metrics),
                 )
             scaler.scale(loss).backward()
             if float(args.grad_clip) > 0:
@@ -430,28 +453,29 @@ def main() -> int:
             scaler.step(optimizer)
             scaler.update()
             if metrics:
-                metrics.update(
-                    peak_slot_detection_metrics(
-                        outputs,
-                        targets,
-                        objectness_threshold=float(args.metric_objectness_threshold),
-                        point_threshold=float(args.metric_point_threshold),
-                        matcher=str(args.matcher),
+                if should_collect_heavy_metrics:
+                    metrics.update(
+                        peak_slot_detection_metrics(
+                            outputs,
+                            targets,
+                            objectness_threshold=float(args.metric_objectness_threshold),
+                            point_threshold=float(args.metric_point_threshold),
+                            matcher=str(args.matcher),
+                        )
                     )
-                )
-                metrics.update(
-                    peak_slot_physics_metrics(
-                        outputs,
-                        targets,
-                        objectness_threshold=float(args.metric_objectness_threshold),
-                        peak_threshold=0.4,
-                        speed_min_kmh=float(args.physics_speed_min_kmh),
-                        speed_max_kmh=float(args.physics_speed_max_kmh),
-                        time_downsample=int(meta.get("time_downsample", 10)),
-                        fs=float(meta.get("fs", 1000.0)),
-                        dx_m=float(meta.get("dx_m", 100.0)),
+                    metrics.update(
+                        peak_slot_physics_metrics(
+                            outputs,
+                            targets,
+                            objectness_threshold=float(args.metric_objectness_threshold),
+                            peak_threshold=0.4,
+                            speed_min_kmh=float(args.physics_speed_min_kmh),
+                            speed_max_kmh=float(args.physics_speed_max_kmh),
+                            time_downsample=int(meta.get("time_downsample", 10)),
+                            fs=float(meta.get("fs", 1000.0)),
+                            dx_m=float(meta.get("dx_m", 100.0)),
+                        )
                     )
-                )
                 epoch_metrics.append(metrics)
             if should_log and metrics:
                 print(
