@@ -82,11 +82,12 @@ class InferenceConfig:
     peak_prominence: float = 0.02
     use_viterbi_decoder: bool = True
     viterbi_topk: int = 16
+    viterbi_candidate_threshold: float = 0.01
     viterbi_speed_min_kmh: float = 60.0
     viterbi_speed_max_kmh: float = 100.0
     viterbi_max_skip_channels: int = 4
-    viterbi_point_bonus: float = 1.0
-    viterbi_skip_penalty: float = 0.7
+    viterbi_point_bonus: float = 3.0
+    viterbi_skip_penalty: float = 2.0
     viterbi_speed_penalty: float = 1.0
     viterbi_smoothness_penalty: float = 0.6
     viterbi_fallback_speed_kmh: float = 80.0
@@ -637,7 +638,7 @@ def decode_peak_slot_path(
         peak_prob,
         peak_valid,
         peak_index,
-        peak_threshold=float(config.peak_threshold),
+        peak_threshold=float(config.viterbi_candidate_threshold),
         topk=int(config.viterbi_topk),
     )
     states: list[list[dict[str, float | int | None]]] = []

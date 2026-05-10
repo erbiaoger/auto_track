@@ -65,11 +65,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-predicted-tracks", type=int, default=96, help="Maximum slots kept per sample.")
     parser.add_argument("--no-viterbi-decoder", action="store_true", help="Use legacy per-channel argmax decoding instead of Viterbi.")
     parser.add_argument("--viterbi-topk", type=int, default=16, help="Top peak candidates per channel considered by Viterbi.")
+    parser.add_argument("--viterbi-candidate-threshold", type=float, default=0.01, help="Low probability floor for candidates entering Viterbi.")
     parser.add_argument("--viterbi-speed-min-kmh", type=float, default=60.0, help="Minimum hard transition speed for Viterbi.")
     parser.add_argument("--viterbi-speed-max-kmh", type=float, default=100.0, help="Maximum hard transition speed for Viterbi.")
     parser.add_argument("--viterbi-max-skip-channels", type=int, default=4, help="Maximum channel gap for one Viterbi transition.")
-    parser.add_argument("--viterbi-point-bonus", type=float, default=1.0, help="Per-point reward that lets Viterbi prefer long paths.")
-    parser.add_argument("--viterbi-skip-penalty", type=float, default=0.7, help="Penalty per skipped channel in Viterbi.")
+    parser.add_argument("--viterbi-point-bonus", type=float, default=3.0, help="Per-point reward that lets Viterbi prefer long paths.")
+    parser.add_argument("--viterbi-skip-penalty", type=float, default=2.0, help="Penalty per skipped channel in Viterbi.")
     parser.add_argument("--viterbi-speed-penalty", type=float, default=1.0, help="Soft penalty for deviation from slot speed.")
     parser.add_argument("--viterbi-smoothness-penalty", type=float, default=0.6, help="Soft penalty for slope changes.")
     parser.add_argument("--matcher", default="hungarian", choices=["hungarian", "greedy"], help="Metric matching strategy.")
@@ -485,6 +486,7 @@ def main() -> int:
         speed_norm_kmh=float(speed_norm_kmh),
         use_viterbi_decoder=not bool(args.no_viterbi_decoder),
         viterbi_topk=int(args.viterbi_topk),
+        viterbi_candidate_threshold=float(args.viterbi_candidate_threshold),
         viterbi_speed_min_kmh=float(args.viterbi_speed_min_kmh),
         viterbi_speed_max_kmh=float(args.viterbi_speed_max_kmh),
         viterbi_max_skip_channels=int(args.viterbi_max_skip_channels),
@@ -663,6 +665,7 @@ def main() -> int:
         "decoder": {
             "use_viterbi_decoder": bool(inference_config.use_viterbi_decoder),
             "viterbi_topk": int(inference_config.viterbi_topk),
+            "viterbi_candidate_threshold": float(inference_config.viterbi_candidate_threshold),
             "viterbi_speed_min_kmh": float(inference_config.viterbi_speed_min_kmh),
             "viterbi_speed_max_kmh": float(inference_config.viterbi_speed_max_kmh),
             "viterbi_max_skip_channels": int(inference_config.viterbi_max_skip_channels),
