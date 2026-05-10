@@ -39,6 +39,7 @@ from autotrack.dl.peak_slot_model import (
     InferenceConfig,
     argmax_peak_slot_path,
     decode_peak_slot_path,
+    decode_peak_slot_paths,
     load_checkpoint_model,
     peak_slot_detection_metrics,
     peak_slot_physics_metrics,
@@ -63,7 +64,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--peak-threshold", type=float, default=0.4, help="Minimum selected peak probability.")
     parser.add_argument("--min-visible-channels", type=int, default=3, help="Minimum selected peaks for a predicted track.")
     parser.add_argument("--max-predicted-tracks", type=int, default=96, help="Maximum slots kept per sample.")
+    parser.add_argument("--decoder-mode", default="beam_global", choices=["argmax", "viterbi", "beam_global"], help="Peak decoding strategy.")
     parser.add_argument("--no-viterbi-decoder", action="store_true", help="Use legacy per-channel argmax decoding instead of Viterbi.")
+    parser.add_argument("--viterbi-beam-size", type=int, default=4, help="Number of candidate paths retained per slot in beam_global decoding.")
+    parser.add_argument("--time-prior-weight", type=float, default=2.0, help="Penalty weight for peak distance from time_prior.")
+    parser.add_argument("--global-conflict-penalty", type=float, default=2.0, help="Penalty for overlapping decoded paths in beam_global mode.")
     parser.add_argument("--viterbi-topk", type=int, default=16, help="Top peak candidates per channel considered by Viterbi.")
     parser.add_argument("--viterbi-candidate-threshold", type=float, default=0.01, help="Low probability floor for candidates entering Viterbi.")
     parser.add_argument("--viterbi-speed-min-kmh", type=float, default=60.0, help="Minimum hard transition speed for Viterbi.")
@@ -187,6 +192,7 @@ def _active_predictions(
     peak_prob = torch.softmax(outputs_cpu["peak_logits"][batch_index], dim=-1)
     direction = torch.argmax(outputs_cpu["direction_logits"][batch_index], dim=-1)
     speed = outputs_cpu["speed"][batch_index]
+    time_prior = outputs_cpu.get("time_prior")
     order = torch.argsort(obj, descending=True)[: min(int(max_predicted_tracks), int(obj.shape[0]))]
     predictions: list[dict[str, Any]] = []
     for rank, slot_tensor in enumerate(order.tolist()):
@@ -195,7 +201,25 @@ def _active_predictions(
         if score < float(objectness_threshold):
             continue
         direction_label = int(direction[slot].item())
-        if bool(inference_config.use_viterbi_decoder):
+        decoder_mode = str(inference_config.decoder_mode).lower()
+        path_options: list[tuple[list[dict[str, float | int]], float]] = []
+        if bool(inference_config.use_viterbi_decoder) and decoder_mode == "beam_global":
+            x_axis_m = np.arange(int(peak_prob.shape[1]), dtype=np.float64) * float(dx_m)
+            decoded_options = decode_peak_slot_paths(
+                peak_prob[slot].numpy(),
+                targets_cpu["peak_time"][batch_index],
+                targets_cpu["peak_valid"][batch_index],
+                targets_cpu["peak_index"][batch_index],
+                direction_label=direction_label,
+                predicted_speed_kmh=float(speed[slot].item()) * float(speed_norm_kmh),
+                x_axis_m=x_axis_m,
+                time_downsample=int(time_downsample),
+                fs=float(fs),
+                config=inference_config,
+                time_prior=None if not torch.is_tensor(time_prior) else time_prior[batch_index, slot].numpy(),
+            )
+            path_options = [(list(item["path"]), float(item["score"])) for item in decoded_options]
+        elif bool(inference_config.use_viterbi_decoder) and decoder_mode != "argmax":
             x_axis_m = np.arange(int(peak_prob.shape[1]), dtype=np.float64) * float(dx_m)
             decoded = decode_peak_slot_path(
                 peak_prob[slot].numpy(),
@@ -208,32 +232,59 @@ def _active_predictions(
                 time_downsample=int(time_downsample),
                 fs=float(fs),
                 config=inference_config,
+                time_prior=None if not torch.is_tensor(time_prior) else time_prior[batch_index, slot].numpy(),
             )
+            path_options = [(decoded, 0.0)]
         else:
             decoded = argmax_peak_slot_path(
                 peak_prob[slot].numpy(),
                 targets_cpu["peak_valid"][batch_index],
                 peak_threshold=float(peak_threshold),
             )
-        channels = [int(item["ch"]) for item in decoded]
-        peak_indices = [int(item["peak_idx"]) for item in decoded]
-        probs = [float(item["prob"]) for item in decoded]
-        if len(channels) < int(min_visible_channels):
-            continue
-        predictions.append(
-            {
-                "rank": int(rank),
-                "slot": slot,
-                "score": score,
-                "direction_label": direction_label,
-                "direction": LABEL_TO_DIRECTION.get(direction_label, str(direction_label)),
-                "speed": float(speed[slot].item()),
-                "speed_kmh": float(speed[slot].item() * float(speed_norm_kmh)),
-                "channels": channels,
-                "peak_indices": peak_indices,
-                "peak_probs": probs,
-            }
-        )
+            path_options = [(decoded, 0.0)]
+        for option_idx, (decoded, path_score) in enumerate(path_options):
+            channels = [int(item["ch"]) for item in decoded]
+            peak_indices = [int(item["peak_idx"]) for item in decoded]
+            probs = [float(item["prob"]) for item in decoded]
+            if len(channels) < int(min_visible_channels):
+                continue
+            norm_path_score = float(path_score) / float(max(1, len(channels)))
+            predictions.append(
+                {
+                    "rank": int(rank),
+                    "slot": slot,
+                    "beam_index": int(option_idx),
+                    "score": score,
+                    "selection_score": float(score + 0.02 * norm_path_score),
+                    "path_score": float(path_score),
+                    "direction_label": direction_label,
+                    "direction": LABEL_TO_DIRECTION.get(direction_label, str(direction_label)),
+                    "speed": float(speed[slot].item()),
+                    "speed_kmh": float(speed[slot].item() * float(speed_norm_kmh)),
+                    "channels": channels,
+                    "peak_indices": peak_indices,
+                    "peak_probs": probs,
+                }
+            )
+    if str(inference_config.decoder_mode).lower() == "beam_global" and float(inference_config.global_conflict_penalty) > 0.0:
+        kept: list[dict[str, Any]] = []
+        used_slots: set[int] = set()
+        for pred in sorted(predictions, key=lambda item: float(item.get("selection_score", item["score"])), reverse=True):
+            if int(pred["slot"]) in used_slots:
+                continue
+            peak_set = {(int(ch), int(pk)) for ch, pk in zip(pred["channels"], pred["peak_indices"])}
+            conflict = False
+            for existing in kept:
+                existing_set = {(int(ch), int(pk)) for ch, pk in zip(existing["channels"], existing["peak_indices"])}
+                common = len(peak_set & existing_set)
+                min_len = max(1, min(len(peak_set), len(existing_set)))
+                if common >= 3 or common / min_len >= 0.35:
+                    conflict = True
+                    break
+            if not conflict:
+                kept.append(pred)
+                used_slots.add(int(pred["slot"]))
+        predictions = kept
     return predictions
 
 
@@ -479,6 +530,7 @@ def main() -> int:
     fs = float(meta.get("fs", 1000.0))
     dx_m = float(meta.get("dx_m", 100.0))
     time_downsample = int(meta.get("time_downsample", 10))
+    time_prior_weight = float(args.time_prior_weight) if bool(checkpoint.get("has_time_prior", True)) else 0.0
     inference_config = InferenceConfig(
         time_downsample=time_downsample,
         objectness_threshold=float(args.objectness_threshold),
@@ -487,6 +539,10 @@ def main() -> int:
         max_tracks=int(args.max_predicted_tracks),
         speed_norm_kmh=float(speed_norm_kmh),
         use_viterbi_decoder=not bool(args.no_viterbi_decoder),
+        decoder_mode="argmax" if bool(args.no_viterbi_decoder) else str(args.decoder_mode),
+        viterbi_beam_size=int(args.viterbi_beam_size),
+        time_prior_weight=float(time_prior_weight),
+        global_conflict_penalty=float(args.global_conflict_penalty),
         viterbi_topk=int(args.viterbi_topk),
         viterbi_candidate_threshold=float(args.viterbi_candidate_threshold),
         viterbi_speed_min_kmh=float(args.viterbi_speed_min_kmh),
@@ -517,6 +573,8 @@ def main() -> int:
     decoded_speed_bad = 0
     decoded_triple_total = 0
     decoded_smooth_bad = 0
+    decoded_peak_use_total = 0
+    decoded_peak_conflict_total = 0
     sample_count = 0
     csv_sample_count = 0
     plot_sample_count = 0
@@ -608,6 +666,12 @@ def main() -> int:
                         decoded_speed_bad += int(decoded_counts["speed_bad"])
                         decoded_triple_total += int(decoded_counts["triple_count"])
                         decoded_smooth_bad += int(decoded_counts["smooth_bad"])
+                        peak_use_counts: defaultdict[tuple[int, int], int] = defaultdict(int)
+                        for pred in predictions:
+                            for ch, peak_idx in zip(pred["channels"], pred["peak_indices"]):
+                                peak_use_counts[(int(ch), int(peak_idx))] += 1
+                        decoded_peak_use_total += sum(peak_use_counts.values())
+                        decoded_peak_conflict_total += sum(max(0, count - 1) for count in peak_use_counts.values())
                         filtered_gt_total += gt_count
                         filtered_pred_total += pred_count
                         filtered_count_abs_error += abs(pred_count - gt_count)
@@ -668,7 +732,11 @@ def main() -> int:
         },
         "decoder": {
             "use_viterbi_decoder": bool(inference_config.use_viterbi_decoder),
+            "decoder_mode": str(inference_config.decoder_mode),
             "viterbi_topk": int(inference_config.viterbi_topk),
+            "viterbi_beam_size": int(inference_config.viterbi_beam_size),
+            "time_prior_weight": float(inference_config.time_prior_weight),
+            "global_conflict_penalty": float(inference_config.global_conflict_penalty),
             "viterbi_candidate_threshold": float(inference_config.viterbi_candidate_threshold),
             "viterbi_speed_min_kmh": float(inference_config.viterbi_speed_min_kmh),
             "viterbi_speed_max_kmh": float(inference_config.viterbi_speed_max_kmh),
@@ -689,6 +757,7 @@ def main() -> int:
             "direction_violation_rate": float(decoded_direction_bad / max(1, decoded_pair_total)),
             "speed_window_violation_rate": float(decoded_speed_bad / max(1, decoded_pair_total)),
             "smoothness_violation_rate": float(decoded_smooth_bad / max(1, decoded_triple_total)),
+            "peak_conflict_rate": float(decoded_peak_conflict_total / max(1, decoded_peak_use_total)),
         },
         "outputs": {
             "summary_json": str(summary_path),

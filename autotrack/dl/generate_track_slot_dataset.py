@@ -92,6 +92,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sigma-min-s", type=float, default=0.25, help="Minimum Gaussian sigma in seconds.")
     parser.add_argument("--sigma-max-s", type=float, default=0.25, help="Maximum Gaussian sigma in seconds.")
     parser.add_argument("--primary-ratio", type=float, default=0.8333333333, help="Fraction of forward-direction vehicles.")
+    parser.add_argument("--interaction-ratio", type=float, default=0.3, help="Fraction of samples seeded with crossing/overtake/near-parallel pairs.")
+    parser.add_argument("--interaction-types", default="crossing,overtake,near_parallel", help="Comma-separated interaction types.")
+    parser.add_argument("--interaction-time-min-frac", type=float, default=0.05, help="Earliest interaction time as window fraction.")
+    parser.add_argument("--interaction-time-max-frac", type=float, default=0.95, help="Latest interaction time as window fraction.")
+    parser.add_argument("--isolated-noise-ratio", type=float, default=0.1, help="Fraction of samples with isolated Gaussian noise peaks.")
+    parser.add_argument("--isolated-noise-rate", type=float, default=6.0, help="Expected isolated Gaussian noise peaks when enabled.")
+    parser.add_argument("--isolated-noise-amp-min", type=float, default=4.0, help="Minimum isolated Gaussian noise amplitude.")
+    parser.add_argument("--isolated-noise-amp-max", type=float, default=8.0, help="Maximum isolated Gaussian noise amplitude.")
+    parser.add_argument(
+        "--isolated-noise-sigma-min-s",
+        "--isolated-noise-sigma-min",
+        dest="isolated_noise_sigma_min_s",
+        type=float,
+        default=0.08,
+        help="Minimum isolated Gaussian noise sigma in seconds.",
+    )
+    parser.add_argument(
+        "--isolated-noise-sigma-max-s",
+        "--isolated-noise-sigma-max",
+        dest="isolated_noise_sigma_max_s",
+        type=float,
+        default=0.35,
+        help="Maximum isolated Gaussian noise sigma in seconds.",
+    )
     parser.add_argument("--min-visible-channels", type=int, default=2, help="Reject sampled vehicles with fewer visible channels.")
     parser.add_argument("--speed-norm-kmh", type=float, default=150.0, help="Speed normalization denominator.")
     parser.add_argument("--clip-ratio", type=float, default=1.35, help="Robust clipping ratio for input normalization.")
@@ -312,6 +336,87 @@ def _sample_track_times(
     return t_center, segment_speed, effective_speed, motion_model, stop_mask
 
 
+def _add_track_to_sample(
+    args: argparse.Namespace,
+    *,
+    data_ds: torch.Tensor,
+    t_axis_s: torch.Tensor,
+    time_label: torch.Tensor,
+    visibility: torch.Tensor,
+    direction: torch.Tensor,
+    speed: torch.Tensor,
+    gt_valid: torch.Tensor,
+    track_id: int,
+    t_center: torch.Tensor,
+    direction_label: int,
+    speed_kmh: float,
+    amp: float,
+    sigma_s: float,
+) -> bool:
+    n_ch = int(data_ds.shape[0])
+    window_samples = int(round(float(args.window_seconds) * float(args.fs)))
+    visible = (t_center >= 0.0) & (t_center < float(args.window_seconds))
+    if int(visible.sum().item()) < int(args.min_visible_channels):
+        return False
+    for ch in torch.where(visible)[0].tolist():
+        pulse = float(amp) * torch.exp(-0.5 * ((t_axis_s - float(t_center[ch].item())) / max(1e-6, float(sigma_s))) ** 2)
+        data_ds[int(ch)] += pulse
+    center_idx = torch.round(t_center * float(args.fs)).to(torch.long).clamp(0, window_samples - 1)
+    time_label[track_id, visible] = (
+        center_idx[visible].to(torch.float32) / float(max(1, window_samples - 1))
+    ).clamp(0.0, 1.0)
+    visibility[track_id] = visible.to(torch.float32)
+    direction[track_id] = int(direction_label)
+    speed[track_id] = float(speed_kmh / max(1e-6, float(args.speed_norm_kmh)))
+    gt_valid[track_id] = True
+    return True
+
+
+def _interaction_time_pair(
+    args: argparse.Namespace,
+    gen: torch.Generator,
+    n_ch: int,
+    interaction_type: str,
+) -> tuple[torch.Tensor, int, float, torch.Tensor, int, float]:
+    cross_ch = int(torch.randint(0, int(n_ch), (1,), generator=gen).item())
+    lo = max(0.0, min(1.0, float(args.interaction_time_min_frac)))
+    hi = max(lo, min(1.0, float(args.interaction_time_max_frac)))
+    cross_time = _rand_uniform(gen, lo * float(args.window_seconds), hi * float(args.window_seconds))
+    speed_min = float(args.speed_min_kmh)
+    speed_max = float(args.speed_max_kmh)
+    speed_span = max(1e-6, speed_max - speed_min)
+    slow = _rand_uniform(gen, speed_min, speed_min + 0.35 * speed_span)
+    fast = _rand_uniform(gen, speed_min + 0.65 * speed_span, speed_max)
+    ch_axis = torch.arange(int(n_ch), dtype=torch.float32)
+    dx = float(args.dx_m)
+    if interaction_type == "crossing":
+        t_a = float(cross_time) + (ch_axis - float(cross_ch)) * dx / (slow / 3.6)
+        t_b = float(cross_time) - (ch_axis - float(cross_ch)) * dx / (fast / 3.6)
+        return t_a, 0, slow, t_b, 1, fast
+    if interaction_type == "near_parallel":
+        offset = _rand_uniform(gen, 0.4, 2.0) * (-1.0 if torch.rand((), generator=gen).item() < 0.5 else 1.0)
+        t_a = float(cross_time) + (ch_axis - float(cross_ch)) * dx / (slow / 3.6)
+        t_b = float(cross_time + offset) + (ch_axis - float(cross_ch)) * dx / (fast / 3.6)
+        return t_a, 0, slow, t_b, 0, fast
+    t_a = float(cross_time) + (ch_axis - float(cross_ch)) * dx / (slow / 3.6)
+    t_b = float(cross_time) + (ch_axis - float(cross_ch)) * dx / (fast / 3.6)
+    return t_a, 0, slow, t_b, 0, fast
+
+
+def _add_isolated_noise(args: argparse.Namespace, gen: torch.Generator, data_ds: torch.Tensor, t_axis_s: torch.Tensor) -> None:
+    rate = max(0.0, float(args.isolated_noise_rate))
+    count = int(rate)
+    if torch.rand((), generator=gen).item() < rate - count:
+        count += 1
+    n_ch = int(data_ds.shape[0])
+    for _ in range(count):
+        ch = int(torch.randint(0, n_ch, (1,), generator=gen).item())
+        center = _rand_uniform(gen, 0.0, float(args.window_seconds))
+        sigma = _rand_uniform(gen, float(args.isolated_noise_sigma_min_s), float(args.isolated_noise_sigma_max_s))
+        amp = _rand_uniform(gen, float(args.isolated_noise_amp_min), float(args.isolated_noise_amp_max))
+        data_ds[ch] += float(amp) * torch.exp(-0.5 * ((t_axis_s - float(center)) / max(1e-6, float(sigma))) ** 2)
+
+
 def _generate_one(args: argparse.Namespace, index: int) -> dict[str, torch.Tensor]:
     gen = torch.Generator(device="cpu")
     gen.manual_seed(int(args.seed) + int(index) * 1_000_003)
@@ -340,6 +445,31 @@ def _generate_one(args: argparse.Namespace, index: int) -> dict[str, torch.Tenso
 
     n_vehicles = int(torch.randint(int(args.vehicles_min), int(args.vehicles_max) + 1, (1,), generator=gen).item())
     track_id = 0
+    if n_vehicles >= 2 and float(args.interaction_ratio) > 0.0 and torch.rand((), generator=gen).item() < float(args.interaction_ratio):
+        interaction_types = _split_csv(str(args.interaction_types)) or ["crossing"]
+        interaction_type = interaction_types[int(torch.randint(0, len(interaction_types), (1,), generator=gen).item())]
+        t_a, dir_a, speed_a, t_b, dir_b, speed_b = _interaction_time_pair(args, gen, n_ch, interaction_type)
+        for t_center, dir_label, speed_kmh in [(t_a, dir_a, speed_a), (t_b, dir_b, speed_b)]:
+            if track_id >= n_vehicles:
+                break
+            added = _add_track_to_sample(
+                args,
+                data_ds=data_ds,
+                t_axis_s=t_axis_s,
+                time_label=time_label,
+                visibility=visibility,
+                direction=direction,
+                speed=speed,
+                gt_valid=gt_valid,
+                track_id=track_id,
+                t_center=t_center,
+                direction_label=int(dir_label),
+                speed_kmh=float(speed_kmh),
+                amp=_rand_uniform(gen, float(args.amp_min), float(args.amp_max)),
+                sigma_s=_rand_uniform(gen, float(args.sigma_min_s), float(args.sigma_max_s)),
+            )
+            if added:
+                track_id += 1
     attempts = 0
     max_attempts = max(64, n_vehicles * 64)
     while track_id < n_vehicles and attempts < max_attempts:
@@ -380,6 +510,8 @@ def _generate_one(args: argparse.Namespace, index: int) -> dict[str, torch.Tenso
         gt_valid[track_id] = True
         track_id += 1
 
+    if float(args.isolated_noise_ratio) > 0.0 and torch.rand((), generator=gen).item() < float(args.isolated_noise_ratio):
+        _add_isolated_noise(args, gen, data_ds, t_axis_s)
     x = _prepare_input(data_ds, clip_ratio=float(args.clip_ratio), input_mode=str(args.input_mode))
     if str(args.x_dtype) == "float16":
         x = x.to(torch.float16)
@@ -450,6 +582,22 @@ def main() -> int:
         raise ValueError("stop response scales must be > 0")
     if float(args.restart_speed_ratio_min) <= 0.0 or float(args.restart_speed_ratio_max) < float(args.restart_speed_ratio_min):
         raise ValueError("restart speed ratio range must be positive and ordered")
+    if not (0.0 <= float(args.interaction_ratio) <= 1.0):
+        raise ValueError("--interaction-ratio must be in [0, 1]")
+    allowed_interactions = {"crossing", "overtake", "near_parallel"}
+    unknown_interactions = sorted(set(_split_csv(str(args.interaction_types))) - allowed_interactions)
+    if unknown_interactions:
+        raise ValueError(f"Unknown interaction type(s): {', '.join(unknown_interactions)}")
+    if float(args.interaction_time_min_frac) < 0.0 or float(args.interaction_time_max_frac) < float(args.interaction_time_min_frac):
+        raise ValueError("interaction time fractions must be ordered and non-negative")
+    if float(args.isolated_noise_rate) < 0.0:
+        raise ValueError("--isolated-noise-rate must be >= 0")
+    if not (0.0 <= float(args.isolated_noise_ratio) <= 1.0):
+        raise ValueError("--isolated-noise-ratio must be in [0, 1]")
+    if float(args.isolated_noise_amp_min) < 0.0 or float(args.isolated_noise_amp_max) < float(args.isolated_noise_amp_min):
+        raise ValueError("isolated noise amplitude range must be non-negative and ordered")
+    if float(args.isolated_noise_sigma_min_s) <= 0.0 or float(args.isolated_noise_sigma_max_s) < float(args.isolated_noise_sigma_min_s):
+        raise ValueError("isolated noise sigma range must be positive and ordered")
 
     out_dir = Path(args.out_dir).expanduser()
     if out_dir.exists() and any(out_dir.iterdir()) and not bool(args.overwrite):

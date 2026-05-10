@@ -93,6 +93,10 @@ class InferenceConfig:
     viterbi_inertia_penalty: float = 2.5
     viterbi_slope_memory: float = 0.75
     viterbi_fallback_speed_kmh: float = 80.0
+    decoder_mode: str = "beam_global"
+    viterbi_beam_size: int = 4
+    time_prior_weight: float = 2.0
+    global_conflict_penalty: float = 2.0
     physics_smooth_tolerance_s: float = 2.0
 
 
@@ -204,6 +208,8 @@ class PeakSlotPredictor(nn.Module):
         self.objectness_head = nn.Sequential(nn.LayerNorm(hidden), nn.Linear(hidden, 1))
         self.direction_head = nn.Sequential(nn.LayerNorm(hidden), nn.Linear(hidden, 2))
         self.speed_head = nn.Sequential(nn.LayerNorm(hidden), nn.Linear(hidden, 1))
+        self.time_prior_head = nn.Sequential(nn.LayerNorm(hidden), nn.Linear(hidden, int(c.n_channels)))
+        self.visibility_prior_head = nn.Sequential(nn.LayerNorm(hidden), nn.Linear(hidden, int(c.n_channels)))
 
     def forward(
         self,
@@ -244,6 +250,8 @@ class PeakSlotPredictor(nn.Module):
             "direction_logits": self.direction_head(hs),
             "speed": self.speed_head(hs).squeeze(-1),
             "peak_logits": peak_logits,
+            "time_prior": torch.sigmoid(self.time_prior_head(hs)),
+            "visibility_prior_logits": self.visibility_prior_head(hs),
         }
 
 
@@ -316,6 +324,56 @@ def _match_single(
     return torch.as_tensor(rows, dtype=torch.long, device=device), torch.as_tensor(cols, dtype=torch.long, device=device)
 
 
+def _slot_peak_competition_loss(outputs: dict[str, torch.Tensor], q_count: int) -> torch.Tensor:
+    obj = torch.sigmoid(outputs["objectness_logits"][:, :q_count])
+    peak_prob = torch.softmax(outputs["peak_logits"][:, :q_count, :, :-1], dim=-1)
+    weighted = peak_prob * obj[:, :, None, None]
+    overlap = torch.einsum("bqck,brck->bqr", weighted, weighted)
+    q = int(overlap.shape[-1])
+    if q <= 1:
+        return torch.zeros((), dtype=overlap.dtype, device=overlap.device)
+    eye = torch.eye(q, dtype=torch.bool, device=overlap.device).unsqueeze(0).expand_as(overlap)
+    return overlap.masked_select(~eye).mean()
+
+
+def _peak_switch_margin_loss(outputs: dict[str, torch.Tensor], targets: dict[str, torch.Tensor], *, matcher: str) -> torch.Tensor:
+    device = outputs["objectness_logits"].device
+    q_count = int(outputs["num_regular_queries"])
+    none_index = int(outputs["peak_logits"].shape[-1] - 1)
+    logp = torch.log_softmax(outputs["peak_logits"][:, :q_count], dim=-1)
+    terms: list[torch.Tensor] = []
+    for b in range(int(logp.shape[0])):
+        rows, cols = _match_single(
+            outputs,
+            targets,
+            b,
+            matcher=matcher,
+            w_peak=3.0,
+            w_obj=1.0,
+            w_dir=0.2,
+            w_speed=0.1,
+        )
+        if rows.numel() <= 0:
+            continue
+        valid_idx = torch.where(targets["gt_valid"][b].to(device=device, dtype=torch.bool))[0]
+        for row, col in zip(rows.tolist(), cols.tolist()):
+            gi = int(valid_idx[int(col)].item())
+            gt_peak = targets["gt_peak_index"][b, gi].to(device=device, dtype=torch.long)
+            gt_vis = targets["visibility"][b, gi].to(device=device, dtype=torch.float32)
+            valid = (gt_vis > 0.5) & (gt_peak < none_index)
+            if not torch.any(valid):
+                continue
+            good = logp[b, int(row), :, :].gather(1, gt_peak.clamp(0, none_index)[:, None]).squeeze(1)
+            masked = logp[b, int(row), :, :none_index].clone()
+            masked[torch.arange(int(masked.shape[0]), device=device), gt_peak.clamp(0, none_index - 1)] = -1e4
+            bad = torch.max(masked, dim=-1).values
+            margin = 0.75
+            terms.append((torch.relu(margin + bad[valid] - good[valid])).mean())
+    if not terms:
+        return torch.zeros((), dtype=logp.dtype, device=device)
+    return torch.stack(terms).mean()
+
+
 def peak_slot_set_loss(
     outputs: dict[str, torch.Tensor],
     targets: dict[str, torch.Tensor],
@@ -332,8 +390,12 @@ def peak_slot_set_loss(
     count_loss_weight: float = 0.05,
     direction_loss_weight: float = 0.5,
     speed_loss_weight: float = 0.25,
-    monotonic_loss_weight: float = 0.2,
-    smoothness_loss_weight: float = 0.05,
+    monotonic_loss_weight: float = 1.0,
+    smoothness_loss_weight: float = 0.2,
+    time_prior_loss_weight: float = 2.0,
+    visibility_prior_loss_weight: float = 0.5,
+    slot_competition_loss_weight: float = 0.1,
+    crossing_loss_weight: float = 0.2,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     device = outputs["objectness_logits"].device
     batch_size = int(outputs["objectness_logits"].shape[0])
@@ -396,10 +458,20 @@ def peak_slot_set_loss(
         loss_peak = (ce * ce_weight).sum() / torch.clamp(ce_weight.sum(), min=1.0)
         pred_dir = outputs["direction_logits"][b_sel, q_sel]
         pred_speed = outputs["speed"][b_sel, q_sel]
+        pred_time_prior = outputs["time_prior"][b_sel, q_sel]
+        pred_vis_prior_logits = outputs["visibility_prior_logits"][b_sel, q_sel]
         gt_dir = targets["direction"][b_sel, mapped_g].to(device=device, dtype=torch.long)
         gt_speed = targets["speed"][b_sel, mapped_g].to(device=device, dtype=torch.float32)
+        gt_time = targets["peak_time"][b_sel].to(device=device, dtype=torch.float32)
+        gt_peak_for_time = gt_peak.clamp(0, none_index - 1)
+        gt_time_prior = gt_time.gather(2, gt_peak_for_time[:, :, None]).squeeze(-1)
+        gt_vis_for_prior = targets["visibility"][b_sel, mapped_g].to(device=device, dtype=torch.float32)
         loss_dir = F.cross_entropy(pred_dir, gt_dir, reduction="mean")
         loss_speed = F.smooth_l1_loss(pred_speed, gt_speed, reduction="mean")
+        loss_time_prior = (F.smooth_l1_loss(pred_time_prior, gt_time_prior, reduction="none") * gt_vis_for_prior).sum()
+        loss_time_prior = loss_time_prior / torch.clamp(gt_vis_for_prior.sum(), min=1.0)
+        vis_prior_raw = F.binary_cross_entropy_with_logits(pred_vis_prior_logits, gt_vis_for_prior, reduction="none")
+        loss_vis_prior = vis_prior_raw.mean()
 
         exp_time = _expected_peak_time(outputs["peak_logits"], targets["peak_time"].to(device), targets["peak_valid"].to(device))
         pred_time = exp_time[b_sel, q_sel]
@@ -421,10 +493,14 @@ def peak_slot_set_loss(
         loss_speed = zero
         loss_mono = zero
         loss_smooth = zero
+        loss_time_prior = zero
+        loss_vis_prior = zero
 
     obj_prob = torch.sigmoid(outputs["objectness_logits"][:, :q_count])
     gt_count = targets["gt_valid"].to(device=device, dtype=torch.float32).sum(dim=1)
     loss_count = F.smooth_l1_loss(obj_prob.sum(dim=1), gt_count, reduction="mean")
+    loss_competition = _slot_peak_competition_loss(outputs, q_count) if float(slot_competition_loss_weight) > 0.0 else zero
+    loss_crossing = _peak_switch_margin_loss(outputs, targets, matcher=str(matcher)) if float(crossing_loss_weight) > 0.0 else zero
     total = (
         loss_obj
         + float(peak_loss_weight) * loss_peak
@@ -433,6 +509,10 @@ def peak_slot_set_loss(
         + float(speed_loss_weight) * loss_speed
         + float(monotonic_loss_weight) * loss_mono
         + float(smoothness_loss_weight) * loss_smooth
+        + float(time_prior_loss_weight) * loss_time_prior
+        + float(visibility_prior_loss_weight) * loss_vis_prior
+        + float(slot_competition_loss_weight) * loss_competition
+        + float(crossing_loss_weight) * loss_crossing
     )
     if not collect_metrics:
         return total, {}
@@ -445,6 +525,10 @@ def peak_slot_set_loss(
         "loss_speed": float(loss_speed.detach().cpu()),
         "loss_monotonic": float(loss_mono.detach().cpu()),
         "loss_smooth": float(loss_smooth.detach().cpu()),
+        "loss_time_prior": float(loss_time_prior.detach().cpu()),
+        "loss_visibility_prior": float(loss_vis_prior.detach().cpu()),
+        "loss_competition": float(loss_competition.detach().cpu()),
+        "loss_crossing": float(loss_crossing.detach().cpu()),
         "matched": float(matched_total),
         "gt": float(gt_total),
         "max_objectness": float(torch.max(obj_prob).detach().cpu()),
@@ -540,6 +624,9 @@ def _slot_peak_candidates(
     *,
     peak_threshold: float,
     topk: int,
+    peak_time: Optional[torch.Tensor] = None,
+    time_prior: Optional[np.ndarray] = None,
+    time_prior_weight: float = 0.0,
 ) -> list[list[dict[str, float | int]]]:
     candidates: list[list[dict[str, float | int]]] = []
     n_ch = int(peak_prob.shape[0])
@@ -552,12 +639,16 @@ def _slot_peak_candidates(
             prob = float(peak_prob[ch, k])
             if prob < float(peak_threshold):
                 continue
+            logp = float(np.log(max(prob, 1e-12)))
+            if time_prior is not None and peak_time is not None and ch < int(time_prior.shape[0]):
+                prior_delta = abs(float(peak_time[ch, k].item()) - float(time_prior[ch]))
+                logp -= float(time_prior_weight) * prior_delta
             ch_items.append(
                 {
                     "ch": int(ch),
                     "peak_idx": int(k),
                     "prob": prob,
-                    "logp": float(np.log(max(prob, 1e-12))),
+                    "logp": logp,
                     "t_down": int(peak_index[ch, k].item()),
                 }
             )
@@ -624,7 +715,33 @@ def _transition_score(
     return True, float(trans), float(slope)
 
 
-def decode_peak_slot_path(
+def _trace_viterbi_path(
+    states: list[list[dict[str, float | int | None]]],
+    best: tuple[int, int, dict[str, float | int | None]],
+) -> list[dict[str, float | int]]:
+    path_rev: list[dict[str, float | int | None]] = []
+    ch, idx, state = best
+    while True:
+        path_rev.append(state)
+        prev_ch = state.get("prev_ch")
+        prev_idx = state.get("prev_idx")
+        if prev_ch is None or prev_idx is None:
+            break
+        ch = int(prev_ch)
+        idx = int(prev_idx)
+        state = states[ch][idx]
+    path = list(reversed(path_rev))
+    return [
+        {
+            "ch": int(item["ch"]),  # type: ignore[arg-type]
+            "peak_idx": int(item["peak_idx"]),  # type: ignore[arg-type]
+            "prob": float(item["prob"]),  # type: ignore[arg-type]
+        }
+        for item in path
+    ]
+
+
+def decode_peak_slot_paths(
     peak_prob: np.ndarray,
     peak_time: torch.Tensor,
     peak_valid: torch.Tensor,
@@ -636,32 +753,44 @@ def decode_peak_slot_path(
     time_downsample: int,
     fs: float,
     config: InferenceConfig,
-) -> list[dict[str, float | int]]:
-    """Decode one slot as a physically consistent peak path.
+    time_prior: Optional[np.ndarray] = None,
+) -> list[dict[str, Any]]:
+    """Decode one slot into a beam of physically consistent peak paths.
 
     The model still supplies per-channel peak probabilities. This function is a
-    non-differentiable inference-time Viterbi pass that replaces independent
-    per-channel argmax with a speed-window-constrained path search.
+    non-differentiable inference-time Viterbi pass. Keeping a small beam is
+    important around crossings: the best local path can switch vehicles, while a
+    slightly lower-scoring candidate can keep the previous velocity identity.
     """
-    del peak_time
     candidates = _slot_peak_candidates(
         peak_prob,
         peak_valid,
         peak_index,
         peak_threshold=float(config.viterbi_candidate_threshold),
         topk=int(config.viterbi_topk),
+        peak_time=peak_time,
+        time_prior=time_prior,
+        time_prior_weight=float(config.time_prior_weight),
     )
     states: list[list[dict[str, float | int | None]]] = []
     ref_speed = float(predicted_speed_kmh)
     if not np.isfinite(ref_speed) or ref_speed <= 1e-6:
         ref_speed = float(config.viterbi_fallback_speed_kmh)
+    beam_size = max(1, int(config.viterbi_beam_size))
     for ch, ch_candidates in enumerate(candidates):
         ch_states: list[dict[str, float | int | None]] = []
         for item in ch_candidates:
-            best_score = float(item["logp"]) + float(config.viterbi_point_bonus)
-            best_prev_ch: Optional[int] = None
-            best_prev_idx: Optional[int] = None
-            best_slope: Optional[float] = None
+            alternatives: list[dict[str, float | int | None]] = []
+            start_state = dict(item)
+            start_state.update(
+                {
+                    "score": float(item["logp"]) + float(config.viterbi_point_bonus),
+                    "prev_ch": None,
+                    "prev_idx": None,
+                    "slope": None,
+                }
+            )
+            alternatives.append(start_state)
             start_ch = max(0, ch - int(config.viterbi_max_skip_channels))
             for prev_ch in range(start_ch, ch):
                 for prev_idx, prev in enumerate(states[prev_ch]):
@@ -684,42 +813,71 @@ def decode_peak_slot_path(
                     if not ok:
                         continue
                     cand_score = float(prev["score"]) + float(item["logp"]) + float(config.viterbi_point_bonus) + trans
-                    if cand_score > best_score:
-                        best_score = cand_score
-                        best_prev_ch = int(prev_ch)
-                        best_prev_idx = int(prev_idx)
-                        best_slope = float(slope)
-            state = dict(item)
-            state.update({"score": best_score, "prev_ch": best_prev_ch, "prev_idx": best_prev_idx, "slope": best_slope})
-            ch_states.append(state)
+                    state = dict(item)
+                    state.update(
+                        {
+                            "score": float(cand_score),
+                            "prev_ch": int(prev_ch),
+                            "prev_idx": int(prev_idx),
+                            "slope": float(slope),
+                        }
+                    )
+                    alternatives.append(state)
+            alternatives.sort(key=lambda state: float(state["score"]), reverse=True)
+            ch_states.extend(alternatives[:beam_size])
+        ch_states.sort(key=lambda state: float(state["score"]), reverse=True)
+        ch_states = ch_states[: max(beam_size, beam_size * max(1, int(config.viterbi_topk)))]
         states.append(ch_states)
-    best: Optional[tuple[int, int, dict[str, float | int | None]]] = None
+    terminal: list[tuple[int, int, dict[str, float | int | None]]] = []
     for ch, ch_states in enumerate(states):
         for idx, state in enumerate(ch_states):
-            if best is None or float(state["score"]) > float(best[2]["score"]):
-                best = (ch, idx, state)
-    if best is None:
-        return []
-    path_rev: list[dict[str, float | int | None]] = []
-    ch, idx, state = best
-    while True:
-        path_rev.append(state)
-        prev_ch = state.get("prev_ch")
-        prev_idx = state.get("prev_idx")
-        if prev_ch is None or prev_idx is None:
+            terminal.append((ch, idx, state))
+    terminal.sort(key=lambda item: float(item[2]["score"]), reverse=True)
+    paths: list[dict[str, Any]] = []
+    seen: set[tuple[tuple[int, int], ...]] = set()
+    for best in terminal:
+        path = _trace_viterbi_path(states, best)
+        key = tuple((int(item["ch"]), int(item["peak_idx"])) for item in path)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        paths.append({"score": float(best[2]["score"]), "path": path})
+        if len(paths) >= beam_size:
             break
-        ch = int(prev_ch)
-        idx = int(prev_idx)
-        state = states[ch][idx]
-    path = list(reversed(path_rev))
-    return [
-        {
-            "ch": int(item["ch"]),  # type: ignore[arg-type]
-            "peak_idx": int(item["peak_idx"]),  # type: ignore[arg-type]
-            "prob": float(item["prob"]),  # type: ignore[arg-type]
-        }
-        for item in path
-    ]
+    return paths
+
+
+def decode_peak_slot_path(
+    peak_prob: np.ndarray,
+    peak_time: torch.Tensor,
+    peak_valid: torch.Tensor,
+    peak_index: torch.Tensor,
+    *,
+    direction_label: int,
+    predicted_speed_kmh: float,
+    x_axis_m: np.ndarray,
+    time_downsample: int,
+    fs: float,
+    config: InferenceConfig,
+    time_prior: Optional[np.ndarray] = None,
+) -> list[dict[str, float | int]]:
+    """Decode one slot as the best physically consistent peak path."""
+    paths = decode_peak_slot_paths(
+        peak_prob,
+        peak_time,
+        peak_valid,
+        peak_index,
+        direction_label=direction_label,
+        predicted_speed_kmh=float(predicted_speed_kmh),
+        x_axis_m=x_axis_m,
+        time_downsample=int(time_downsample),
+        fs=float(fs),
+        config=config,
+        time_prior=time_prior,
+    )
+    if not paths:
+        return []
+    return list(paths[0]["path"])
 
 
 def argmax_peak_slot_path(
@@ -899,6 +1057,12 @@ def predict_tracks_from_window(
     peak_prob = torch.softmax(outputs["peak_logits"][0], dim=-1).detach().cpu().numpy()
     dirs = torch.argmax(outputs["direction_logits"][0], dim=-1).detach().cpu().numpy()
     speeds = outputs["speed"][0].detach().cpu().numpy()
+    time_prior = outputs.get("time_prior")
+    time_prior_np = (
+        time_prior[0].detach().cpu().numpy()
+        if torch.is_tensor(time_prior) and bool(getattr(model, "has_time_prior", True))
+        else None
+    )
     max_tracks = min(int(cfg.max_tracks), int(obj.shape[0]))
     order = np.argsort(obj)[::-1][:max_tracks]
     tracks: list[Track] = []
@@ -906,8 +1070,10 @@ def predict_tracks_from_window(
         score = float(obj[q_idx])
         if score < float(cfg.objectness_threshold):
             continue
-        if bool(cfg.use_viterbi_decoder):
-            decoded = decode_peak_slot_path(
+        decoder_mode = str(cfg.decoder_mode).lower()
+        path_options: list[list[dict[str, float | int]]] = []
+        if bool(cfg.use_viterbi_decoder) and decoder_mode == "beam_global":
+            decoded_options = decode_peak_slot_paths(
                 peak_prob[q_idx],
                 peak_time,
                 peak_valid,
@@ -918,29 +1084,69 @@ def predict_tracks_from_window(
                 time_downsample=int(cfg.time_downsample),
                 fs=float(fs),
                 config=cfg,
+                time_prior=None if time_prior_np is None else time_prior_np[q_idx],
             )
-        else:
-            decoded = argmax_peak_slot_path(peak_prob[q_idx], peak_valid, peak_threshold=float(cfg.peak_threshold))
-        points: list[TrackPoint] = []
-        for item in decoded:
-            ch = int(item["ch"])
-            choice = int(item["peak_idx"])
-            prob = float(item["prob"])
-            t_idx = int(peak_index[ch, choice].item()) * int(cfg.time_downsample)
-            t_idx = int(max(0, min(int(arr.shape[1]) - 1, t_idx)))
-            offset = float(x_axis_m[int(ch)]) if int(ch) < len(x_axis_m) else float(ch)
-            points.append(
-                TrackPoint(
-                    ch_idx=int(ch),
-                    t_idx=t_idx,
-                    time_s=float(t_idx) / float(fs),
-                    offset_m=offset,
-                    amp=float(abs(arr[int(ch), t_idx])),
-                    score=score * prob,
+            path_options = [list(item["path"]) for item in decoded_options]
+        elif bool(cfg.use_viterbi_decoder) and decoder_mode != "argmax":
+            path_options = [
+                decode_peak_slot_path(
+                    peak_prob[q_idx],
+                    peak_time,
+                    peak_valid,
+                    peak_index,
+                    direction_label=int(dirs[q_idx]),
+                    predicted_speed_kmh=float(speeds[q_idx]) * float(cfg.speed_norm_kmh),
+                    x_axis_m=np.asarray(x_axis_m, dtype=np.float64),
+                    time_downsample=int(cfg.time_downsample),
+                    fs=float(fs),
+                    config=cfg,
+                    time_prior=None if time_prior_np is None else time_prior_np[q_idx],
                 )
-            )
-        if len(points) >= int(cfg.min_visible_channels):
-            tracks.append(_track_stats(len(tracks), LABEL_TO_DIRECTION.get(int(dirs[q_idx]), "forward"), points))
+            ]
+        else:
+            path_options = [argmax_peak_slot_path(peak_prob[q_idx], peak_valid, peak_threshold=float(cfg.peak_threshold))]
+        for decoded in path_options:
+            points: list[TrackPoint] = []
+            for item in decoded:
+                ch = int(item["ch"])
+                choice = int(item["peak_idx"])
+                prob = float(item["prob"])
+                t_idx = int(peak_index[ch, choice].item()) * int(cfg.time_downsample)
+                t_idx = int(max(0, min(int(arr.shape[1]) - 1, t_idx)))
+                offset = float(x_axis_m[int(ch)]) if int(ch) < len(x_axis_m) else float(ch)
+                points.append(
+                    TrackPoint(
+                        ch_idx=int(ch),
+                        t_idx=t_idx,
+                        time_s=float(t_idx) / float(fs),
+                        offset_m=offset,
+                        amp=float(abs(arr[int(ch), t_idx])),
+                        score=score * prob,
+                    )
+                )
+            if len(points) >= int(cfg.min_visible_channels):
+                tracks.append(_track_stats(int(q_idx), LABEL_TO_DIRECTION.get(int(dirs[q_idx]), "forward"), points))
+    if str(cfg.decoder_mode).lower() == "beam_global" and float(cfg.global_conflict_penalty) > 0.0:
+        kept_tracks: list[Track] = []
+        used_slots: set[int] = set()
+        for track in sorted(tracks, key=lambda item: item.total_score, reverse=True):
+            if int(track.track_id) in used_slots:
+                continue
+            tmap = {int(p.ch_idx): int(p.t_idx) for p in track.points}
+            conflict = False
+            for existing in kept_tracks:
+                emap = {int(p.ch_idx): int(p.t_idx) for p in existing.points}
+                common = sorted(set(tmap) & set(emap))
+                if len(common) < int(cfg.dedup_min_overlap_channels):
+                    continue
+                diffs = np.array([abs(tmap[ch] - emap[ch]) for ch in common], dtype=np.float64)
+                if float(np.median(diffs)) <= float(cfg.dedup_tolerance_samples):
+                    conflict = True
+                    break
+            if not conflict:
+                kept_tracks.append(track)
+                used_slots.add(int(track.track_id))
+        tracks = kept_tracks
     return _deduplicate_tracks(
         tracks,
         tol_samples=int(cfg.dedup_tolerance_samples),
@@ -982,6 +1188,13 @@ def load_checkpoint_model(checkpoint_path: str | Path, device: Optional[str] = N
     checkpoint = torch.load(str(Path(checkpoint_path).expanduser()), map_location="cpu", weights_only=False)
     model_config = ModelConfig(**dict(checkpoint.get("model_config", {})))
     model = PeakSlotPredictor(model_config).to(resolved_device)
-    model.load_state_dict(checkpoint["model_state"], strict=True)
+    missing, unexpected = model.load_state_dict(checkpoint["model_state"], strict=False)
+    if missing:
+        print(f"PeakSlot checkpoint loaded with newly initialized keys: {missing}", flush=True)
+    if unexpected:
+        print(f"PeakSlot checkpoint ignored unexpected keys: {unexpected}", flush=True)
+    checkpoint["has_time_prior"] = not any(str(key).startswith("time_prior_head") for key in missing)
+    checkpoint["has_visibility_prior"] = not any(str(key).startswith("visibility_prior_head") for key in missing)
+    model.has_time_prior = bool(checkpoint["has_time_prior"])  # type: ignore[attr-defined]
     model.eval()
     return model, checkpoint

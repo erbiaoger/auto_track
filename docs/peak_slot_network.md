@@ -17,21 +17,32 @@ candidate peak or the final `none` class:
 
 ```text
 peak_logits[q, c, 0:K+1]
+time_prior[q, c]
+visibility_prior_logits[q, c]
 ```
 
 The class `K` means no vehicle point on that channel. This means exported
 trajectory points can only be detected peaks; empty boundary channels are not
 forced to receive a regressed time.
 
+`time_prior` is a continuous per-slot guide for where the vehicle should be on
+each channel. It does not replace peak selection. During decoding it adds a
+soft penalty when a candidate peak is far from the prior, so crossings are less
+likely to switch to the other vehicle after the intersection. Old checkpoints
+that do not contain the prior heads still load; in that case the time-prior
+penalty is disabled.
+
 ## Inference Decoding
 
-Prediction now defaults to a Viterbi-style physical decoder instead of
-independent per-channel argmax. For each active slot, the decoder searches a
-peak path using:
+Prediction now defaults to `beam_global`, a beam Viterbi physical decoder plus
+global conflict-aware selection, instead of independent per-channel argmax. For
+each active slot, the decoder searches peak paths using:
 
 ```text
 emission = log_softmax(peak_logits[q, ch, k])
+prior penalty = abs(peak_time[ch, k] - time_prior[q, ch])
 candidate threshold = 0.01
+beam size = 4
 hard speed window = 60-100 km/h
 max channel skip = 4
 soft penalties = speed mismatch + skipped channels (strong) + slope changes + speed inertia
@@ -47,6 +58,10 @@ middle-channel peaks can bridge otherwise broken trajectories.
 The inertia term keeps a smoothed running slope for each partial path and
 penalizes candidates that do not continue from the previously implied speed,
 which reduces identity switches after crossing points.
+`beam_global` keeps several alternatives for each slot, then greedily selects
+one path per slot while penalizing repeated use of the same peak candidates.
+This makes crossing cases less brittle because the decoder can reject a locally
+high-scoring path that steals peaks from another trajectory.
 
 ## Matching and Loss
 
@@ -71,6 +86,10 @@ loss =
 + 0.25 * loss_speed
 + 1.0 * loss_monotonic
 + 0.2 * loss_smooth
++ 2.0 * loss_time_prior
++ 0.5 * loss_visibility_prior
++ 0.1 * loss_slot_competition
++ 0.2 * loss_crossing_margin
 ```
 
 `loss_peak_ce` is the main term. Visible GT channel points are supervised to
@@ -86,6 +105,34 @@ SmoothL1(sum(sigmoid(objectness)), GT_count)
 Monotonic and smoothness losses are weak regularizers computed from the
 expected peak time distribution. They reduce reversals and jitter, but the hard
 position constraint is the peak candidate selection itself.
+
+The prior losses supervise matched slots to output the GT candidate time and
+visibility per channel. The slot competition loss discourages different slots
+from assigning high probability to the same peak candidates. The crossing
+margin term raises the margin between the matched GT candidate and other
+candidate peaks on the same channel, which is targeted at crossing and
+near-crossing switch errors.
+
+## Synthetic Interaction Data
+
+`generate_track_slot_dataset.py` now supports interaction-heavy training
+samples:
+
+```text
+--interaction-ratio 0.3
+--interaction-types crossing,overtake,near_parallel
+--interaction-time-min-frac 0.05
+--interaction-time-max-frac 0.95
+--isolated-noise-ratio 0.1
+--isolated-noise-rate 6
+--isolated-noise-amp-min 4 --isolated-noise-amp-max 8
+--isolated-noise-sigma-min 0.08 --isolated-noise-sigma-max 0.35
+```
+
+The interaction time is sampled across the full window, not only the middle.
+The difficult cases include opposite-direction crossings, same-direction
+overtakes, near-parallel close tracks, and isolated Gaussian peaks that may be
+stronger than nearby vehicle peaks.
 
 ## Data Flow
 

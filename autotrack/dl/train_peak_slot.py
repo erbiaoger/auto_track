@@ -71,6 +71,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--count-loss-weight", type=float, default=0.05, help="Soft count loss weight.")
     parser.add_argument("--monotonic-loss-weight", type=float, default=1.0, help="Monotonic loss weight.")
     parser.add_argument("--smoothness-loss-weight", type=float, default=0.2, help="Smoothness loss weight.")
+    parser.add_argument("--time-prior-loss-weight", type=float, default=2.0, help="Time prior supervision loss weight.")
+    parser.add_argument("--visibility-prior-loss-weight", type=float, default=0.5, help="Visibility prior supervision loss weight.")
+    parser.add_argument("--slot-competition-loss-weight", type=float, default=0.1, help="Penalty for multiple slots selecting the same peaks.")
+    parser.add_argument("--crossing-loss-weight", type=float, default=0.2, help="Margin loss against switching to competing peaks.")
     parser.add_argument("--physics-speed-min-kmh", type=float, default=60.0, help="Minimum speed for physics violation metrics.")
     parser.add_argument("--physics-speed-max-kmh", type=float, default=100.0, help="Maximum speed for physics violation metrics.")
     parser.add_argument("--metric-objectness-threshold", type=float, default=0.5, help="Objectness threshold for metrics.")
@@ -244,6 +248,10 @@ def _evaluate(model: PeakSlotPredictor, data_dir: Path, shards: list[str], devic
                 count_loss_weight=float(args.count_loss_weight),
                 monotonic_loss_weight=float(args.monotonic_loss_weight),
                 smoothness_loss_weight=float(args.smoothness_loss_weight),
+                time_prior_loss_weight=float(args.time_prior_loss_weight),
+                visibility_prior_loss_weight=float(args.visibility_prior_loss_weight),
+                slot_competition_loss_weight=float(args.slot_competition_loss_weight),
+                crossing_loss_weight=float(args.crossing_loss_weight),
                 collect_metrics=True,
             )
             metrics.update(
@@ -321,12 +329,19 @@ def main() -> int:
     if bool(args.channels_last) and str(device).startswith("cuda"):
         model = model.to(memory_format=torch.channels_last)
     if resume_checkpoint is not None:
-        model.load_state_dict(resume_checkpoint["model_state"], strict=True)
+        missing, unexpected = model.load_state_dict(resume_checkpoint["model_state"], strict=False)
+        if missing:
+            print(f"Resume checkpoint missing newly initialized keys: {missing}", flush=True)
+        if unexpected:
+            print(f"Resume checkpoint ignored unexpected keys: {unexpected}", flush=True)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
     if resume_checkpoint is not None and not bool(args.resume_model_only) and "optimizer_state" in resume_checkpoint:
-        optimizer.load_state_dict(resume_checkpoint["optimizer_state"])
-        _move_optimizer_state_to_device(optimizer, device)
-        print("Loaded optimizer state from checkpoint.", flush=True)
+        try:
+            optimizer.load_state_dict(resume_checkpoint["optimizer_state"])
+            _move_optimizer_state_to_device(optimizer, device)
+            print("Loaded optimizer state from checkpoint.", flush=True)
+        except ValueError as exc:
+            print(f"Skipped optimizer state because model parameters changed: {exc}", flush=True)
     elif resume_checkpoint is not None:
         print("Loaded model weights only; optimizer starts from scratch.", flush=True)
     use_amp = (str(args.amp) == "on") or (str(args.amp) == "auto" and str(device).startswith("cuda"))
@@ -402,6 +417,10 @@ def main() -> int:
                     count_loss_weight=float(args.count_loss_weight),
                     monotonic_loss_weight=float(args.monotonic_loss_weight),
                     smoothness_loss_weight=float(args.smoothness_loss_weight),
+                    time_prior_loss_weight=float(args.time_prior_loss_weight),
+                    visibility_prior_loss_weight=float(args.visibility_prior_loss_weight),
+                    slot_competition_loss_weight=float(args.slot_competition_loss_weight),
+                    crossing_loss_weight=float(args.crossing_loss_weight),
                     collect_metrics=bool(collect_metrics),
                 )
             scaler.scale(loss).backward()
