@@ -89,7 +89,7 @@ def extract_all_deep_learning(
             objectness_threshold=float(cfg.get("objectness_threshold", 0.5)),
             peak_threshold=float(cfg.get("peak_threshold", 0.4)),
             min_visible_channels=int(cfg.get("min_visible_channels", 3)),
-            max_tracks=int(cfg.get("max_tracks", 96)),
+            max_tracks=int(cfg.get("max_tracks", 64)),
             dedup_tolerance_samples=int(cfg.get("dedup_tolerance_samples", 180)),
             speed_norm_kmh=float(dataset_cfg.get("speed_norm_kmh", 150.0)),
             clip_ratio=float(dataset_cfg.get("clip_ratio", 1.35)),

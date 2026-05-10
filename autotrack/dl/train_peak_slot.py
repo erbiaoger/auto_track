@@ -54,7 +54,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-samples", type=int, default=0, help="Limit samples per epoch for smoke tests; 0 uses all.")
     parser.add_argument("--lr", type=float, default=2e-4, help="AdamW learning rate.")
     parser.add_argument("--weight-decay", type=float, default=1e-4, help="AdamW weight decay.")
-    parser.add_argument("--max-tracks", type=int, default=96, help="Output slots Q.")
+    parser.add_argument("--max-tracks", type=int, default=64, help="Output slots Q.")
     parser.add_argument("--hidden-dim", type=int, default=128, help="Model hidden dimension.")
     parser.add_argument("--decoder-layers", type=int, default=2, help="Transformer decoder layers.")
     parser.add_argument("--num-heads", type=int, default=4, help="Transformer attention heads.")

@@ -55,7 +55,7 @@ class PeakDetectionConfig:
 class ModelConfig:
     n_channels: int = 50
     in_channels: int = 1
-    max_tracks: int = 96
+    max_tracks: int = 64
     peak_candidates: int = 64
     hidden_dim: int = 128
     num_heads: int = 4
@@ -71,7 +71,7 @@ class InferenceConfig:
     objectness_threshold: float = 0.5
     peak_threshold: float = 0.4
     min_visible_channels: int = 3
-    max_tracks: int = 96
+    max_tracks: int = 64
     dedup_tolerance_samples: int = 180
     dedup_min_overlap_channels: int = 3
     speed_norm_kmh: float = 150.0
