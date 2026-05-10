@@ -4,7 +4,7 @@ set -eu
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$SCRIPT_DIR"
 
-RUN_DIR=${RUN_DIR:-models/peak_slot_cuda}
+RUN_DIR=${RUN_DIR:-models/peak_slot_v2_cuda}
 HISTORY=${HISTORY:-}
 OUT_DIR=${OUT_DIR:-}
 METRICS=${METRICS:-loss,track_f1,count_mae,time_mae_norm,max_objectness,mean_objectness}
