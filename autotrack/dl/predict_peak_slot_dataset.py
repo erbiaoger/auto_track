@@ -73,6 +73,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--viterbi-skip-penalty", type=float, default=2.0, help="Penalty per skipped channel in Viterbi.")
     parser.add_argument("--viterbi-speed-penalty", type=float, default=1.0, help="Soft penalty for deviation from slot speed.")
     parser.add_argument("--viterbi-smoothness-penalty", type=float, default=0.6, help="Soft penalty for slope changes.")
+    parser.add_argument("--viterbi-inertia-penalty", type=float, default=2.5, help="Penalty for deviating from the previous speed prediction.")
+    parser.add_argument("--viterbi-slope-memory", type=float, default=0.75, help="Exponential memory for the slot's running slope.")
     parser.add_argument("--matcher", default="hungarian", choices=["hungarian", "greedy"], help="Metric matching strategy.")
     parser.add_argument("--none-weight", type=float, default=0.35, help="GT-none weight for loss reporting.")
     parser.add_argument("--no-object-weight", type=float, default=0.15, help="Unmatched slot weight for loss reporting.")
@@ -494,6 +496,8 @@ def main() -> int:
         viterbi_skip_penalty=float(args.viterbi_skip_penalty),
         viterbi_speed_penalty=float(args.viterbi_speed_penalty),
         viterbi_smoothness_penalty=float(args.viterbi_smoothness_penalty),
+        viterbi_inertia_penalty=float(args.viterbi_inertia_penalty),
+        viterbi_slope_memory=float(args.viterbi_slope_memory),
     )
     summary_path = out_dir / "summary.json"
     sample_summary_path = out_dir / "sample_summary.csv"
@@ -669,6 +673,8 @@ def main() -> int:
             "viterbi_speed_min_kmh": float(inference_config.viterbi_speed_min_kmh),
             "viterbi_speed_max_kmh": float(inference_config.viterbi_speed_max_kmh),
             "viterbi_max_skip_channels": int(inference_config.viterbi_max_skip_channels),
+            "viterbi_inertia_penalty": float(inference_config.viterbi_inertia_penalty),
+            "viterbi_slope_memory": float(inference_config.viterbi_slope_memory),
         },
         "loss_metrics": _weighted_mean(loss_sums, loss_weights),
         "batch_mean_detection_metrics": _weighted_mean(metric_sums, metric_weights),

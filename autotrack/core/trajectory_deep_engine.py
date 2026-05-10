@@ -107,6 +107,8 @@ def extract_all_deep_learning(
             viterbi_skip_penalty=float(cfg.get("viterbi_skip_penalty", 2.0)),
             viterbi_speed_penalty=float(cfg.get("viterbi_speed_penalty", 1.0)),
             viterbi_smoothness_penalty=float(cfg.get("viterbi_smoothness_penalty", 0.6)),
+            viterbi_inertia_penalty=float(cfg.get("viterbi_inertia_penalty", 2.5)),
+            viterbi_slope_memory=float(cfg.get("viterbi_slope_memory", 0.75)),
             viterbi_fallback_speed_kmh=float(cfg.get("viterbi_fallback_speed_kmh", 80.0)),
         )
         predict_fn = pk.predict_tracks_from_window

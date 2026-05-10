@@ -34,7 +34,7 @@ emission = log_softmax(peak_logits[q, ch, k])
 candidate threshold = 0.01
 hard speed window = 60-100 km/h
 max channel skip = 4
-soft penalties = speed mismatch + skipped channels (strong) + slope changes
+soft penalties = speed mismatch + skipped channels (strong) + slope changes + speed inertia
 ```
 
 This is a post-processing step, not part of the neural network and not
@@ -44,6 +44,9 @@ Use `--no-viterbi-decoder` in `predict_peak_slot_dataset.py` to compare with
 the legacy argmax decoder. The Viterbi candidate threshold is intentionally
 lower than the exported point threshold so weak but physically consistent
 middle-channel peaks can bridge otherwise broken trajectories.
+The inertia term keeps a smoothed running slope for each partial path and
+penalizes candidates that do not continue from the previously implied speed,
+which reduces identity switches after crossing points.
 
 ## Matching and Loss
 

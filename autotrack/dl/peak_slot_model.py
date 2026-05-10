@@ -90,6 +90,8 @@ class InferenceConfig:
     viterbi_skip_penalty: float = 2.0
     viterbi_speed_penalty: float = 1.0
     viterbi_smoothness_penalty: float = 0.6
+    viterbi_inertia_penalty: float = 2.5
+    viterbi_slope_memory: float = 0.75
     viterbi_fallback_speed_kmh: float = 80.0
     physics_smooth_tolerance_s: float = 2.0
 
@@ -578,6 +580,8 @@ def _transition_score(
     skip_penalty: float,
     speed_penalty: float,
     smoothness_penalty: float,
+    inertia_penalty: float,
+    slope_memory: float,
 ) -> tuple[bool, float, float]:
     prev_ch = int(prev["ch"])  # type: ignore[arg-type]
     cur_ch = int(cur["ch"])
@@ -610,7 +614,13 @@ def _transition_score(
     prev_slope = prev.get("slope")
     if prev_slope is not None and np.isfinite(float(prev_slope)):
         ref_slope = 3.6 / max(1e-6, ref_speed)
-        trans -= float(smoothness_penalty) * abs(slope - float(prev_slope)) / max(1e-6, ref_slope)
+        prev_slope_f = float(prev_slope)
+        trans -= float(smoothness_penalty) * abs(slope - prev_slope_f) / max(1e-6, ref_slope)
+        expected_dt = prev_slope_f * dx
+        inertia_scale = max(1e-6, abs(expected_dt), ref_slope * dx)
+        trans -= float(inertia_penalty) * abs(dt_signed - expected_dt) / inertia_scale
+        memory = min(0.98, max(0.0, float(slope_memory)))
+        slope = memory * prev_slope_f + (1.0 - memory) * slope
     return True, float(trans), float(slope)
 
 
@@ -668,6 +678,8 @@ def decode_peak_slot_path(
                         skip_penalty=float(config.viterbi_skip_penalty),
                         speed_penalty=float(config.viterbi_speed_penalty),
                         smoothness_penalty=float(config.viterbi_smoothness_penalty),
+                        inertia_penalty=float(config.viterbi_inertia_penalty),
+                        slope_memory=float(config.viterbi_slope_memory),
                     )
                     if not ok:
                         continue
