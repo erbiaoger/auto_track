@@ -118,6 +118,16 @@ does not run a second Hungarian/auction assignment.
 
 ## Synthetic Interaction Data
 
+The 120 s branch defaults generate shorter windows in separate directories:
+
+```text
+window_seconds = 120
+vehicles_min/max = 16/24
+track-slot data = datasets/track_slot_v2_120s/train
+peak-slot data = datasets/peak_slot_v2_120s/train
+model output = models/peak_slot_v2_120s_cuda
+```
+
 `generate_track_slot_dataset.py` now supports interaction-heavy training
 samples:
 
@@ -155,9 +165,10 @@ infer_trajectory_model.py --model-family peak_slot
 ## Commands
 
 ```sh
+sh generate_track_slot_dataset.sh
 sh convert_track_slot_to_peak_slot.sh
 DEVICE=cuda EPOCHS=20 BATCH_SIZE=32 sh train_peak_slot_cuda.sh
-MODEL=models/peak_slot_cuda/checkpoint_best.pt DATA_DIR=datasets/peak_slot/train sh predict_peak_slot_dataset.sh
+MODEL=models/peak_slot_v2_120s_cuda/checkpoint_best.pt DATA_DIR=datasets/peak_slot_v2_120s/test sh predict_peak_slot_dataset.sh
 ```
 
 CPU smoke test:

@@ -4,8 +4,8 @@ set -eu
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$SCRIPT_DIR"
 
-DATA_DIR=${DATA_DIR:-datasets/peak_slot_v2/train}
-OUT_DIR=${OUT_DIR:-models/peak_slot_v2_cuda/label_check}
+DATA_DIR=${DATA_DIR:-datasets/peak_slot_v2_120s/train}
+OUT_DIR=${OUT_DIR:-models/peak_slot_v2_120s_cuda/label_check}
 SAMPLE_INDICES=${SAMPLE_INDICES:-}
 START_SAMPLE=${START_SAMPLE:-0}
 PLOT_SAMPLES=${PLOT_SAMPLES:-16}

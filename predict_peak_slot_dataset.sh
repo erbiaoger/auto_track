@@ -4,9 +4,9 @@ set -eu
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$SCRIPT_DIR"
 
-DATA_DIR=${DATA_DIR:-datasets/peak_slot_v2/test}
-MODEL=${MODEL:-models/peak_slot_v2_cuda/checkpoint_best.pt}
-OUT_DIR=${OUT_DIR:-models/peak_slot_v2_cuda/prediction_check}
+DATA_DIR=${DATA_DIR:-datasets/peak_slot_v2_120s/test}
+MODEL=${MODEL:-models/peak_slot_v2_120s_cuda/checkpoint_best.pt}
+OUT_DIR=${OUT_DIR:-models/peak_slot_v2_120s_cuda/prediction_check}
 DEVICE=${DEVICE:-cpu}
 BATCH_SIZE=${BATCH_SIZE:-16}
 MAX_SAMPLES=${MAX_SAMPLES:-256}
