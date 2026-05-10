@@ -63,7 +63,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--objectness-threshold", type=float, default=0.5, help="Predicted slot objectness threshold.")
     parser.add_argument("--peak-threshold", type=float, default=0.4, help="Minimum selected peak probability.")
     parser.add_argument("--min-visible-channels", type=int, default=3, help="Minimum selected peaks for a predicted track.")
-    parser.add_argument("--max-predicted-tracks", type=int, default=64, help="Maximum slots kept per sample.")
+    parser.add_argument("--max-predicted-tracks", type=int, default=96, help="Maximum slots kept per sample.")
     parser.add_argument("--decoder-mode", default="beam_global", choices=["argmax", "viterbi", "beam_global"], help="Peak decoding strategy.")
     parser.add_argument("--no-viterbi-decoder", action="store_true", help="Use legacy per-channel argmax decoding instead of Viterbi.")
     parser.add_argument("--viterbi-beam-size", type=int, default=4, help="Number of candidate paths retained per slot in beam_global decoding.")
