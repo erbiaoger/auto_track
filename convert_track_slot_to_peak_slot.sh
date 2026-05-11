@@ -4,8 +4,8 @@ set -eu
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$SCRIPT_DIR"
 
-IN_DIR=${IN_DIR:-datasets/track_slot_v2_120s/train}
-OUT_DIR=${OUT_DIR:-datasets/peak_slot_v2_120s/train}
+IN_DIR=${IN_DIR:-datasets/track_slot_v3_120s_realistic/train}
+OUT_DIR=${OUT_DIR:-datasets/peak_slot_v3_120s_realistic/train}
 PEAK_CANDIDATES_PER_CHANNEL=${PEAK_CANDIDATES_PER_CHANNEL:-64}
 PEAK_MIN_DISTANCE_S=${PEAK_MIN_DISTANCE_S:-0.5}
 PEAK_MIN_HEIGHT=${PEAK_MIN_HEIGHT:-0.02}

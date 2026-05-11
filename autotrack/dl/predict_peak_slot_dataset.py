@@ -60,15 +60,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--plot-samples", type=int, default=16, help="Number of overlay figures to write.")
     parser.add_argument("--plot-dpi", type=int, default=160, help="DPI for overlay PNG figures.")
     parser.add_argument("--plot-style", default="waveform", choices=["waveform", "heatmap"], help="Overlay plot style: GUI-like waveform or heatmap.")
-    parser.add_argument("--objectness-threshold", type=float, default=0.5, help="Predicted slot objectness threshold.")
+    parser.add_argument("--objectness-threshold", type=float, default=0.35, help="Predicted slot objectness threshold. Lower values favor recall.")
     parser.add_argument("--peak-threshold", type=float, default=0.4, help="Minimum selected peak probability.")
-    parser.add_argument("--min-visible-channels", type=int, default=3, help="Minimum selected peaks for a predicted track.")
+    parser.add_argument("--min-visible-channels", type=int, default=2, help="Minimum selected peaks for a predicted track.")
     parser.add_argument("--max-predicted-tracks", type=int, default=96, help="Maximum slots kept per sample.")
     parser.add_argument("--decoder-mode", default="beam_global", choices=["argmax", "viterbi", "beam_global"], help="Peak decoding strategy.")
     parser.add_argument("--no-viterbi-decoder", action="store_true", help="Use legacy per-channel argmax decoding instead of Viterbi.")
-    parser.add_argument("--viterbi-beam-size", type=int, default=4, help="Number of candidate paths retained per slot in beam_global decoding.")
+    parser.add_argument("--viterbi-beam-size", type=int, default=8, help="Number of candidate paths retained per slot in beam_global decoding.")
     parser.add_argument("--time-prior-weight", type=float, default=2.0, help="Penalty weight for peak distance from time_prior.")
-    parser.add_argument("--global-conflict-penalty", type=float, default=2.0, help="Penalty for overlapping decoded paths in beam_global mode.")
+    parser.add_argument("--global-conflict-penalty", type=float, default=2.0, help="Enable cross-slot overlap suppression when > 0.")
     parser.add_argument("--viterbi-topk", type=int, default=16, help="Top peak candidates per channel considered by Viterbi.")
     parser.add_argument("--viterbi-candidate-threshold", type=float, default=0.01, help="Low probability floor for candidates entering Viterbi.")
     parser.add_argument("--viterbi-speed-min-kmh", type=float, default=60.0, help="Minimum hard transition speed for Viterbi.")
@@ -266,12 +266,19 @@ def _active_predictions(
                     "peak_probs": probs,
                 }
             )
-    if str(inference_config.decoder_mode).lower() == "beam_global" and float(inference_config.global_conflict_penalty) > 0.0:
-        kept: list[dict[str, Any]] = []
+    if str(inference_config.decoder_mode).lower() == "beam_global":
+        best_per_slot: list[dict[str, Any]] = []
         used_slots: set[int] = set()
         for pred in sorted(predictions, key=lambda item: float(item.get("selection_score", item["score"])), reverse=True):
-            if int(pred["slot"]) in used_slots:
+            slot = int(pred["slot"])
+            if slot in used_slots:
                 continue
+            best_per_slot.append(pred)
+            used_slots.add(slot)
+        predictions = best_per_slot
+    if str(inference_config.decoder_mode).lower() == "beam_global" and float(inference_config.global_conflict_penalty) > 0.0:
+        kept: list[dict[str, Any]] = []
+        for pred in sorted(predictions, key=lambda item: float(item.get("selection_score", item["score"])), reverse=True):
             peak_set = {(int(ch), int(pk)) for ch, pk in zip(pred["channels"], pred["peak_indices"])}
             conflict = False
             for existing in kept:
@@ -283,7 +290,6 @@ def _active_predictions(
                     break
             if not conflict:
                 kept.append(pred)
-                used_slots.add(int(pred["slot"]))
         predictions = kept
     return predictions
 

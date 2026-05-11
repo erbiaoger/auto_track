@@ -27,8 +27,17 @@ Generate tensor shards without SAC I/O:
 WORKERS=8 sh generate_track_slot_dataset.sh
 ```
 
-The default generator uses realistic motion augmentation:
-`constant_sparse,smooth_random,stop_go` with weights `0.84,0.15,0.01`.
+The default generator uses realistic motion augmentation and noisy DAS
+backgrounds. Motion defaults are `constant_sparse,smooth_random,stop_go` with
+weights `0.84,0.15,0.01`; signal defaults also include white noise, correlated
+low-frequency noise, channel bias/gain variation, slow baseline drift, and
+isolated pulse interference. The default `REALISM_PRESET=xi_gauss_50` also
+uses 32-48 vehicles per 120 s window, fixed dead channels
+`5,6,15,16,22,36,38,42,45,48`, random dead channels, and random zero background
+blocks to better match the checked real `gauss_section.npy` data. Override
+`NOISE_STD=0` and the other noise/dead-channel environment variables only for
+clean ablation runs. The default sample count is `NUM_SAMPLES=80000`.
+Direction sampling keeps the expected traffic prior (`PRIMARY_RATIO=0.8333333333`).
 
 Train on CUDA:
 
@@ -101,11 +110,24 @@ Train on CUDA:
 DEVICE=cuda EPOCHS=20 BATCH_SIZE=32 sh train_peak_slot_cuda.sh
 ```
 
+`train_peak_slot_cuda.sh` reserves a fixed tail split by default
+(`VAL_FRACTION=0.1`) and evaluates it every 5 epochs. Set `VAL_DATA_DIR` to use
+a separately generated peak-slot validation directory instead. Count/objectness
+training is weighted more strongly by default through `OBJECT_LOSS_WEIGHT=1.25`
+and `COUNT_LOSS_WEIGHT=0.15`. Step timing is summarized every 5 epochs by
+default with `TIMING_EVERY=5`.
+
 Predict directly on converted shards:
 
 ```sh
 MODEL=models/peak_slot_cuda/checkpoint_best.pt DATA_DIR=datasets/peak_slot/train sh predict_peak_slot_dataset.sh
 ```
+
+`predict_peak_slot_dataset.sh` defaults to recall-oriented inference
+(`OBJECTNESS_THRESHOLD=0.35`, `MIN_VISIBLE_CHANNELS=2`,
+`VITERBI_BEAM_SIZE=8`) while keeping cross-slot conflict suppression enabled
+with `GLOBAL_CONFLICT_PENALTY=2.0`. Raise the threshold if false positives
+become too high.
 
 Infer on SAC data:
 

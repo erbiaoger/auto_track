@@ -122,10 +122,13 @@ The 120 s branch defaults generate shorter windows in separate directories:
 
 ```text
 window_seconds = 120
-vehicles_min/max = 16/24
-track-slot data = datasets/track_slot_v2_120s/train
-peak-slot data = datasets/peak_slot_v2_120s/train
-model output = models/peak_slot_v2_120s_cuda
+vehicles_min/max = 32/48
+default generated samples = 80000
+primary_ratio = 0.8333333333
+realism_preset = xi_gauss_50
+track-slot data = datasets/track_slot_v3_120s_realistic/train
+peak-slot data = datasets/peak_slot_v3_120s_realistic/train
+model output = models/peak_slot_v3_120s_realistic_cuda
 ```
 
 `generate_track_slot_dataset.py` now supports interaction-heavy training
@@ -136,16 +139,31 @@ samples:
 --interaction-types crossing,overtake,near_parallel
 --interaction-time-min-frac 0.05
 --interaction-time-max-frac 0.95
---isolated-noise-ratio 0.1
---isolated-noise-rate 6
---isolated-noise-amp-min 4 --isolated-noise-amp-max 8
+--noise-std 0.35
+--colored-noise-std 0.18
+--channel-bias-std 0.08
+--channel-gain-std 0.12
+--baseline-drift-std 0.10
+--dead-channel-indices 5,6,15,16,22,36,38,42,45,48
+--random-dead-channel-ratio 0.35
+--random-dead-channel-min 1 --random-dead-channel-max 5
+--zero-background-ratio 1.0
+--zero-background-rate 160
+--zero-background-channel-min 1 --zero-background-channel-max 8
+--zero-background-duration-min-s 2.0 --zero-background-duration-max-s 10.0
+--primary-ratio 0.8333333333
+--isolated-noise-ratio 1.0
+--isolated-noise-rate 18
+--isolated-noise-amp-min 1 --isolated-noise-amp-max 6
 --isolated-noise-sigma-min 0.08 --isolated-noise-sigma-max 0.35
 ```
 
 The interaction time is sampled across the full window, not only the middle.
 The difficult cases include opposite-direction crossings, same-direction
 overtakes, near-parallel close tracks, and isolated Gaussian peaks that may be
-stronger than nearby vehicle peaks.
+stronger than nearby vehicle peaks. Background noise is added before robust
+input normalization so the saved training tensors are no longer ideal clean
+Gaussian traces.
 
 ## Data Flow
 
@@ -162,6 +180,12 @@ infer_trajectory_model.py --model-family peak_slot
     -> auto_tracks_deep.csv
 ```
 
+For inspection plots, the default prediction command is recall-oriented:
+`OBJECTNESS_THRESHOLD=0.35`, `MIN_VISIBLE_CHANNELS=2`, and
+`VITERBI_BEAM_SIZE=8`, while cross-slot conflict suppression stays enabled with
+`GLOBAL_CONFLICT_PENALTY=2.0`. If overlays show too many false positives, first
+raise `OBJECTNESS_THRESHOLD`.
+
 ## Commands
 
 ```sh
@@ -170,6 +194,20 @@ sh convert_track_slot_to_peak_slot.sh
 DEVICE=cuda EPOCHS=20 BATCH_SIZE=32 sh train_peak_slot_cuda.sh
 MODEL=models/peak_slot_v2_120s_cuda/checkpoint_best.pt DATA_DIR=datasets/peak_slot_v2_120s/test sh predict_peak_slot_dataset.sh
 ```
+
+Training defaults reserve a fixed 10% tail-shard validation split and evaluate
+it every 5 epochs:
+
+```text
+VAL_FRACTION=0.1
+VAL_EVERY=5
+OBJECT_LOSS_WEIGHT=1.25
+COUNT_LOSS_WEIGHT=0.15
+METRIC_OBJECTNESS_THRESHOLD=0.35
+```
+
+For a fully independent validation set, generate another peak-slot directory
+with a different `SEED` and pass it as `VAL_DATA_DIR=/path/to/peak_slot_val`.
 
 CPU smoke test:
 

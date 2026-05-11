@@ -68,9 +68,9 @@ class ModelConfig:
 @dataclass
 class InferenceConfig:
     time_downsample: int = 10
-    objectness_threshold: float = 0.5
+    objectness_threshold: float = 0.35
     peak_threshold: float = 0.4
-    min_visible_channels: int = 3
+    min_visible_channels: int = 2
     max_tracks: int = 96
     dedup_tolerance_samples: int = 180
     dedup_min_overlap_channels: int = 3
@@ -94,7 +94,7 @@ class InferenceConfig:
     viterbi_slope_memory: float = 0.75
     viterbi_fallback_speed_kmh: float = 80.0
     decoder_mode: str = "beam_global"
-    viterbi_beam_size: int = 4
+    viterbi_beam_size: int = 8
     time_prior_weight: float = 2.0
     global_conflict_penalty: float = 2.0
     physics_smooth_tolerance_s: float = 2.0
@@ -466,6 +466,7 @@ def peak_slot_set_loss(
     w_dir: float = 0.2,
     w_speed: float = 0.1,
     peak_loss_weight: float = 1.0,
+    object_loss_weight: float = 1.0,
     count_loss_weight: float = 0.05,
     direction_loss_weight: float = 0.5,
     speed_loss_weight: float = 0.25,
@@ -582,7 +583,7 @@ def peak_slot_set_loss(
     loss_count = F.smooth_l1_loss(obj_prob.sum(dim=1), gt_count, reduction="mean")
     loss_competition = _slot_peak_competition_loss(outputs, q_count) if float(slot_competition_loss_weight) > 0.0 else zero
     total = (
-        loss_obj
+        float(object_loss_weight) * loss_obj
         + float(peak_loss_weight) * loss_peak
         + float(count_loss_weight) * loss_count
         + float(direction_loss_weight) * loss_dir
@@ -639,6 +640,14 @@ def peak_slot_detection_metrics(
     count_abs_error = 0.0
     count_exact = 0
     time_errors: list[float] = []
+    gt_forward = 0
+    gt_reverse = 0
+    good_forward = 0
+    good_reverse = 0
+    gt_short_visible = 0
+    gt_long_visible = 0
+    good_short_visible = 0
+    good_long_visible = 0
     peak_time = targets["peak_time"].to(device=device, dtype=torch.float32)
     for b in range(int(obj.shape[0])):
         pred_count = int(active[b].sum().item())
@@ -647,6 +656,17 @@ def peak_slot_detection_metrics(
         count_exact += int(pred_count == gt_count)
         if gt_count <= 0:
             continue
+        for gi_total in torch.where(gt_valid[b])[0].tolist():
+            dir_label = int(targets["direction"][b, gi_total].item())
+            visible_count = int((targets["visibility"][b, gi_total] > 0.5).sum().item())
+            if dir_label == 0:
+                gt_forward += 1
+            else:
+                gt_reverse += 1
+            if visible_count <= 8:
+                gt_short_visible += 1
+            else:
+                gt_long_visible += 1
         rows, cols = _match_single(
             outputs,
             targets,
@@ -677,6 +697,16 @@ def peak_slot_detection_metrics(
             time_errors.append(err_f)
             if err_f <= float(point_threshold):
                 good_total += 1
+                dir_label = int(targets["direction"][b, gi].item())
+                visible_count = int((targets["visibility"][b, gi] > 0.5).sum().item())
+                if dir_label == 0:
+                    good_forward += 1
+                else:
+                    good_reverse += 1
+                if visible_count <= 8:
+                    good_short_visible += 1
+                else:
+                    good_long_visible += 1
     precision = float(good_total / max(1, pred_total))
     recall = float(good_total / max(1, gt_total))
     f1 = float(2.0 * precision * recall / max(1e-12, precision + recall))
@@ -691,6 +721,14 @@ def peak_slot_detection_metrics(
         "count_mae": float(count_abs_error / max(1, batch_size)),
         "count_acc": float(count_exact / max(1, batch_size)),
         "time_mae_norm": float(np.mean(time_errors)) if time_errors else float("nan"),
+        "track_recall_forward": float(good_forward / max(1, gt_forward)),
+        "track_recall_reverse": float(good_reverse / max(1, gt_reverse)),
+        "track_recall_short_visible": float(good_short_visible / max(1, gt_short_visible)),
+        "track_recall_long_visible": float(good_long_visible / max(1, gt_long_visible)),
+        "gt_forward_count": float(gt_forward),
+        "gt_reverse_count": float(gt_reverse),
+        "gt_short_visible_count": float(gt_short_visible),
+        "gt_long_visible_count": float(gt_long_visible),
     }
 
 
@@ -1207,12 +1245,18 @@ def predict_tracks_from_window(
                 )
             if len(points) >= int(cfg.min_visible_channels):
                 tracks.append(_track_stats(int(q_idx), LABEL_TO_DIRECTION.get(int(dirs[q_idx]), "forward"), points))
-    if str(cfg.decoder_mode).lower() == "beam_global" and float(cfg.global_conflict_penalty) > 0.0:
-        kept_tracks: list[Track] = []
+    if str(cfg.decoder_mode).lower() == "beam_global":
+        best_per_slot: list[Track] = []
         used_slots: set[int] = set()
         for track in sorted(tracks, key=lambda item: item.total_score, reverse=True):
             if int(track.track_id) in used_slots:
                 continue
+            best_per_slot.append(track)
+            used_slots.add(int(track.track_id))
+        tracks = best_per_slot
+    if str(cfg.decoder_mode).lower() == "beam_global" and float(cfg.global_conflict_penalty) > 0.0:
+        kept_tracks: list[Track] = []
+        for track in sorted(tracks, key=lambda item: item.total_score, reverse=True):
             tmap = {int(p.ch_idx): int(p.t_idx) for p in track.points}
             conflict = False
             for existing in kept_tracks:
@@ -1226,7 +1270,6 @@ def predict_tracks_from_window(
                     break
             if not conflict:
                 kept_tracks.append(track)
-                used_slots.add(int(track.track_id))
         tracks = kept_tracks
     return _deduplicate_tracks(
         tracks,

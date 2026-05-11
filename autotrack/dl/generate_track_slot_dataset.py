@@ -3,7 +3,7 @@
 Purpose:
     This script creates a disk dataset tailored for the track-slot model. It
     directly writes PyTorch `.pt` shards and does not create SAC files. Each
-    sample is a clean Gaussian DAS heatmap window plus instance trajectory
+    sample is a noisy synthetic DAS heatmap window plus instance trajectory
     labels, so training can read tensors instead of parsing waveform files.
 
 Example:
@@ -55,6 +55,7 @@ import torch
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate TrackSlotNet tensor training shards.")
     parser.add_argument("--out-dir", required=True, type=Path, help="Output directory for meta.json and .pt shards.")
+    parser.add_argument("--realism-preset", default="custom", help="Human-readable preset name recorded in meta.json.")
     parser.add_argument("--num-samples", type=int, default=20000, help="Total generated windows.")
     parser.add_argument("--shard-size", type=int, default=256, help="Samples per .pt shard.")
     parser.add_argument("--n-ch", type=int, default=50, help="Number of DAS channels.")
@@ -86,7 +87,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stop-response-amp-scale", type=float, default=1.2, help="Gaussian amplitude multiplier near a stop event.")
     parser.add_argument("--restart-speed-ratio-min", type=float, default=0.95, help="Minimum restart speed ratio after a stop.")
     parser.add_argument("--restart-speed-ratio-max", type=float, default=1.05, help="Maximum restart speed ratio after a stop.")
-    parser.add_argument("--noise-std", type=float, default=0.0, help="Gaussian noise std added to the downsampled heatmap.")
+    parser.add_argument("--noise-std", type=float, default=0.35, help="White Gaussian noise std added to the downsampled heatmap before normalization.")
+    parser.add_argument("--colored-noise-std", type=float, default=0.18, help="Low-frequency correlated noise std added to each channel.")
+    parser.add_argument("--colored-noise-corr-s", type=float, default=0.8, help="Approximate time correlation length in seconds for colored noise.")
+    parser.add_argument("--channel-bias-std", type=float, default=0.08, help="Per-channel constant baseline offset std.")
+    parser.add_argument("--channel-gain-std", type=float, default=0.12, help="Per-channel multiplicative gain variation std applied to the final heatmap.")
+    parser.add_argument("--baseline-drift-std", type=float, default=0.10, help="Slow baseline drift std added per channel.")
+    parser.add_argument("--baseline-drift-corr-s", type=float, default=6.0, help="Approximate time correlation length in seconds for baseline drift.")
+    parser.add_argument("--dead-channel-indices", default="", help="Comma-separated channel indices that are always completely zeroed.")
+    parser.add_argument("--random-dead-channel-ratio", type=float, default=0.0, help="Fraction of samples with extra random completely zeroed channels.")
+    parser.add_argument("--random-dead-channel-min", type=int, default=1, help="Minimum extra random dead channels when enabled.")
+    parser.add_argument("--random-dead-channel-max", type=int, default=5, help="Maximum extra random dead channels when enabled.")
+    parser.add_argument("--zero-background-ratio", type=float, default=0.0, help="Fraction of samples with random channel-time zero background blocks before vehicle pulses.")
+    parser.add_argument("--zero-background-rate", type=float, default=12.0, help="Expected random zero background blocks when enabled.")
+    parser.add_argument("--zero-background-channel-min", type=int, default=1, help="Minimum channels per zero background block.")
+    parser.add_argument("--zero-background-channel-max", type=int, default=4, help="Maximum channels per zero background block.")
+    parser.add_argument("--zero-background-duration-min-s", type=float, default=0.5, help="Minimum zero background block duration.")
+    parser.add_argument("--zero-background-duration-max-s", type=float, default=4.0, help="Maximum zero background block duration.")
     parser.add_argument("--amp-min", type=float, default=6.0, help="Minimum Gaussian pulse amplitude.")
     parser.add_argument("--amp-max", type=float, default=6.0, help="Maximum Gaussian pulse amplitude.")
     parser.add_argument("--sigma-min-s", type=float, default=0.25, help="Minimum Gaussian sigma in seconds.")
@@ -96,10 +113,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--interaction-types", default="crossing,overtake,near_parallel", help="Comma-separated interaction types.")
     parser.add_argument("--interaction-time-min-frac", type=float, default=0.05, help="Earliest interaction time as window fraction.")
     parser.add_argument("--interaction-time-max-frac", type=float, default=0.95, help="Latest interaction time as window fraction.")
-    parser.add_argument("--isolated-noise-ratio", type=float, default=0.1, help="Fraction of samples with isolated Gaussian noise peaks.")
-    parser.add_argument("--isolated-noise-rate", type=float, default=6.0, help="Expected isolated Gaussian noise peaks when enabled.")
-    parser.add_argument("--isolated-noise-amp-min", type=float, default=4.0, help="Minimum isolated Gaussian noise amplitude.")
-    parser.add_argument("--isolated-noise-amp-max", type=float, default=8.0, help="Maximum isolated Gaussian noise amplitude.")
+    parser.add_argument("--isolated-noise-ratio", type=float, default=1.0, help="Fraction of samples with isolated Gaussian noise peaks.")
+    parser.add_argument("--isolated-noise-rate", type=float, default=18.0, help="Expected isolated Gaussian noise peaks when enabled.")
+    parser.add_argument("--isolated-noise-amp-min", type=float, default=1.0, help="Minimum isolated Gaussian noise amplitude.")
+    parser.add_argument("--isolated-noise-amp-max", type=float, default=6.0, help="Maximum isolated Gaussian noise amplitude.")
     parser.add_argument(
         "--isolated-noise-sigma-min-s",
         "--isolated-noise-sigma-min",
@@ -155,6 +172,10 @@ def _split_csv(text: str) -> list[str]:
 
 def _parse_float_csv(text: str) -> list[float]:
     return [float(item) for item in _split_csv(text)]
+
+
+def _parse_int_csv(text: str) -> list[int]:
+    return [int(item) for item in _split_csv(text)]
 
 
 def _motion_models_and_weights(args: argparse.Namespace) -> tuple[list[str], list[float]]:
@@ -417,6 +438,126 @@ def _add_isolated_noise(args: argparse.Namespace, gen: torch.Generator, data_ds:
         data_ds[ch] += float(amp) * torch.exp(-0.5 * ((t_axis_s - float(center)) / max(1e-6, float(sigma))) ** 2)
 
 
+def _smooth_time_noise(noise: torch.Tensor, *, corr_samples: int) -> torch.Tensor:
+    width = int(max(1, corr_samples))
+    if width <= 1 or int(noise.shape[-1]) <= 1:
+        return noise
+    width = min(width, int(noise.shape[-1]))
+    pad_left = width // 2
+    pad_right = width - 1 - pad_left
+    padded = torch.nn.functional.pad(noise, (pad_left, pad_right), mode="replicate")
+    cumsum = torch.nn.functional.pad(torch.cumsum(padded, dim=-1), (1, 0))
+    return (cumsum[:, width:] - cumsum[:, :-width]) / float(width)
+
+
+def _add_background_noise(args: argparse.Namespace, gen: torch.Generator, data_ds: torch.Tensor) -> None:
+    n_ch, t_down = int(data_ds.shape[0]), int(data_ds.shape[1])
+    if float(args.noise_std) > 0.0:
+        data_ds += torch.normal(
+            mean=0.0,
+            std=float(args.noise_std),
+            size=(n_ch, t_down),
+            generator=gen,
+            dtype=torch.float32,
+        )
+    if float(args.colored_noise_std) > 0.0:
+        corr = int(round(float(args.colored_noise_corr_s) * float(args.fs) / float(max(1, args.time_downsample))))
+        colored = torch.randn((n_ch, t_down), generator=gen, dtype=torch.float32)
+        colored = _smooth_time_noise(colored, corr_samples=corr)
+        colored = colored / torch.clamp(torch.std(colored, dim=1, keepdim=True, unbiased=False), min=1e-6)
+        data_ds += float(args.colored_noise_std) * colored
+    if float(args.channel_bias_std) > 0.0:
+        bias = torch.normal(
+            mean=0.0,
+            std=float(args.channel_bias_std),
+            size=(n_ch, 1),
+            generator=gen,
+            dtype=torch.float32,
+        )
+        data_ds += bias
+    if float(args.baseline_drift_std) > 0.0:
+        corr = int(round(float(args.baseline_drift_corr_s) * float(args.fs) / float(max(1, args.time_downsample))))
+        drift = torch.randn((n_ch, t_down), generator=gen, dtype=torch.float32)
+        drift = _smooth_time_noise(drift, corr_samples=corr)
+        drift = drift / torch.clamp(torch.std(drift, dim=1, keepdim=True, unbiased=False), min=1e-6)
+        data_ds += float(args.baseline_drift_std) * drift
+
+
+def _apply_channel_gain(args: argparse.Namespace, gen: torch.Generator, data_ds: torch.Tensor) -> None:
+    if float(args.channel_gain_std) <= 0.0:
+        return
+    gain = 1.0 + torch.normal(
+        mean=0.0,
+        std=float(args.channel_gain_std),
+        size=(int(data_ds.shape[0]), 1),
+        generator=gen,
+        dtype=torch.float32,
+    )
+    data_ds *= torch.clamp(gain, min=0.2, max=3.0)
+
+
+def _sample_dead_channels(args: argparse.Namespace, gen: torch.Generator, n_ch: int) -> list[int]:
+    dead = {idx for idx in _parse_int_csv(str(args.dead_channel_indices)) if 0 <= idx < int(n_ch)}
+    if (
+        float(args.random_dead_channel_ratio) > 0.0
+        and torch.rand((), generator=gen).item() < float(args.random_dead_channel_ratio)
+    ):
+        count_min = int(max(0, args.random_dead_channel_min))
+        count_max = int(max(count_min, args.random_dead_channel_max))
+        if count_max > 0:
+            count = int(torch.randint(count_min, count_max + 1, (1,), generator=gen).item())
+            count = min(count, int(n_ch))
+            if count > 0:
+                order = torch.randperm(int(n_ch), generator=gen).tolist()
+                dead.update(int(idx) for idx in order[:count])
+    return sorted(dead)
+
+
+def _apply_dead_channels(
+    data_ds: torch.Tensor,
+    visibility: torch.Tensor,
+    gt_valid: torch.Tensor,
+    dead_channels: list[int],
+    *,
+    min_visible_channels: int,
+) -> None:
+    if not dead_channels:
+        return
+    data_ds[dead_channels, :] = 0.0
+    if visibility.numel() <= 0:
+        return
+    visibility[:, dead_channels] = 0.0
+    visible_counts = visibility.sum(dim=1)
+    gt_valid &= visible_counts >= int(min_visible_channels)
+
+
+def _add_zero_background_blocks(args: argparse.Namespace, gen: torch.Generator, data_ds: torch.Tensor) -> None:
+    if float(args.zero_background_ratio) <= 0.0:
+        return
+    if torch.rand((), generator=gen).item() >= float(args.zero_background_ratio):
+        return
+    rate = max(0.0, float(args.zero_background_rate))
+    count = int(rate)
+    if torch.rand((), generator=gen).item() < rate - count:
+        count += 1
+    if count <= 0:
+        return
+    n_ch, t_down = int(data_ds.shape[0]), int(data_ds.shape[1])
+    ch_min = int(max(1, args.zero_background_channel_min))
+    ch_max = int(max(ch_min, args.zero_background_channel_max))
+    dur_min = float(max(0.0, args.zero_background_duration_min_s))
+    dur_max = float(max(dur_min, args.zero_background_duration_max_s))
+    for _ in range(count):
+        width_ch = int(torch.randint(ch_min, ch_max + 1, (1,), generator=gen).item())
+        width_ch = max(1, min(width_ch, n_ch))
+        start_ch = int(torch.randint(0, max(1, n_ch - width_ch + 1), (1,), generator=gen).item())
+        duration_s = _rand_uniform(gen, dur_min, dur_max)
+        width_t = int(max(1, round(duration_s * float(args.fs) / float(max(1, args.time_downsample)))))
+        width_t = max(1, min(width_t, t_down))
+        start_t = int(torch.randint(0, max(1, t_down - width_t + 1), (1,), generator=gen).item())
+        data_ds[start_ch : start_ch + width_ch, start_t : start_t + width_t] = 0.0
+
+
 def _generate_one(args: argparse.Namespace, index: int) -> dict[str, torch.Tensor]:
     gen = torch.Generator(device="cpu")
     gen.manual_seed(int(args.seed) + int(index) * 1_000_003)
@@ -425,16 +566,9 @@ def _generate_one(args: argparse.Namespace, index: int) -> dict[str, torch.Tenso
     time_downsample = int(max(1, args.time_downsample))
     t_down = int(max(1, len(range(0, window_samples, time_downsample))))
     t_axis_s = torch.arange(t_down, dtype=torch.float32) * (float(time_downsample) / float(args.fs))
-    if float(args.noise_std) > 0.0:
-        data_ds = torch.normal(
-            mean=0.0,
-            std=float(args.noise_std),
-            size=(n_ch, t_down),
-            generator=gen,
-            dtype=torch.float32,
-        )
-    else:
-        data_ds = torch.zeros((n_ch, t_down), dtype=torch.float32)
+    data_ds = torch.zeros((n_ch, t_down), dtype=torch.float32)
+    _add_background_noise(args, gen, data_ds)
+    _add_zero_background_blocks(args, gen, data_ds)
 
     max_gt = int(max(args.vehicles_min, args.vehicles_max))
     time_label = torch.zeros((max_gt, n_ch), dtype=torch.float32)
@@ -512,6 +646,14 @@ def _generate_one(args: argparse.Namespace, index: int) -> dict[str, torch.Tenso
 
     if float(args.isolated_noise_ratio) > 0.0 and torch.rand((), generator=gen).item() < float(args.isolated_noise_ratio):
         _add_isolated_noise(args, gen, data_ds, t_axis_s)
+    _apply_channel_gain(args, gen, data_ds)
+    _apply_dead_channels(
+        data_ds,
+        visibility,
+        gt_valid,
+        _sample_dead_channels(args, gen, n_ch),
+        min_visible_channels=int(args.min_visible_channels),
+    )
     x = _prepare_input(data_ds, clip_ratio=float(args.clip_ratio), input_mode=str(args.input_mode))
     if str(args.x_dtype) == "float16":
         x = x.to(torch.float16)
@@ -582,6 +724,37 @@ def main() -> int:
         raise ValueError("stop response scales must be > 0")
     if float(args.restart_speed_ratio_min) <= 0.0 or float(args.restart_speed_ratio_max) < float(args.restart_speed_ratio_min):
         raise ValueError("restart speed ratio range must be positive and ordered")
+    if not (0.0 <= float(args.primary_ratio) <= 1.0):
+        raise ValueError("--primary-ratio must be in [0, 1]")
+    if any(
+        float(value) < 0.0
+        for value in [
+            args.noise_std,
+            args.colored_noise_std,
+            args.channel_bias_std,
+            args.channel_gain_std,
+            args.baseline_drift_std,
+        ]
+    ):
+        raise ValueError("noise std parameters must be >= 0")
+    if float(args.colored_noise_corr_s) <= 0.0 or float(args.baseline_drift_corr_s) <= 0.0:
+        raise ValueError("noise correlation lengths must be > 0")
+    dead_channels = _parse_int_csv(str(args.dead_channel_indices))
+    invalid_dead = [idx for idx in dead_channels if idx < 0 or idx >= int(args.n_ch)]
+    if invalid_dead:
+        raise ValueError(f"dead channel indices outside [0, {int(args.n_ch) - 1}]: {invalid_dead}")
+    if not (0.0 <= float(args.random_dead_channel_ratio) <= 1.0):
+        raise ValueError("--random-dead-channel-ratio must be in [0, 1]")
+    if int(args.random_dead_channel_min) < 0 or int(args.random_dead_channel_max) < int(args.random_dead_channel_min):
+        raise ValueError("random dead channel counts must be non-negative and ordered")
+    if not (0.0 <= float(args.zero_background_ratio) <= 1.0):
+        raise ValueError("--zero-background-ratio must be in [0, 1]")
+    if float(args.zero_background_rate) < 0.0:
+        raise ValueError("--zero-background-rate must be >= 0")
+    if int(args.zero_background_channel_min) <= 0 or int(args.zero_background_channel_max) < int(args.zero_background_channel_min):
+        raise ValueError("zero background channel widths must be positive and ordered")
+    if float(args.zero_background_duration_min_s) <= 0.0 or float(args.zero_background_duration_max_s) < float(args.zero_background_duration_min_s):
+        raise ValueError("zero background durations must be positive and ordered")
     if not (0.0 <= float(args.interaction_ratio) <= 1.0):
         raise ValueError("--interaction-ratio must be in [0, 1]")
     allowed_interactions = {"crossing", "overtake", "near_parallel"}
@@ -649,6 +822,7 @@ def main() -> int:
     window_samples = int(round(float(args.window_seconds) * float(args.fs)))
     meta = {
         "format": "track_slot_shards_v1",
+        "realism_preset": str(args.realism_preset),
         "created_at_unix": time.time(),
         "num_samples": total,
         "shard_size": shard_size,

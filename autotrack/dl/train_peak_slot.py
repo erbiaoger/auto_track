@@ -12,7 +12,9 @@ Example:
         --device cuda \
         --amp on \
         --epochs 50 \
-        --batch-size 32
+        --batch-size 32 \
+        --val-fraction 0.1 \
+        --val-every 5
 
 Outputs:
     <out-dir>/checkpoint_last.pt
@@ -80,19 +82,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--matcher", default="hungarian", choices=["hungarian", "greedy", "auction"], help="Slot-to-GT assignment.")
     parser.add_argument("--no-object-weight", type=float, default=0.15, help="Object loss weight for unmatched slots.")
     parser.add_argument("--none-weight", type=float, default=0.35, help="Peak CE weight for GT-none channel targets.")
-    parser.add_argument("--count-loss-weight", type=float, default=0.05, help="Soft count loss weight.")
+    parser.add_argument("--object-loss-weight", type=float, default=1.25, help="Overall objectness loss multiplier.")
+    parser.add_argument("--count-loss-weight", type=float, default=0.15, help="Soft count loss weight.")
     parser.add_argument("--monotonic-loss-weight", type=float, default=1.0, help="Monotonic loss weight.")
     parser.add_argument("--smoothness-loss-weight", type=float, default=0.2, help="Smoothness loss weight.")
     parser.add_argument("--time-prior-loss-weight", type=float, default=2.0, help="Time prior supervision loss weight.")
-    parser.add_argument("--visibility-prior-loss-weight", type=float, default=0.5, help="Visibility prior supervision loss weight.")
-    parser.add_argument("--slot-competition-loss-weight", type=float, default=0.1, help="Penalty for multiple slots selecting the same peaks.")
+    parser.add_argument("--visibility-prior-loss-weight", type=float, default=0.75, help="Visibility prior supervision loss weight.")
+    parser.add_argument("--slot-competition-loss-weight", type=float, default=0.15, help="Penalty for multiple slots selecting the same peaks.")
     parser.add_argument("--crossing-loss-weight", type=float, default=0.2, help="Margin loss against switching to competing peaks.")
     parser.add_argument("--physics-speed-min-kmh", type=float, default=60.0, help="Minimum speed for physics violation metrics.")
     parser.add_argument("--physics-speed-max-kmh", type=float, default=100.0, help="Maximum speed for physics violation metrics.")
-    parser.add_argument("--metric-objectness-threshold", type=float, default=0.5, help="Objectness threshold for metrics.")
+    parser.add_argument("--metric-objectness-threshold", type=float, default=0.35, help="Objectness threshold for metrics.")
     parser.add_argument("--metric-point-threshold", type=float, default=0.05, help="Normalized mean time error threshold for TP metrics.")
-    parser.add_argument("--val-fraction", type=float, default=0.0, help="Fraction of shards reserved for validation.")
-    parser.add_argument("--val-every", type=int, default=1, help="Run validation every N epochs when val shards exist.")
+    parser.add_argument("--val-data-dir", type=Path, default=None, help="Optional separate peak-slot validation dataset directory. Overrides --val-fraction when provided.")
+    parser.add_argument("--val-fraction", type=float, default=0.1, help="Fraction of shards reserved for validation.")
+    parser.add_argument("--val-every", type=int, default=5, help="Run validation every N epochs when val shards exist.")
+    parser.add_argument("--val-max-samples", type=int, default=0, help="Limit validation samples; 0 evaluates all validation samples.")
     parser.add_argument("--checkpoint-every", type=int, default=1, help="Save checkpoint every N epochs.")
     parser.add_argument("--metrics-every", type=int, default=20, help="Collect detailed metrics every N batches; 0 disables intermediate metrics.")
     parser.add_argument("--resume", type=Path, default=None, help="Checkpoint path to resume.")
@@ -101,6 +106,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42, help="Shuffle seed.")
     parser.add_argument("--grad-clip", type=float, default=1.0, help="Gradient clipping norm; <=0 disables.")
     parser.add_argument("--log-every", type=int, default=20, help="Print batch progress every N batches.")
+    parser.add_argument("--timing-every", type=int, default=5, help="Print and log epoch-level step timing every N epochs; 0 disables.")
+    parser.add_argument("--profile-steps", type=int, default=0, help="Print step timing for the first N profiled batches; 0 disables.")
+    parser.add_argument("--profile-warmup", type=int, default=2, help="Skip this many batches before printing step timing.")
     return parser.parse_args()
 
 
@@ -126,6 +134,11 @@ def _move_optimizer_state_to_device(optimizer: torch.optim.Optimizer, device: st
         for key, value in list(state.items()):
             if torch.is_tensor(value):
                 state[key] = value.to(device)
+
+
+def _sync_for_timing(device: str, enabled: bool) -> None:
+    if enabled and str(device).startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.synchronize()
 
 
 def _append_history_row(path: Path, row: dict[str, float | int | str]) -> None:
@@ -437,7 +450,16 @@ def _forward(model: PeakSlotPredictor, x: torch.Tensor, targets: dict[str, torch
     return model(x, targets["peak_time"], targets["peak_amp"], targets["peak_valid"])
 
 
-def _evaluate(model: PeakSlotPredictor, data_dir: Path, shards: list[str], device: str, args: argparse.Namespace, meta: dict) -> dict[str, float]:
+def _evaluate(
+    model: PeakSlotPredictor,
+    data_dir: Path,
+    shards: list[str],
+    device: str,
+    args: argparse.Namespace,
+    meta: dict,
+    *,
+    max_samples: int,
+) -> dict[str, float]:
     model.eval()
     metrics_items: list[dict[str, float]] = []
     with torch.no_grad():
@@ -451,7 +473,7 @@ def _evaluate(model: PeakSlotPredictor, data_dir: Path, shards: list[str], devic
             shuffle=False,
             seed=int(args.seed),
             epoch=0,
-            max_samples=int(args.max_samples),
+            max_samples=int(max_samples),
             x_transfer_dtype="float32",
             num_workers=int(args.num_workers),
             pin_memory=bool(args.pin_memory and str(device).startswith("cuda")),
@@ -466,6 +488,7 @@ def _evaluate(model: PeakSlotPredictor, data_dir: Path, shards: list[str], devic
                 no_object_weight=float(args.no_object_weight),
                 none_weight=float(args.none_weight),
                 matcher=str(args.matcher),
+                object_loss_weight=float(args.object_loss_weight),
                 count_loss_weight=float(args.count_loss_weight),
                 monotonic_loss_weight=float(args.monotonic_loss_weight),
                 smoothness_loss_weight=float(args.smoothness_loss_weight),
@@ -505,11 +528,21 @@ def main() -> int:
     args = parse_args()
     data_dir = Path(args.data_dir).expanduser()
     out_dir = Path(args.out_dir).expanduser()
+    val_data_dir = Path(args.val_data_dir).expanduser() if args.val_data_dir is not None else None
     args.data_dir = data_dir
     args.out_dir = out_dir
+    args.val_data_dir = val_data_dir
     meta = _load_meta(data_dir)
     shards = [str(item) for item in meta.get("shards", [])]
-    train_shards, val_shards = _split_shards(shards, float(args.val_fraction))
+    val_meta: dict = meta
+    if val_data_dir is not None:
+        val_meta = _load_meta(val_data_dir)
+        train_shards = shards
+        val_shards = [str(item) for item in val_meta.get("shards", [])]
+        if not val_shards:
+            raise ValueError(f"Validation dataset contains no shards: {val_data_dir}")
+    else:
+        train_shards, val_shards = _split_shards(shards, float(args.val_fraction))
     raw_device = str(args.device).strip()
     device = auto_torch_device() if raw_device in {"", "auto", "None"} else raw_device
     torch.manual_seed(int(args.seed))
@@ -574,9 +607,11 @@ def main() -> int:
         "mode": "peak_slot_shards",
         "model_family": "peak_slot",
         "data_dir": str(data_dir),
+        "val_data_dir": "" if val_data_dir is None else str(val_data_dir),
         "train_shards": train_shards,
         "val_shards": val_shards,
         "dataset_meta": meta,
+        "val_dataset_meta": val_meta if val_data_dir is not None else {},
         "dataset_config": asdict(dataset_config),
         "model_config": asdict(model_config),
         "train_args": {key: (str(value) if isinstance(value, Path) else value) for key, value in vars(args).items()},
@@ -592,6 +627,15 @@ def main() -> int:
         f"batch_size={int(args.batch_size)}, batches_per_epoch={batches_per_epoch}, peaks={model_config.peak_candidates}, "
         f"workers={int(args.num_workers)}, pin_memory={bool(args.pin_memory and str(device).startswith('cuda'))}"
     )
+    if val_shards:
+        val_source = str(val_data_dir) if val_data_dir is not None else f"{float(args.val_fraction):.3f} tail split"
+        val_limit = int(args.val_max_samples)
+        print(
+            "Validation: "
+            f"source={val_source}, val_every={int(args.val_every)}, "
+            f"val_samples={val_meta.get('num_samples')}, val_max_samples={val_limit if val_limit > 0 else 'all'}",
+            flush=True,
+        )
     print(
         "Model: "
         f"slots={model_config.max_tracks}, hidden_dim={model_config.hidden_dim}, "
@@ -630,6 +674,20 @@ def main() -> int:
         model.train()
         t0 = time.perf_counter()
         epoch_metrics: list[dict[str, float]] = []
+        timing_enabled = int(args.timing_every) > 0 and epoch % int(args.timing_every) == 0
+        timing_sums = {
+            "data_wait": 0.0,
+            "h2d": 0.0,
+            "zero_grad": 0.0,
+            "forward": 0.0,
+            "loss": 0.0,
+            "backward": 0.0,
+            "update": 0.0,
+            "metrics": 0.0,
+            "total": 0.0,
+        }
+        timing_batches = 0
+        fetch_start = time.perf_counter()
         if train_loader is None:
             batch_iter = _make_batch_iter(
                 data_dir,
@@ -653,19 +711,35 @@ def main() -> int:
             batch_iter,
             start=1,
         ):
+            profile_enabled = int(args.profile_steps) > 0 and batch_idx > int(args.profile_warmup)
+            profile_active = profile_enabled and batch_idx <= int(args.profile_warmup) + int(args.profile_steps)
+            sync_timing = bool(profile_active or timing_enabled)
+            data_wait_s = time.perf_counter() - fetch_start
+            _sync_for_timing(device, sync_timing)
+            step_t0 = time.perf_counter()
             should_log = int(args.log_every) > 0 and (batch_idx == 1 or batch_idx % int(args.log_every) == 0 or batch_idx == batches_per_epoch)
             should_collect_heavy_metrics = int(args.metrics_every) > 0 and batch_idx % int(args.metrics_every) == 0
             collect_loss_metrics = should_log or batch_idx == 1 or batch_idx == batches_per_epoch or should_collect_heavy_metrics
             x, targets = _batch_to_device(x, targets, device, channels_last=bool(args.channels_last and str(device).startswith("cuda")))
+            _sync_for_timing(device, sync_timing)
+            h2d_s = time.perf_counter() - step_t0
+            optim_t0 = time.perf_counter()
             optimizer.zero_grad(set_to_none=True)
+            _sync_for_timing(device, sync_timing)
+            zero_grad_s = time.perf_counter() - optim_t0
+            forward_t0 = time.perf_counter()
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=bool(use_amp and str(device).startswith("cuda"))):
                 outputs = _forward(model, x, targets)
+                _sync_for_timing(device, sync_timing)
+                forward_s = time.perf_counter() - forward_t0
+                loss_t0 = time.perf_counter()
                 loss, metrics = peak_slot_set_loss(
                     outputs,
                     targets,
                     no_object_weight=float(args.no_object_weight),
                     none_weight=float(args.none_weight),
                     matcher=str(args.matcher),
+                    object_loss_weight=float(args.object_loss_weight),
                     count_loss_weight=float(args.count_loss_weight),
                     monotonic_loss_weight=float(args.monotonic_loss_weight),
                     smoothness_loss_weight=float(args.smoothness_loss_weight),
@@ -675,13 +749,22 @@ def main() -> int:
                     crossing_loss_weight=float(args.crossing_loss_weight),
                     collect_metrics=bool(collect_loss_metrics),
                 )
+                _sync_for_timing(device, sync_timing)
+                loss_s = time.perf_counter() - loss_t0
+            backward_t0 = time.perf_counter()
             scaler.scale(loss).backward()
+            _sync_for_timing(device, sync_timing)
+            backward_s = time.perf_counter() - backward_t0
+            step_update_t0 = time.perf_counter()
             if float(args.grad_clip) > 0:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), float(args.grad_clip))
             scaler.step(optimizer)
             scaler.update()
+            _sync_for_timing(device, sync_timing)
+            update_s = time.perf_counter() - step_update_t0
             if metrics:
+                metrics_t0 = time.perf_counter()
                 if should_collect_heavy_metrics:
                     metrics.update(
                         peak_slot_detection_metrics(
@@ -705,7 +788,37 @@ def main() -> int:
                             dx_m=float(meta.get("dx_m", 100.0)),
                         )
                     )
+                _sync_for_timing(device, sync_timing)
+                metrics_s = time.perf_counter() - metrics_t0
                 epoch_metrics.append(metrics)
+            else:
+                metrics_s = 0.0
+            total_s = data_wait_s + h2d_s + zero_grad_s + forward_s + loss_s + backward_s + update_s + metrics_s
+            if timing_enabled:
+                timing_sums["data_wait"] += float(data_wait_s)
+                timing_sums["h2d"] += float(h2d_s)
+                timing_sums["zero_grad"] += float(zero_grad_s)
+                timing_sums["forward"] += float(forward_s)
+                timing_sums["loss"] += float(loss_s)
+                timing_sums["backward"] += float(backward_s)
+                timing_sums["update"] += float(update_s)
+                timing_sums["metrics"] += float(metrics_s)
+                timing_sums["total"] += float(total_s)
+                timing_batches += 1
+            if profile_active:
+                print(
+                    f"profile epoch={epoch:03d} batch={batch_idx:04d} "
+                    f"data_wait={data_wait_s * 1000.0:.1f}ms "
+                    f"h2d={h2d_s * 1000.0:.1f}ms "
+                    f"zero={zero_grad_s * 1000.0:.1f}ms "
+                    f"forward={forward_s * 1000.0:.1f}ms "
+                    f"loss={loss_s * 1000.0:.1f}ms "
+                    f"backward={backward_s * 1000.0:.1f}ms "
+                    f"update={update_s * 1000.0:.1f}ms "
+                    f"metrics={metrics_s * 1000.0:.1f}ms "
+                    f"total={total_s * 1000.0:.1f}ms",
+                    flush=True,
+                )
             if should_log and metrics:
                 print(
                     f"epoch={epoch:03d} batch={batch_idx:04d}/{batches_per_epoch:04d} "
@@ -718,10 +831,16 @@ def main() -> int:
                     f"spd_bad={metrics.get('speed_window_violation_rate', float('nan')):.3f}",
                     flush=True,
                 )
+            fetch_start = time.perf_counter()
         mean_metrics = _mean_metrics(epoch_metrics)
         elapsed = time.perf_counter() - t0
         mean_metrics["epoch"] = float(epoch)
         mean_metrics["elapsed_seconds"] = float(elapsed)
+        timing_metrics: dict[str, float] = {}
+        if timing_enabled and timing_batches > 0:
+            timing_metrics = {f"timing_{key}_mean_ms": 1000.0 * value / float(timing_batches) for key, value in timing_sums.items()}
+            timing_metrics.update({f"timing_{key}_total_s": float(value) for key, value in timing_sums.items()})
+            timing_metrics["timing_batches"] = float(timing_batches)
         print(
             f"epoch={epoch:03d} loss={mean_metrics.get('loss', float('nan')):.4f} "
             f"peak={mean_metrics.get('loss_peak', float('nan')):.4f} "
@@ -730,9 +849,30 @@ def main() -> int:
             f"spd_bad={mean_metrics.get('speed_window_violation_rate', float('nan')):.3f} "
             f"elapsed={elapsed:.1f}s"
         )
+        if timing_metrics:
+            print(
+                f"epoch={epoch:03d} timing mean_ms "
+                f"data={timing_metrics['timing_data_wait_mean_ms']:.1f} "
+                f"h2d={timing_metrics['timing_h2d_mean_ms']:.1f} "
+                f"forward={timing_metrics['timing_forward_mean_ms']:.1f} "
+                f"loss={timing_metrics['timing_loss_mean_ms']:.1f} "
+                f"backward={timing_metrics['timing_backward_mean_ms']:.1f} "
+                f"update={timing_metrics['timing_update_mean_ms']:.1f} "
+                f"metrics={timing_metrics['timing_metrics_mean_ms']:.1f} "
+                f"total={timing_metrics['timing_total_mean_ms']:.1f}",
+                flush=True,
+            )
         val_metrics: dict[str, float] = {}
         if val_shards and epoch % int(max(1, args.val_every)) == 0:
-            val_metrics = _evaluate(model, data_dir, val_shards, device, args, meta)
+            val_metrics = _evaluate(
+                model,
+                val_data_dir or data_dir,
+                val_shards,
+                device,
+                args,
+                val_meta,
+                max_samples=int(args.val_max_samples),
+            )
             print(
                 f"epoch={epoch:03d} val_loss={val_metrics.get('loss', float('nan')):.4f} "
                 f"val_f1={val_metrics.get('track_f1', float('nan')):.3f} "
@@ -741,6 +881,7 @@ def main() -> int:
             )
         history_row: dict[str, float | int | str] = {"epoch": int(epoch), "elapsed_seconds": float(elapsed)}
         history_row.update({f"train_{key}": float(value) for key, value in mean_metrics.items() if np.isfinite(value)})
+        history_row.update({f"train_{key}": float(value) for key, value in timing_metrics.items() if np.isfinite(value)})
         history_row.update({f"val_{key}": float(value) for key, value in val_metrics.items() if np.isfinite(value)})
         _append_history_row(out_dir / "train_history.jsonl", history_row)
         save_this_epoch = epoch % int(max(1, args.checkpoint_every)) == 0 or epoch == int(args.epochs)

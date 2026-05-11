@@ -45,7 +45,7 @@ from typing import Any, Iterable
 import numpy as np
 
 
-DEFAULT_METRICS = "loss,loss_count,track_f1,count_mae,time_mae_norm,max_objectness,mean_objectness"
+DEFAULT_METRICS = "loss,loss_count,track_f1,count_mae,time_mae_norm,track_recall_reverse,track_recall_short_visible,max_objectness,mean_objectness"
 
 
 def parse_args() -> argparse.Namespace:
