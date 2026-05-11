@@ -79,6 +79,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--line-width", type=float, default=1.15, help="GT line width.")
     parser.add_argument("--line-alpha", type=float, default=0.75, help="GT line opacity.")
     parser.add_argument("--vmax-quantile", type=float, default=0.995, help="Absolute heatmap quantile used for grayscale clipping.")
+    parser.add_argument("--plot-style", choices=["heatmap", "waveform"], default="heatmap", help="Background style: heatmap image or per-channel waveform traces.")
     return parser.parse_args()
 
 
@@ -277,6 +278,7 @@ def _plot_sample(
     line_width: float,
     line_alpha: float,
     vmax_quantile: float,
+    plot_style: str,
 ) -> tuple[int, int]:
     import matplotlib
 
@@ -292,16 +294,35 @@ def _plot_sample(
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     fig, ax = plt.subplots(figsize=(12.0, 7.0))
-    im = ax.imshow(
-        arr,
-        origin="lower",
-        aspect="auto",
-        cmap="gray_r",
-        vmin=-vmax,
-        vmax=vmax,
-        extent=(0.0, float(window_seconds), -0.5, float(n_ch) - 0.5),
-        interpolation="nearest",
-    )
+    im = None
+    style = str(plot_style).lower()
+    x_axis = np.arange(n_ch, dtype=np.float64)
+    x_label = "Channel index"
+    if style == "waveform":
+        dx_m = float(sample.get("_dx_m", 0.0))
+        if dx_m > 0.0:
+            x_axis = np.arange(n_ch, dtype=np.float64) * dx_m * 1e-3
+            x_label = "Offset [km]"
+        t_axis = np.linspace(0.0, float(window_seconds), int(arr.shape[1]), dtype=np.float64)
+        spacing = float(np.median(np.diff(x_axis))) if x_axis.size >= 2 else 1.0
+        if not np.isfinite(spacing) or spacing <= 0.0:
+            spacing = 1.0
+        wiggle_amp = 0.27 * spacing
+        scale = max(vmax, 1e-6)
+        for ch in range(n_ch):
+            ratio = np.clip(np.asarray(arr[ch], dtype=np.float64) / scale, -1.35, 1.35)
+            ax.plot(x_axis[ch] + ratio * wiggle_amp, t_axis, color="0.45", linewidth=0.8, alpha=0.9)
+    else:
+        im = ax.imshow(
+            arr,
+            origin="lower",
+            aspect="auto",
+            cmap="gray_r",
+            vmin=-vmax,
+            vmax=vmax,
+            extent=(0.0, float(window_seconds), -0.5, float(n_ch) - 0.5),
+            interpolation="nearest",
+        )
 
     if bool(plot_peaks) and "peak_time" in sample and "peak_valid" in sample:
         peak_time = sample["peak_time"].to(torch.float32)
@@ -313,7 +334,13 @@ def _plot_sample(
             peak_chs.extend([int(ch)] * len(valid))
             peak_ts.extend([float(peak_time[ch, int(idx)].item()) * float(window_seconds) for idx in valid])
         if peak_chs:
-            ax.scatter(peak_ts, peak_chs, s=5, color="#1f77b4", alpha=0.35, linewidths=0, label="Peak candidates")
+            if style == "waveform":
+                peak_xs = [float(x_axis[int(ch)]) for ch in peak_chs]
+                peak_ys = peak_ts
+            else:
+                peak_xs = peak_ts
+                peak_ys = peak_chs
+            ax.scatter(peak_xs, peak_ys, s=5, color="#1f77b4", alpha=0.35, linewidths=0, label="Peak candidates")
 
     cmap = plt.get_cmap("tab20")
     plotted_tracks = 0
@@ -325,31 +352,46 @@ def _plot_sample(
             continue
         times = [float(point["time_s"]) for point in points]
         chs = [int(point["channel"]) for point in points]
+        if style == "waveform":
+            xs = [float(x_axis[int(ch)]) for ch in chs]
+            ys = times
+        else:
+            xs = times
+            ys = chs
         color = cmap(plot_gt_id % 20)
         if len(points) >= 2:
             ax.plot(
-                times,
-                chs,
+                xs,
+                ys,
                 color=color,
                 linewidth=float(line_width),
                 alpha=float(line_alpha),
                 label="GT labels" if first_label else None,
             )
-        ax.scatter(times, chs, s=float(point_size), color=color, edgecolors="black", linewidths=0.2, alpha=0.95)
+        ax.scatter(xs, ys, s=float(point_size), color=color, edgecolors="black", linewidths=0.2, alpha=0.95)
         first_label = False
         plotted_tracks += 1
         plotted_points += len(points)
 
     fmt = "peak_slot" if "gt_peak_index" in sample else "track_slot"
     ax.set_title(f"Dataset label overlay, sample {sample_index}  format={fmt}  GT={plotted_tracks}  points={plotted_points}")
-    ax.set_xlabel("Time (s)")
-    ax.set_ylabel("Channel index")
-    ax.set_xlim(0.0, float(window_seconds))
-    ax.set_ylim(-0.5, float(n_ch) - 0.5)
+    if style == "waveform":
+        pad = 0.4 * (float(np.median(np.diff(x_axis))) if x_axis.size >= 2 else 1.0)
+        ax.set_xlabel(x_label)
+        ax.set_ylabel("Time (s)")
+        ax.set_xlim(float(x_axis[0] - pad), float(x_axis[-1] + pad))
+        ax.set_ylim(0.0, float(window_seconds))
+        ax.invert_yaxis()
+    else:
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Channel index")
+        ax.set_xlim(0.0, float(window_seconds))
+        ax.set_ylim(-0.5, float(n_ch) - 0.5)
     if plotted_tracks > 0 or (plot_peaks and "peak_time" in sample):
         ax.legend(loc="upper right", frameon=True)
-    cbar = fig.colorbar(im, ax=ax, fraction=0.025, pad=0.02)
-    cbar.set_label("Normalized heatmap amplitude")
+    if im is not None:
+        cbar = fig.colorbar(im, ax=ax, fraction=0.025, pad=0.02)
+        cbar.set_label("Normalized heatmap amplitude")
     fig.tight_layout()
     fig.savefig(out_path, dpi=int(dpi), bbox_inches="tight")
     plt.close(fig)
@@ -400,6 +442,7 @@ def main() -> int:
         writer = csv.DictWriter(fp, fieldnames=fields)
         writer.writeheader()
         for sample_index, shard_name, local_index, sample in _iter_selected_samples(data_dir, shards, selected_set):
+            sample["_dx_m"] = float(meta.get("dx_m", 0.0))
             track_count, point_count = _plot_sample(
                 plots_dir / f"sample_{int(sample_index):06d}.png",
                 sample_index=int(sample_index),
@@ -412,6 +455,7 @@ def main() -> int:
                 line_width=float(args.line_width),
                 line_alpha=float(args.line_alpha),
                 vmax_quantile=float(args.vmax_quantile),
+                plot_style=str(args.plot_style),
             )
             _write_label_rows(
                 writer,

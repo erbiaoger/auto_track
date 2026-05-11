@@ -122,7 +122,7 @@ The 120 s branch defaults generate shorter windows in separate directories:
 
 ```text
 window_seconds = 120
-vehicles_min/max = 32/48
+vehicles_min/max = 24/36
 default generated samples = 80000
 primary_ratio = 0.8333333333
 realism_preset = xi_gauss_50
@@ -139,21 +139,21 @@ samples:
 --interaction-types crossing,overtake,near_parallel
 --interaction-time-min-frac 0.05
 --interaction-time-max-frac 0.95
---noise-std 0.35
---colored-noise-std 0.18
---channel-bias-std 0.08
---channel-gain-std 0.12
---baseline-drift-std 0.10
---dead-channel-indices 5,6,15,16,22,36,38,42,45,48
---random-dead-channel-ratio 0.35
---random-dead-channel-min 1 --random-dead-channel-max 5
+--noise-std 0.0
+--colored-noise-std 0.0
+--channel-bias-std 0.0
+--channel-gain-std 0.0
+--baseline-drift-std 0.0
+--dead-channel-indices
+--random-dead-channel-ratio 0.18
+--random-dead-channel-min 1 --random-dead-channel-max 3
 --zero-background-ratio 1.0
---zero-background-rate 160
---zero-background-channel-min 1 --zero-background-channel-max 8
---zero-background-duration-min-s 2.0 --zero-background-duration-max-s 10.0
+--zero-background-rate 45
+--zero-background-channel-min 1 --zero-background-channel-max 4
+--zero-background-duration-min-s 0.8 --zero-background-duration-max-s 4.0
 --primary-ratio 0.8333333333
 --isolated-noise-ratio 1.0
---isolated-noise-rate 18
+--isolated-noise-rate 36
 --isolated-noise-amp-min 1 --isolated-noise-amp-max 6
 --isolated-noise-sigma-min 0.08 --isolated-noise-sigma-max 0.35
 ```
@@ -161,9 +161,9 @@ samples:
 The interaction time is sampled across the full window, not only the middle.
 The difficult cases include opposite-direction crossings, same-direction
 overtakes, near-parallel close tracks, and isolated Gaussian peaks that may be
-stronger than nearby vehicle peaks. Background noise is added before robust
-input normalization so the saved training tensors are no longer ideal clean
-Gaussian traces.
+stronger than nearby vehicle peaks. Missing channel-time blocks are applied
+after Gaussian windows are drawn, so they can remove both vehicle points and
+isolated Gaussian interference, matching real Gaussian-window output dropouts.
 
 ## Data Flow
 

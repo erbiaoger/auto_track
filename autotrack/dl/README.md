@@ -7,11 +7,11 @@ Deep-learning code for DAS vehicle trajectory recognition.
 - `generate_track_slot_dataset.py`: creates tensor shards for TrackSlotNet
   training. It writes `meta.json` and `shard_*.pt`; it does not write or read
   SAC files. The default motion mix is `constant_sparse,smooth_random,stop_go`
-  with rare stop-go events. Generated inputs include white noise, correlated
-  noise, channel bias/gain variation, slow baseline drift, and isolated pulse
-  interference by default. The default shell preset also adds fixed real-data
-  dead channels, random dead channels, and random zero background blocks.
-  Direction sampling keeps the expected traffic prior.
+  with rare stop-go events. The default shell preset targets Gaussian-window
+  real data: continuous background noise is off, while many isolated Gaussian
+  windows, fixed real-data dead channels, random dead channels, and missing
+  channel-time blocks are enabled. Direction sampling keeps the expected traffic
+  prior.
 - `predict_track_slot_dataset.py`: runs a trained TrackSlotNet checkpoint
   directly on generated tensor shards and writes prediction CSV, metrics, and
   heatmap overlay figures. It applies monotonic trimming and trajectory NMS by

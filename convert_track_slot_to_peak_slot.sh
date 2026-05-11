@@ -4,15 +4,15 @@ set -eu
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$SCRIPT_DIR"
 
-IN_DIR=${IN_DIR:-datasets/track_slot_v3_120s_realistic/train}
-OUT_DIR=${OUT_DIR:-datasets/peak_slot_v3_120s_realistic/train}
-PEAK_CANDIDATES_PER_CHANNEL=${PEAK_CANDIDATES_PER_CHANNEL:-64}
-PEAK_MIN_DISTANCE_S=${PEAK_MIN_DISTANCE_S:-0.5}
-PEAK_MIN_HEIGHT=${PEAK_MIN_HEIGHT:-0.02}
-PEAK_PROMINENCE=${PEAK_PROMINENCE:-0.02}
-PEAK_MATCH_TOLERANCE_S=${PEAK_MATCH_TOLERANCE_S:-0.25}
-WORKERS=${WORKERS:-32}
-OVERWRITE=${OVERWRITE:-1}
+IN_DIR=${IN_DIR:-datasets/track_slot_v3_120s_realistic/train}        # 输入 track_slot 数据目录
+OUT_DIR=${OUT_DIR:-datasets/peak_slot_v3_120s_realistic/train}       # 输出 peak_slot 数据目录
+PEAK_CANDIDATES_PER_CHANNEL=${PEAK_CANDIDATES_PER_CHANNEL:-64}       # 每道最多保留的峰候选数
+PEAK_MIN_DISTANCE_S=${PEAK_MIN_DISTANCE_S:-0.5}                      # 同一道峰候选最小间隔 s
+PEAK_MIN_HEIGHT=${PEAK_MIN_HEIGHT:-0.02}                             # 峰候选最小高度阈值
+PEAK_PROMINENCE=${PEAK_PROMINENCE:-0.02}                             # 峰候选最小显著性阈值
+PEAK_MATCH_TOLERANCE_S=${PEAK_MATCH_TOLERANCE_S:-0.25}               # GT 与候选峰匹配容差 s
+WORKERS=${WORKERS:-32}                                               # 转换并行 worker 数
+OVERWRITE=${OVERWRITE:-1}                                            # 是否覆盖已有输出目录
 
 overwrite_args=""
 if [ "$OVERWRITE" = "1" ] || [ "$OVERWRITE" = "true" ]; then

@@ -87,23 +87,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stop-response-amp-scale", type=float, default=1.2, help="Gaussian amplitude multiplier near a stop event.")
     parser.add_argument("--restart-speed-ratio-min", type=float, default=0.95, help="Minimum restart speed ratio after a stop.")
     parser.add_argument("--restart-speed-ratio-max", type=float, default=1.05, help="Maximum restart speed ratio after a stop.")
-    parser.add_argument("--noise-std", type=float, default=0.35, help="White Gaussian noise std added to the downsampled heatmap before normalization.")
-    parser.add_argument("--colored-noise-std", type=float, default=0.18, help="Low-frequency correlated noise std added to each channel.")
+    parser.add_argument("--noise-std", type=float, default=0.0, help="Optional white noise std; keep 0 for pre-Gaussian-window real data.")
+    parser.add_argument("--colored-noise-std", type=float, default=0.0, help="Optional low-frequency noise std; keep 0 for pre-Gaussian-window real data.")
     parser.add_argument("--colored-noise-corr-s", type=float, default=0.8, help="Approximate time correlation length in seconds for colored noise.")
-    parser.add_argument("--channel-bias-std", type=float, default=0.08, help="Per-channel constant baseline offset std.")
-    parser.add_argument("--channel-gain-std", type=float, default=0.12, help="Per-channel multiplicative gain variation std applied to the final heatmap.")
-    parser.add_argument("--baseline-drift-std", type=float, default=0.10, help="Slow baseline drift std added per channel.")
+    parser.add_argument("--channel-bias-std", type=float, default=0.0, help="Optional per-channel baseline offset std; keep 0 for pre-Gaussian-window real data.")
+    parser.add_argument("--channel-gain-std", type=float, default=0.0, help="Optional per-channel multiplicative gain variation std applied to the final heatmap.")
+    parser.add_argument("--baseline-drift-std", type=float, default=0.0, help="Optional slow baseline drift std; keep 0 for pre-Gaussian-window real data.")
     parser.add_argument("--baseline-drift-corr-s", type=float, default=6.0, help="Approximate time correlation length in seconds for baseline drift.")
     parser.add_argument("--dead-channel-indices", default="", help="Comma-separated channel indices that are always completely zeroed.")
     parser.add_argument("--random-dead-channel-ratio", type=float, default=0.0, help="Fraction of samples with extra random completely zeroed channels.")
     parser.add_argument("--random-dead-channel-min", type=int, default=1, help="Minimum extra random dead channels when enabled.")
     parser.add_argument("--random-dead-channel-max", type=int, default=5, help="Maximum extra random dead channels when enabled.")
-    parser.add_argument("--zero-background-ratio", type=float, default=0.0, help="Fraction of samples with random channel-time zero background blocks before vehicle pulses.")
-    parser.add_argument("--zero-background-rate", type=float, default=12.0, help="Expected random zero background blocks when enabled.")
-    parser.add_argument("--zero-background-channel-min", type=int, default=1, help="Minimum channels per zero background block.")
-    parser.add_argument("--zero-background-channel-max", type=int, default=4, help="Maximum channels per zero background block.")
-    parser.add_argument("--zero-background-duration-min-s", type=float, default=0.5, help="Minimum zero background block duration.")
-    parser.add_argument("--zero-background-duration-max-s", type=float, default=4.0, help="Maximum zero background block duration.")
+    parser.add_argument("--zero-background-ratio", type=float, default=0.0, help="Fraction of samples with random missing channel-time blocks after Gaussian windows are drawn.")
+    parser.add_argument("--zero-background-rate", type=float, default=12.0, help="Expected random missing channel-time blocks when enabled.")
+    parser.add_argument("--zero-background-channel-min", type=int, default=1, help="Minimum channels per missing block.")
+    parser.add_argument("--zero-background-channel-max", type=int, default=4, help="Maximum channels per missing block.")
+    parser.add_argument("--zero-background-duration-min-s", type=float, default=0.5, help="Minimum missing block duration.")
+    parser.add_argument("--zero-background-duration-max-s", type=float, default=4.0, help="Maximum missing block duration.")
     parser.add_argument("--amp-min", type=float, default=6.0, help="Minimum Gaussian pulse amplitude.")
     parser.add_argument("--amp-max", type=float, default=6.0, help="Maximum Gaussian pulse amplitude.")
     parser.add_argument("--sigma-min-s", type=float, default=0.25, help="Minimum Gaussian sigma in seconds.")
@@ -114,7 +114,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--interaction-time-min-frac", type=float, default=0.05, help="Earliest interaction time as window fraction.")
     parser.add_argument("--interaction-time-max-frac", type=float, default=0.95, help="Latest interaction time as window fraction.")
     parser.add_argument("--isolated-noise-ratio", type=float, default=1.0, help="Fraction of samples with isolated Gaussian noise peaks.")
-    parser.add_argument("--isolated-noise-rate", type=float, default=18.0, help="Expected isolated Gaussian noise peaks when enabled.")
+    parser.add_argument("--isolated-noise-rate", type=float, default=120.0, help="Expected isolated Gaussian noise windows when enabled.")
     parser.add_argument("--isolated-noise-amp-min", type=float, default=1.0, help="Minimum isolated Gaussian noise amplitude.")
     parser.add_argument("--isolated-noise-amp-max", type=float, default=6.0, help="Maximum isolated Gaussian noise amplitude.")
     parser.add_argument(
@@ -531,7 +531,14 @@ def _apply_dead_channels(
     gt_valid &= visible_counts >= int(min_visible_channels)
 
 
-def _add_zero_background_blocks(args: argparse.Namespace, gen: torch.Generator, data_ds: torch.Tensor) -> None:
+def _apply_missing_blocks(
+    args: argparse.Namespace,
+    gen: torch.Generator,
+    data_ds: torch.Tensor,
+    time_label: torch.Tensor,
+    visibility: torch.Tensor,
+    gt_valid: torch.Tensor,
+) -> None:
     if float(args.zero_background_ratio) <= 0.0:
         return
     if torch.rand((), generator=gen).item() >= float(args.zero_background_ratio):
@@ -555,7 +562,20 @@ def _add_zero_background_blocks(args: argparse.Namespace, gen: torch.Generator, 
         width_t = int(max(1, round(duration_s * float(args.fs) / float(max(1, args.time_downsample)))))
         width_t = max(1, min(width_t, t_down))
         start_t = int(torch.randint(0, max(1, t_down - width_t + 1), (1,), generator=gen).item())
-        data_ds[start_ch : start_ch + width_ch, start_t : start_t + width_t] = 0.0
+        end_ch = start_ch + width_ch
+        end_t = start_t + width_t
+        data_ds[start_ch:end_ch, start_t:end_t] = 0.0
+        channels = torch.arange(start_ch, end_ch, dtype=torch.long)
+        if channels.numel() <= 0 or visibility.numel() <= 0:
+            continue
+        t_down_idx = torch.round(
+            time_label[:, channels] * float(max(1, int(data_ds.shape[1]) - 1))
+        ).to(torch.long)
+        missing = (t_down_idx >= int(start_t)) & (t_down_idx < int(end_t)) & (visibility[:, channels] > 0.5)
+        if bool(missing.any().item()):
+            visibility[:, channels] = torch.where(missing, torch.zeros_like(visibility[:, channels]), visibility[:, channels])
+    if visibility.numel() > 0:
+        gt_valid &= visibility.sum(dim=1) >= int(args.min_visible_channels)
 
 
 def _generate_one(args: argparse.Namespace, index: int) -> dict[str, torch.Tensor]:
@@ -568,7 +588,6 @@ def _generate_one(args: argparse.Namespace, index: int) -> dict[str, torch.Tenso
     t_axis_s = torch.arange(t_down, dtype=torch.float32) * (float(time_downsample) / float(args.fs))
     data_ds = torch.zeros((n_ch, t_down), dtype=torch.float32)
     _add_background_noise(args, gen, data_ds)
-    _add_zero_background_blocks(args, gen, data_ds)
 
     max_gt = int(max(args.vehicles_min, args.vehicles_max))
     time_label = torch.zeros((max_gt, n_ch), dtype=torch.float32)
@@ -646,6 +665,7 @@ def _generate_one(args: argparse.Namespace, index: int) -> dict[str, torch.Tenso
 
     if float(args.isolated_noise_ratio) > 0.0 and torch.rand((), generator=gen).item() < float(args.isolated_noise_ratio):
         _add_isolated_noise(args, gen, data_ds, t_axis_s)
+    _apply_missing_blocks(args, gen, data_ds, time_label, visibility, gt_valid)
     _apply_channel_gain(args, gen, data_ds)
     _apply_dead_channels(
         data_ds,
