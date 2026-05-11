@@ -32,6 +32,9 @@ NUM_WORKERS=${NUM_WORKERS:-16}                                        # DataLoad
 PIN_MEMORY=${PIN_MEMORY:-1}                                           # 是否开启 pin memory
 PERSISTENT_WORKERS=${PERSISTENT_WORKERS:-1}                           # 是否复用 DataLoader worker
 PREFETCH_FACTOR=${PREFETCH_FACTOR:-4}                                 # DataLoader 预取倍数
+WORKER_SHARD_CACHE_SIZE=${WORKER_SHARD_CACHE_SIZE:-2}                 # 每个 DataLoader worker 最多缓存多少个 shard，避免内存随 epoch 增长
+MULTIPROCESSING_CONTEXT=${MULTIPROCESSING_CONTEXT:-auto}              # DataLoader worker 启动方式；Unix 下 auto 默认 fork
+DATALOADER_TIMEOUT=${DATALOADER_TIMEOUT:-120}                         # DataLoader 卡住多久后报错，0 表示不超时
 LR=${LR:-0.0002}                                                      # 学习率
 WEIGHT_DECAY=${WEIGHT_DECAY:-0.0001}                                  # 权重衰减
 MAX_TRACKS=${MAX_TRACKS:-96}                                          # 模型最大 slot 数
@@ -87,6 +90,7 @@ if [ -n "$VAL_DATA_DIR" ]; then
 fi
 
 loader_args="--num-workers $NUM_WORKERS --prefetch-factor $PREFETCH_FACTOR"
+loader_args="$loader_args --worker-shard-cache-size $WORKER_SHARD_CACHE_SIZE --multiprocessing-context $MULTIPROCESSING_CONTEXT --dataloader-timeout $DATALOADER_TIMEOUT"
 if [ "$PIN_MEMORY" = "1" ] || [ "$PIN_MEMORY" = "true" ]; then
   loader_args="$loader_args --pin-memory"
 fi

@@ -30,6 +30,7 @@ import json
 import math
 import os
 import time
+from collections import OrderedDict
 from dataclasses import asdict
 from pathlib import Path
 from typing import Iterator, Optional
@@ -60,6 +61,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pin-memory", action="store_true", help="Use pinned CPU memory for CUDA input transfer.")
     parser.add_argument("--persistent-workers", action="store_true", help="Keep DataLoader workers alive between epochs.")
     parser.add_argument("--prefetch-factor", type=int, default=2, help="DataLoader prefetch factor when num-workers > 0.")
+    parser.add_argument("--worker-shard-cache-size", type=int, default=2, help="Maximum loaded shards kept in each DataLoader worker; <=0 disables caching.")
+    parser.add_argument(
+        "--multiprocessing-context",
+        default="auto",
+        choices=["auto", "fork", "spawn", "forkserver"],
+        help="DataLoader worker start method. auto uses fork on Unix when available.",
+    )
+    parser.add_argument("--dataloader-timeout", type=float, default=0.0, help="Seconds before DataLoader raises when a worker stalls; 0 disables.")
     parser.add_argument("--lr", type=float, default=2e-4, help="AdamW learning rate.")
     parser.add_argument("--weight-decay", type=float, default=1e-4, help="AdamW weight decay.")
     parser.add_argument("--max-tracks", type=int, default=96, help="Output slots Q.")
@@ -228,10 +237,12 @@ class PeakSlotShardDataset(Dataset):
         shards: list[str],
         max_samples: int,
         x_transfer_dtype: str,
+        worker_shard_cache_size: int,
     ):
         self.data_dir = Path(data_dir)
         self.x_transfer_dtype = str(x_transfer_dtype)
-        self._cache: dict[str, dict[str, torch.Tensor]] = {}
+        self.worker_shard_cache_size = int(worker_shard_cache_size)
+        self._cache: OrderedDict[str, dict[str, torch.Tensor]] = OrderedDict()
         refs: list[tuple[str, int]] = []
         limit = int(max_samples)
         for shard in shards:
@@ -249,9 +260,14 @@ class PeakSlotShardDataset(Dataset):
 
     def _payload(self, shard: str) -> dict[str, torch.Tensor]:
         payload = self._cache.get(shard)
-        if payload is None:
-            payload = torch.load(str(self.data_dir / shard), map_location="cpu", weights_only=False)
+        if payload is not None:
+            self._cache.move_to_end(shard)
+            return payload
+        payload = torch.load(str(self.data_dir / shard), map_location="cpu", weights_only=False)
+        if self.worker_shard_cache_size > 0:
             self._cache[shard] = payload
+            while len(self._cache) > self.worker_shard_cache_size:
+                self._cache.popitem(last=False)
         return payload
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
@@ -289,6 +305,12 @@ def _shutdown_dataloader(loader: Optional[DataLoader]) -> None:
     if loader is None:
         return
     iterator = getattr(loader, "_iterator", None)
+    _shutdown_dataloader_iterator(iterator)
+
+
+def _shutdown_dataloader_iterator(iterator: object) -> None:
+    if iterator is None:
+        return
     shutdown = getattr(iterator, "_shutdown_workers", None)
     if callable(shutdown):
         shutdown()
@@ -310,6 +332,9 @@ def _make_batch_iter(
     pin_memory: bool,
     persistent_workers: bool,
     prefetch_factor: int,
+    multiprocessing_context: str,
+    dataloader_timeout: float,
+    worker_shard_cache_size: int,
 ) -> Iterator[tuple[torch.Tensor, dict[str, torch.Tensor]]]:
     if int(num_workers) <= 0:
         return _iter_batches(
@@ -337,8 +362,18 @@ def _make_batch_iter(
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
         prefetch_factor=prefetch_factor,
+        multiprocessing_context=str(multiprocessing_context),
+        dataloader_timeout=float(dataloader_timeout),
+        worker_shard_cache_size=int(worker_shard_cache_size),
     )
     return iter(loader)
+
+
+def _resolve_multiprocessing_context(requested: str, *, device: str) -> str:
+    requested = str(requested).strip().lower()
+    if requested != "auto":
+        return requested
+    return "fork" if hasattr(os, "fork") else "spawn"
 
 
 def _make_dataloader(
@@ -357,6 +392,9 @@ def _make_dataloader(
     pin_memory: bool,
     persistent_workers: bool,
     prefetch_factor: int,
+    multiprocessing_context: str,
+    dataloader_timeout: float,
+    worker_shard_cache_size: int,
 ) -> DataLoader:
     dataset = PeakSlotShardDataset(
         data_dir,
@@ -365,6 +403,7 @@ def _make_dataloader(
         shards=shards,
         max_samples=int(max_samples),
         x_transfer_dtype=str(x_transfer_dtype),
+        worker_shard_cache_size=int(worker_shard_cache_size),
     )
     generator = torch.Generator(device="cpu")
     generator.manual_seed(int(seed) + int(epoch) * 97_531)
@@ -379,9 +418,10 @@ def _make_dataloader(
         "collate_fn": _collate_peak_slot_batch,
         "worker_init_fn": _seed_worker,
         "generator": generator,
+        "timeout": max(0.0, float(dataloader_timeout)),
     }
-    if hasattr(os, "fork"):
-        loader_kwargs["multiprocessing_context"] = "fork"
+    if int(num_workers) > 0:
+        loader_kwargs["multiprocessing_context"] = str(multiprocessing_context)
     return DataLoader(**loader_kwargs)
 
 
@@ -464,7 +504,7 @@ def _evaluate(
     metrics_items: list[dict[str, float]] = []
     with torch.no_grad():
         all_shards = [str(item) for item in meta.get("shards", [])]
-        for x, targets in _make_batch_iter(
+        batch_iter = _make_batch_iter(
             data_dir,
             meta=meta,
             all_shards=all_shards,
@@ -479,48 +519,55 @@ def _evaluate(
             pin_memory=bool(args.pin_memory and str(device).startswith("cuda")),
             persistent_workers=bool(args.persistent_workers and int(args.num_workers) > 0),
             prefetch_factor=int(args.prefetch_factor),
-        ):
-            x, targets = _batch_to_device(x, targets, device, channels_last=bool(args.channels_last and str(device).startswith("cuda")))
-            outputs = _forward(model, x, targets)
-            _, metrics = peak_slot_set_loss(
-                outputs,
-                targets,
-                no_object_weight=float(args.no_object_weight),
-                none_weight=float(args.none_weight),
-                matcher=str(args.matcher),
-                object_loss_weight=float(args.object_loss_weight),
-                count_loss_weight=float(args.count_loss_weight),
-                monotonic_loss_weight=float(args.monotonic_loss_weight),
-                smoothness_loss_weight=float(args.smoothness_loss_weight),
-                time_prior_loss_weight=float(args.time_prior_loss_weight),
-                visibility_prior_loss_weight=float(args.visibility_prior_loss_weight),
-                slot_competition_loss_weight=float(args.slot_competition_loss_weight),
-                crossing_loss_weight=float(args.crossing_loss_weight),
-                collect_metrics=True,
-            )
-            metrics.update(
-                peak_slot_detection_metrics(
+            multiprocessing_context=str(args.multiprocessing_context),
+            dataloader_timeout=float(args.dataloader_timeout),
+            worker_shard_cache_size=int(args.worker_shard_cache_size),
+        )
+        try:
+            for x, targets in batch_iter:
+                x, targets = _batch_to_device(x, targets, device, channels_last=bool(args.channels_last and str(device).startswith("cuda")))
+                outputs = _forward(model, x, targets)
+                _, metrics = peak_slot_set_loss(
                     outputs,
                     targets,
-                    objectness_threshold=float(args.metric_objectness_threshold),
-                    point_threshold=float(args.metric_point_threshold),
+                    no_object_weight=float(args.no_object_weight),
+                    none_weight=float(args.none_weight),
                     matcher=str(args.matcher),
+                    object_loss_weight=float(args.object_loss_weight),
+                    count_loss_weight=float(args.count_loss_weight),
+                    monotonic_loss_weight=float(args.monotonic_loss_weight),
+                    smoothness_loss_weight=float(args.smoothness_loss_weight),
+                    time_prior_loss_weight=float(args.time_prior_loss_weight),
+                    visibility_prior_loss_weight=float(args.visibility_prior_loss_weight),
+                    slot_competition_loss_weight=float(args.slot_competition_loss_weight),
+                    crossing_loss_weight=float(args.crossing_loss_weight),
+                    collect_metrics=True,
                 )
-            )
-            metrics.update(
-                peak_slot_physics_metrics(
-                    outputs,
-                    targets,
-                    objectness_threshold=float(args.metric_objectness_threshold),
-                    peak_threshold=0.4,
-                    speed_min_kmh=float(args.physics_speed_min_kmh),
-                    speed_max_kmh=float(args.physics_speed_max_kmh),
-                    time_downsample=int(meta.get("time_downsample", 10)),
-                    fs=float(meta.get("fs", 1000.0)),
-                    dx_m=float(meta.get("dx_m", 100.0)),
+                metrics.update(
+                    peak_slot_detection_metrics(
+                        outputs,
+                        targets,
+                        objectness_threshold=float(args.metric_objectness_threshold),
+                        point_threshold=float(args.metric_point_threshold),
+                        matcher=str(args.matcher),
+                    )
                 )
-            )
-            metrics_items.append(metrics)
+                metrics.update(
+                    peak_slot_physics_metrics(
+                        outputs,
+                        targets,
+                        objectness_threshold=float(args.metric_objectness_threshold),
+                        peak_threshold=0.4,
+                        speed_min_kmh=float(args.physics_speed_min_kmh),
+                        speed_max_kmh=float(args.physics_speed_max_kmh),
+                        time_downsample=int(meta.get("time_downsample", 10)),
+                        fs=float(meta.get("fs", 1000.0)),
+                        dx_m=float(meta.get("dx_m", 100.0)),
+                    )
+                )
+                metrics_items.append(metrics)
+        finally:
+            _shutdown_dataloader_iterator(batch_iter)
     return _mean_metrics(metrics_items)
 
 
@@ -601,6 +648,8 @@ def main() -> int:
     use_amp = (str(args.amp) == "on") or (str(args.amp) == "auto" and str(device).startswith("cuda"))
     amp_dtype = torch.float16 if str(args.amp_dtype) == "float16" else torch.bfloat16
     x_transfer_dtype = _resolve_x_transfer_dtype(args, device=device, use_amp=bool(use_amp))
+    multiprocessing_context = _resolve_multiprocessing_context(str(args.multiprocessing_context), device=device)
+    args.multiprocessing_context = multiprocessing_context
     scaler = torch.amp.GradScaler("cuda", enabled=bool(use_amp and str(device).startswith("cuda") and amp_dtype == torch.float16))
     out_dir.mkdir(parents=True, exist_ok=True)
     config_payload = {
@@ -625,7 +674,9 @@ def main() -> int:
         "Dataset: "
         f"samples={meta.get('num_samples')}, train_shards={len(train_shards)}, val_shards={len(val_shards)}, "
         f"batch_size={int(args.batch_size)}, batches_per_epoch={batches_per_epoch}, peaks={model_config.peak_candidates}, "
-        f"workers={int(args.num_workers)}, pin_memory={bool(args.pin_memory and str(device).startswith('cuda'))}"
+        f"workers={int(args.num_workers)}, pin_memory={bool(args.pin_memory and str(device).startswith('cuda'))}, "
+        f"mp_context={multiprocessing_context}, dataloader_timeout={float(args.dataloader_timeout):.1f}s, "
+        f"worker_shard_cache_size={int(args.worker_shard_cache_size)}"
     )
     if val_shards:
         val_source = str(val_data_dir) if val_data_dir is not None else f"{float(args.val_fraction):.3f} tail split"
@@ -668,6 +719,9 @@ def main() -> int:
             pin_memory=bool(args.pin_memory and str(device).startswith("cuda")),
             persistent_workers=bool(args.persistent_workers),
             prefetch_factor=int(args.prefetch_factor),
+            multiprocessing_context=str(multiprocessing_context),
+            dataloader_timeout=float(args.dataloader_timeout),
+            worker_shard_cache_size=int(args.worker_shard_cache_size),
         )
 
     for epoch in range(start_epoch, int(args.epochs) + 1):
@@ -688,6 +742,7 @@ def main() -> int:
         }
         timing_batches = 0
         fetch_start = time.perf_counter()
+        print(f"Starting epoch={epoch:03d}; waiting for first batch...", flush=True)
         if train_loader is None:
             batch_iter = _make_batch_iter(
                 data_dir,
@@ -704,134 +759,138 @@ def main() -> int:
                 pin_memory=False,
                 persistent_workers=False,
                 prefetch_factor=int(args.prefetch_factor),
+                multiprocessing_context=str(multiprocessing_context),
+                dataloader_timeout=float(args.dataloader_timeout),
+                worker_shard_cache_size=int(args.worker_shard_cache_size),
             )
         else:
             batch_iter = iter(train_loader)
-        for batch_idx, (x, targets) in enumerate(
-            batch_iter,
-            start=1,
-        ):
-            profile_enabled = int(args.profile_steps) > 0 and batch_idx > int(args.profile_warmup)
-            profile_active = profile_enabled and batch_idx <= int(args.profile_warmup) + int(args.profile_steps)
-            sync_timing = bool(profile_active or timing_enabled)
-            data_wait_s = time.perf_counter() - fetch_start
-            _sync_for_timing(device, sync_timing)
-            step_t0 = time.perf_counter()
-            should_log = int(args.log_every) > 0 and (batch_idx == 1 or batch_idx % int(args.log_every) == 0 or batch_idx == batches_per_epoch)
-            should_collect_heavy_metrics = int(args.metrics_every) > 0 and batch_idx % int(args.metrics_every) == 0
-            collect_loss_metrics = should_log or batch_idx == 1 or batch_idx == batches_per_epoch or should_collect_heavy_metrics
-            x, targets = _batch_to_device(x, targets, device, channels_last=bool(args.channels_last and str(device).startswith("cuda")))
-            _sync_for_timing(device, sync_timing)
-            h2d_s = time.perf_counter() - step_t0
-            optim_t0 = time.perf_counter()
-            optimizer.zero_grad(set_to_none=True)
-            _sync_for_timing(device, sync_timing)
-            zero_grad_s = time.perf_counter() - optim_t0
-            forward_t0 = time.perf_counter()
-            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=bool(use_amp and str(device).startswith("cuda"))):
-                outputs = _forward(model, x, targets)
+        try:
+            for batch_idx, (x, targets) in enumerate(batch_iter, start=1):
+                profile_enabled = int(args.profile_steps) > 0 and batch_idx > int(args.profile_warmup)
+                profile_active = profile_enabled and batch_idx <= int(args.profile_warmup) + int(args.profile_steps)
+                sync_timing = bool(profile_active or timing_enabled)
+                data_wait_s = time.perf_counter() - fetch_start
                 _sync_for_timing(device, sync_timing)
-                forward_s = time.perf_counter() - forward_t0
-                loss_t0 = time.perf_counter()
-                loss, metrics = peak_slot_set_loss(
-                    outputs,
-                    targets,
-                    no_object_weight=float(args.no_object_weight),
-                    none_weight=float(args.none_weight),
-                    matcher=str(args.matcher),
-                    object_loss_weight=float(args.object_loss_weight),
-                    count_loss_weight=float(args.count_loss_weight),
-                    monotonic_loss_weight=float(args.monotonic_loss_weight),
-                    smoothness_loss_weight=float(args.smoothness_loss_weight),
-                    time_prior_loss_weight=float(args.time_prior_loss_weight),
-                    visibility_prior_loss_weight=float(args.visibility_prior_loss_weight),
-                    slot_competition_loss_weight=float(args.slot_competition_loss_weight),
-                    crossing_loss_weight=float(args.crossing_loss_weight),
-                    collect_metrics=bool(collect_loss_metrics),
-                )
+                step_t0 = time.perf_counter()
+                should_log = int(args.log_every) > 0 and (batch_idx == 1 or batch_idx % int(args.log_every) == 0 or batch_idx == batches_per_epoch)
+                should_collect_heavy_metrics = int(args.metrics_every) > 0 and batch_idx % int(args.metrics_every) == 0
+                collect_loss_metrics = should_log or batch_idx == 1 or batch_idx == batches_per_epoch or should_collect_heavy_metrics
+                x, targets = _batch_to_device(x, targets, device, channels_last=bool(args.channels_last and str(device).startswith("cuda")))
                 _sync_for_timing(device, sync_timing)
-                loss_s = time.perf_counter() - loss_t0
-            backward_t0 = time.perf_counter()
-            scaler.scale(loss).backward()
-            _sync_for_timing(device, sync_timing)
-            backward_s = time.perf_counter() - backward_t0
-            step_update_t0 = time.perf_counter()
-            if float(args.grad_clip) > 0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), float(args.grad_clip))
-            scaler.step(optimizer)
-            scaler.update()
-            _sync_for_timing(device, sync_timing)
-            update_s = time.perf_counter() - step_update_t0
-            if metrics:
-                metrics_t0 = time.perf_counter()
-                if should_collect_heavy_metrics:
-                    metrics.update(
-                        peak_slot_detection_metrics(
-                            outputs,
-                            targets,
-                            objectness_threshold=float(args.metric_objectness_threshold),
-                            point_threshold=float(args.metric_point_threshold),
-                            matcher=str(args.matcher),
-                        )
+                h2d_s = time.perf_counter() - step_t0
+                optim_t0 = time.perf_counter()
+                optimizer.zero_grad(set_to_none=True)
+                _sync_for_timing(device, sync_timing)
+                zero_grad_s = time.perf_counter() - optim_t0
+                forward_t0 = time.perf_counter()
+                with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=bool(use_amp and str(device).startswith("cuda"))):
+                    outputs = _forward(model, x, targets)
+                    _sync_for_timing(device, sync_timing)
+                    forward_s = time.perf_counter() - forward_t0
+                    loss_t0 = time.perf_counter()
+                    loss, metrics = peak_slot_set_loss(
+                        outputs,
+                        targets,
+                        no_object_weight=float(args.no_object_weight),
+                        none_weight=float(args.none_weight),
+                        matcher=str(args.matcher),
+                        object_loss_weight=float(args.object_loss_weight),
+                        count_loss_weight=float(args.count_loss_weight),
+                        monotonic_loss_weight=float(args.monotonic_loss_weight),
+                        smoothness_loss_weight=float(args.smoothness_loss_weight),
+                        time_prior_loss_weight=float(args.time_prior_loss_weight),
+                        visibility_prior_loss_weight=float(args.visibility_prior_loss_weight),
+                        slot_competition_loss_weight=float(args.slot_competition_loss_weight),
+                        crossing_loss_weight=float(args.crossing_loss_weight),
+                        collect_metrics=bool(collect_loss_metrics),
                     )
-                    metrics.update(
-                        peak_slot_physics_metrics(
-                            outputs,
-                            targets,
-                            objectness_threshold=float(args.metric_objectness_threshold),
-                            peak_threshold=0.4,
-                            speed_min_kmh=float(args.physics_speed_min_kmh),
-                            speed_max_kmh=float(args.physics_speed_max_kmh),
-                            time_downsample=int(meta.get("time_downsample", 10)),
-                            fs=float(meta.get("fs", 1000.0)),
-                            dx_m=float(meta.get("dx_m", 100.0)),
-                        )
-                    )
+                    _sync_for_timing(device, sync_timing)
+                    loss_s = time.perf_counter() - loss_t0
+                backward_t0 = time.perf_counter()
+                scaler.scale(loss).backward()
                 _sync_for_timing(device, sync_timing)
-                metrics_s = time.perf_counter() - metrics_t0
-                epoch_metrics.append(metrics)
-            else:
-                metrics_s = 0.0
-            total_s = data_wait_s + h2d_s + zero_grad_s + forward_s + loss_s + backward_s + update_s + metrics_s
-            if timing_enabled:
-                timing_sums["data_wait"] += float(data_wait_s)
-                timing_sums["h2d"] += float(h2d_s)
-                timing_sums["zero_grad"] += float(zero_grad_s)
-                timing_sums["forward"] += float(forward_s)
-                timing_sums["loss"] += float(loss_s)
-                timing_sums["backward"] += float(backward_s)
-                timing_sums["update"] += float(update_s)
-                timing_sums["metrics"] += float(metrics_s)
-                timing_sums["total"] += float(total_s)
-                timing_batches += 1
-            if profile_active:
-                print(
-                    f"profile epoch={epoch:03d} batch={batch_idx:04d} "
-                    f"data_wait={data_wait_s * 1000.0:.1f}ms "
-                    f"h2d={h2d_s * 1000.0:.1f}ms "
-                    f"zero={zero_grad_s * 1000.0:.1f}ms "
-                    f"forward={forward_s * 1000.0:.1f}ms "
-                    f"loss={loss_s * 1000.0:.1f}ms "
-                    f"backward={backward_s * 1000.0:.1f}ms "
-                    f"update={update_s * 1000.0:.1f}ms "
-                    f"metrics={metrics_s * 1000.0:.1f}ms "
-                    f"total={total_s * 1000.0:.1f}ms",
-                    flush=True,
-                )
-            if should_log and metrics:
-                print(
-                    f"epoch={epoch:03d} batch={batch_idx:04d}/{batches_per_epoch:04d} "
-                    f"loss={metrics.get('loss', float('nan')):.4f} "
-                    f"peak={metrics.get('loss_peak', float('nan')):.4f} "
-                    f"obj={metrics.get('loss_obj', float('nan')):.4f} "
-                    f"cnt_loss={metrics.get('loss_count', float('nan')):.2f} "
-                    f"f1={metrics.get('track_f1', float('nan')):.3f} "
-                    f"cnt_mae={metrics.get('count_mae', float('nan')):.2f} "
-                    f"spd_bad={metrics.get('speed_window_violation_rate', float('nan')):.3f}",
-                    flush=True,
-                )
-            fetch_start = time.perf_counter()
+                backward_s = time.perf_counter() - backward_t0
+                step_update_t0 = time.perf_counter()
+                if float(args.grad_clip) > 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), float(args.grad_clip))
+                scaler.step(optimizer)
+                scaler.update()
+                _sync_for_timing(device, sync_timing)
+                update_s = time.perf_counter() - step_update_t0
+                if metrics:
+                    metrics_t0 = time.perf_counter()
+                    if should_collect_heavy_metrics:
+                        metrics.update(
+                            peak_slot_detection_metrics(
+                                outputs,
+                                targets,
+                                objectness_threshold=float(args.metric_objectness_threshold),
+                                point_threshold=float(args.metric_point_threshold),
+                                matcher=str(args.matcher),
+                            )
+                        )
+                        metrics.update(
+                            peak_slot_physics_metrics(
+                                outputs,
+                                targets,
+                                objectness_threshold=float(args.metric_objectness_threshold),
+                                peak_threshold=0.4,
+                                speed_min_kmh=float(args.physics_speed_min_kmh),
+                                speed_max_kmh=float(args.physics_speed_max_kmh),
+                                time_downsample=int(meta.get("time_downsample", 10)),
+                                fs=float(meta.get("fs", 1000.0)),
+                                dx_m=float(meta.get("dx_m", 100.0)),
+                            )
+                        )
+                    _sync_for_timing(device, sync_timing)
+                    metrics_s = time.perf_counter() - metrics_t0
+                    epoch_metrics.append(metrics)
+                else:
+                    metrics_s = 0.0
+                total_s = data_wait_s + h2d_s + zero_grad_s + forward_s + loss_s + backward_s + update_s + metrics_s
+                if timing_enabled:
+                    timing_sums["data_wait"] += float(data_wait_s)
+                    timing_sums["h2d"] += float(h2d_s)
+                    timing_sums["zero_grad"] += float(zero_grad_s)
+                    timing_sums["forward"] += float(forward_s)
+                    timing_sums["loss"] += float(loss_s)
+                    timing_sums["backward"] += float(backward_s)
+                    timing_sums["update"] += float(update_s)
+                    timing_sums["metrics"] += float(metrics_s)
+                    timing_sums["total"] += float(total_s)
+                    timing_batches += 1
+                if profile_active:
+                    print(
+                        f"profile epoch={epoch:03d} batch={batch_idx:04d} "
+                        f"data_wait={data_wait_s * 1000.0:.1f}ms "
+                        f"h2d={h2d_s * 1000.0:.1f}ms "
+                        f"zero={zero_grad_s * 1000.0:.1f}ms "
+                        f"forward={forward_s * 1000.0:.1f}ms "
+                        f"loss={loss_s * 1000.0:.1f}ms "
+                        f"backward={backward_s * 1000.0:.1f}ms "
+                        f"update={update_s * 1000.0:.1f}ms "
+                        f"metrics={metrics_s * 1000.0:.1f}ms "
+                        f"total={total_s * 1000.0:.1f}ms",
+                        flush=True,
+                    )
+                if should_log and metrics:
+                    print(
+                        f"epoch={epoch:03d} batch={batch_idx:04d}/{batches_per_epoch:04d} "
+                        f"loss={metrics.get('loss', float('nan')):.4f} "
+                        f"peak={metrics.get('loss_peak', float('nan')):.4f} "
+                        f"obj={metrics.get('loss_obj', float('nan')):.4f} "
+                        f"cnt_loss={metrics.get('loss_count', float('nan')):.2f} "
+                        f"f1={metrics.get('track_f1', float('nan')):.3f} "
+                        f"cnt_mae={metrics.get('count_mae', float('nan')):.2f} "
+                        f"spd_bad={metrics.get('speed_window_violation_rate', float('nan')):.3f}",
+                        flush=True,
+                    )
+                fetch_start = time.perf_counter()
+        finally:
+            if train_loader is None or not bool(args.persistent_workers):
+                _shutdown_dataloader_iterator(batch_iter)
         mean_metrics = _mean_metrics(epoch_metrics)
         elapsed = time.perf_counter() - t0
         mean_metrics["epoch"] = float(epoch)
