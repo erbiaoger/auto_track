@@ -397,12 +397,71 @@ def _match_single(
         + float(w_speed) * torch.abs(pred_speed[:, None] - gt_speed[None, :])
     )
     matcher_name = str(matcher).lower()
+    if matcher_name == "independent":
+        cols = torch.arange(g_count, dtype=torch.long, device=device)
+        rows = torch.argmin(cost, dim=0).to(torch.long)
+        return rows, cols
     if matcher_name == "greedy":
         return _greedy_match_cost(cost)
     if matcher_name == "auction":
         return _auction_match_cost(cost)
     rows, cols = linear_sum_assignment(cost.detach().cpu().numpy())
     return torch.as_tensor(rows, dtype=torch.long, device=device), torch.as_tensor(cols, dtype=torch.long, device=device)
+
+
+def _independent_match_batch(
+    outputs: dict[str, torch.Tensor],
+    targets: dict[str, torch.Tensor],
+    *,
+    w_peak: float,
+    w_obj: float,
+    w_dir: float,
+    w_speed: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fast approximate matcher: each GT independently picks its best slot.
+
+    This keeps the assignment fully on the torch device and avoids the
+    per-sample synchronization used by the exact/auction matchers. It does not
+    enforce one-to-one slot ownership, so it is intended for high-throughput
+    training rather than exact validation metrics.
+    """
+    device = outputs["objectness_logits"].device
+    q_count = int(outputs["num_regular_queries"])
+    gt_valid = targets["gt_valid"].to(device=device, dtype=torch.bool)
+    if int(gt_valid.numel()) <= 0:
+        empty = torch.empty((0,), dtype=torch.long, device=device)
+        return empty, empty, empty
+
+    logp = torch.log_softmax(outputs["peak_logits"][:, :q_count].detach(), dim=-1)
+    batch_size, _, n_ch, k_plus_one = logp.shape
+    max_gt = int(gt_valid.shape[1])
+    gt_peak = targets["gt_peak_index"].to(device=device, dtype=torch.long).clamp(0, k_plus_one - 1)
+    gt_vis = targets["visibility"].to(device=device, dtype=torch.float32)
+    gather_idx = gt_peak[:, None, :, :, None].expand(batch_size, q_count, max_gt, n_ch, 1)
+    nll = -logp[:, :, None, :, :].expand(-1, -1, max_gt, -1, -1).gather(-1, gather_idx).squeeze(-1)
+    peak_cost = (nll * gt_vis[:, None, :, :]).sum(dim=-1) / torch.clamp(gt_vis.sum(dim=-1)[:, None, :], min=1.0)
+
+    pred_obj = torch.sigmoid(outputs["objectness_logits"][:, :q_count].detach())
+    pred_dir = torch.softmax(outputs["direction_logits"][:, :q_count].detach(), dim=-1)
+    pred_speed = outputs["speed"][:, :q_count].detach()
+    gt_dir = targets["direction"].to(device=device, dtype=torch.long).clamp(0, pred_dir.shape[-1] - 1)
+    gt_speed = targets["speed"].to(device=device, dtype=torch.float32)
+    dir_score = pred_dir[:, :, None, :].expand(-1, -1, max_gt, -1).gather(
+        -1,
+        gt_dir[:, None, :, None].expand(batch_size, q_count, max_gt, 1),
+    ).squeeze(-1)
+    cost = (
+        float(w_peak) * peak_cost
+        - float(w_obj) * pred_obj[:, :, None]
+        - float(w_dir) * dir_score
+        + float(w_speed) * torch.abs(pred_speed[:, :, None] - gt_speed[:, None, :])
+    )
+    large = torch.finfo(cost.dtype).max
+    cost = cost.masked_fill(~gt_valid[:, None, :], large)
+    q_sel_all = torch.argmin(cost, dim=1)
+    b_sel, g_sel = torch.where(gt_valid)
+    q_sel = q_sel_all[b_sel, g_sel]
+    return b_sel.to(torch.long), q_sel.to(torch.long), g_sel.to(torch.long)
 
 
 def _slot_peak_competition_loss(outputs: dict[str, torch.Tensor], q_count: int) -> torch.Tensor:
@@ -602,28 +661,46 @@ def peak_slot_set_loss(
     matched_b: list[torch.Tensor] = []
     matched_q: list[torch.Tensor] = []
     matched_g: list[torch.Tensor] = []
+    mapped_g: Optional[torch.Tensor] = None
     matched_total = 0
     gt_total = 0
 
-    for b in range(batch_size):
-        rows, cols = _match_single(
+    if str(matcher).lower() == "independent":
+        b_sel, q_sel, mapped_g = _independent_match_batch(
             outputs,
             targets,
-            b,
-            matcher=matcher,
             w_peak=w_peak,
             w_obj=w_obj,
             w_dir=w_dir,
             w_speed=w_speed,
         )
-        if rows.numel() == 0:
-            continue
-        obj_target[b, rows] = 1.0
-        obj_weight[b, rows] = 1.0
-        matched_total += int(rows.numel())
-        matched_b.append(torch.full_like(rows, b))
-        matched_q.append(rows)
-        matched_g.append(cols)
+        if b_sel.numel() > 0:
+            obj_target[b_sel, q_sel] = 1.0
+            obj_weight[b_sel, q_sel] = 1.0
+            matched_total = int(q_sel.numel())
+            matched_b.append(b_sel)
+            matched_q.append(q_sel)
+            matched_g.append(mapped_g)
+    else:
+        for b in range(batch_size):
+            rows, cols = _match_single(
+                outputs,
+                targets,
+                b,
+                matcher=matcher,
+                w_peak=w_peak,
+                w_obj=w_obj,
+                w_dir=w_dir,
+                w_speed=w_speed,
+            )
+            if rows.numel() == 0:
+                continue
+            obj_target[b, rows] = 1.0
+            obj_weight[b, rows] = 1.0
+            matched_total += int(rows.numel())
+            matched_b.append(torch.full_like(rows, b))
+            matched_q.append(rows)
+            matched_g.append(cols)
 
     zero = torch.zeros((), dtype=torch.float32, device=device)
     loss_obj = F.binary_cross_entropy_with_logits(
@@ -638,7 +715,8 @@ def peak_slot_set_loss(
         q_sel = torch.cat(matched_q)
         g_sel = torch.cat(matched_g)
         gt_valid = targets["gt_valid"].to(device=device, dtype=torch.bool)
-        mapped_g = _valid_rank_to_gt_index(gt_valid)[b_sel, g_sel]
+        if mapped_g is None:
+            mapped_g = _valid_rank_to_gt_index(gt_valid)[b_sel, g_sel]
         pred_peak_logits = outputs["peak_logits"][b_sel, q_sel]
         gt_peak = targets["gt_peak_index"][b_sel, mapped_g].to(device=device, dtype=torch.long).clamp(0, none_index)
         ce = F.cross_entropy(pred_peak_logits.reshape(-1, none_index + 1), gt_peak.reshape(-1), reduction="none").view_as(gt_peak)

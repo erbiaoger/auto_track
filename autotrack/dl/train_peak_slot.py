@@ -37,7 +37,7 @@ from typing import Iterator, Optional
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 
 from autotrack.dl.peak_slot_model import (
     ModelConfig,
@@ -88,7 +88,12 @@ def parse_args() -> argparse.Namespace:
         help="CPU shard x dtype before GPU transfer. auto preserves shard dtype only for CUDA AMP training.",
     )
     parser.add_argument("--channels-last", action="store_true", help="Use channels-last input/model layout on CUDA.")
-    parser.add_argument("--matcher", default="hungarian", choices=["hungarian", "greedy", "auction"], help="Slot-to-GT assignment.")
+    parser.add_argument(
+        "--matcher",
+        default="independent",
+        choices=["hungarian", "greedy", "auction", "independent"],
+        help="Slot-to-GT assignment. independent is the fastest approximate GPU matcher for throughput training.",
+    )
     parser.add_argument("--no-object-weight", type=float, default=0.15, help="Object loss weight for unmatched slots.")
     parser.add_argument("--none-weight", type=float, default=0.35, help="Peak CE weight for GT-none channel targets.")
     parser.add_argument("--object-loss-weight", type=float, default=1.25, help="Overall objectness loss multiplier.")
@@ -115,7 +120,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-every", type=int, default=5, help="Run validation every N epochs when val shards exist.")
     parser.add_argument("--val-max-samples", type=int, default=0, help="Limit validation samples; 0 evaluates all validation samples.")
     parser.add_argument("--checkpoint-every", type=int, default=1, help="Save checkpoint every N epochs.")
-    parser.add_argument("--metrics-every", type=int, default=20, help="Collect detailed metrics every N batches; 0 disables intermediate metrics.")
+    parser.add_argument("--metrics-every", type=int, default=0, help="Collect detailed metrics every N batches; 0 disables intermediate metrics.")
     parser.add_argument("--resume", type=Path, default=None, help="Checkpoint path to resume.")
     parser.add_argument("--auto-resume", action="store_true", help="Resume from <out-dir>/checkpoint_last.pt if present.")
     parser.add_argument("--resume-model-only", action="store_true", help="Load model weights but reset optimizer.")
@@ -226,6 +231,29 @@ def _convert_x_dtype(x: torch.Tensor, x_transfer_dtype: str) -> torch.Tensor:
     if str(x_transfer_dtype) == "float16":
         return x.to(torch.float16)
     return x
+
+
+class EpochShuffleSampler(Sampler[int]):
+    """Deterministic per-epoch sampler compatible with persistent workers."""
+
+    def __init__(self, length: int, *, seed: int, epoch: int, shuffle: bool):
+        self.length = int(length)
+        self.seed = int(seed)
+        self.epoch = int(epoch)
+        self.shuffle = bool(shuffle)
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __iter__(self) -> Iterator[int]:
+        if not self.shuffle or self.length <= 1:
+            return iter(range(self.length))
+        gen = torch.Generator(device="cpu")
+        gen.manual_seed(self.seed + self.epoch * 97_531)
+        return iter(torch.randperm(self.length, generator=gen).tolist())
+
+    def __len__(self) -> int:
+        return self.length
 
 
 class PeakSlotShardDataset(Dataset):
@@ -412,19 +440,17 @@ def _make_dataloader(
         x_transfer_dtype=str(x_transfer_dtype),
         worker_shard_cache_size=int(worker_shard_cache_size),
     )
-    generator = torch.Generator(device="cpu")
-    generator.manual_seed(int(seed) + int(epoch) * 97_531)
+    sampler = EpochShuffleSampler(len(dataset), seed=int(seed), epoch=int(epoch), shuffle=bool(shuffle))
     loader_kwargs = {
         "dataset": dataset,
         "batch_size": int(batch_size),
-        "shuffle": bool(shuffle),
+        "sampler": sampler,
         "num_workers": int(num_workers),
         "pin_memory": bool(pin_memory),
         "persistent_workers": bool(persistent_workers),
         "prefetch_factor": max(1, int(prefetch_factor)),
         "collate_fn": _collate_peak_slot_batch,
         "worker_init_fn": _seed_worker,
-        "generator": generator,
         "timeout": max(0.0, float(dataloader_timeout)),
     }
     if int(num_workers) > 0:
@@ -747,6 +773,8 @@ def main() -> int:
         model.train()
         t0 = time.perf_counter()
         epoch_metrics: list[dict[str, float]] = []
+        epoch_samples = 0
+        epoch_batches = 0
         timing_enabled = int(args.timing_every) > 0 and epoch % int(args.timing_every) == 0
         timing_sums = {
             "data_wait": 0.0,
@@ -783,9 +811,16 @@ def main() -> int:
                 worker_shard_cache_size=int(args.worker_shard_cache_size),
             )
         else:
+            sampler = getattr(train_loader, "sampler", None)
+            set_epoch = getattr(sampler, "set_epoch", None)
+            if callable(set_epoch):
+                set_epoch(epoch)
             batch_iter = iter(train_loader)
         try:
             for batch_idx, (x, targets) in enumerate(batch_iter, start=1):
+                batch_samples = int(x.shape[0])
+                epoch_samples += batch_samples
+                epoch_batches += 1
                 profile_enabled = int(args.profile_steps) > 0 and batch_idx > int(args.profile_warmup)
                 profile_active = profile_enabled and batch_idx <= int(args.profile_warmup) + int(args.profile_steps)
                 sync_timing = bool(profile_active or timing_enabled)
@@ -924,6 +959,8 @@ def main() -> int:
                 _shutdown_dataloader_iterator(batch_iter)
         mean_metrics = _mean_metrics(epoch_metrics)
         elapsed = time.perf_counter() - t0
+        mean_metrics["samples_per_second"] = float(epoch_samples / max(elapsed, 1e-12))
+        mean_metrics["steps_per_second"] = float(epoch_batches / max(elapsed, 1e-12))
         mean_metrics["epoch"] = float(epoch)
         mean_metrics["elapsed_seconds"] = float(elapsed)
         timing_metrics: dict[str, float] = {}
@@ -937,6 +974,8 @@ def main() -> int:
             f"f1={mean_metrics.get('track_f1', float('nan')):.3f} "
             f"cnt_mae={mean_metrics.get('count_mae', float('nan')):.2f} "
             f"spd_bad={mean_metrics.get('speed_window_violation_rate', float('nan')):.3f} "
+            f"samples/s={mean_metrics.get('samples_per_second', float('nan')):.2f} "
+            f"steps/s={mean_metrics.get('steps_per_second', float('nan')):.3f} "
             f"elapsed={elapsed:.1f}s"
         )
         if timing_metrics:
