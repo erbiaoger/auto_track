@@ -15,6 +15,8 @@ PLOT_SAMPLES=${PLOT_SAMPLES:-16}                                      # 最多�
 PLOT_DPI=${PLOT_DPI:-160}                                             # 绘图 DPI
 PLOT_STYLE=${PLOT_STYLE:-waveform}                                    # 绘图风格：waveform 或 heatmap
 OBJECTNESS_THRESHOLD=${OBJECTNESS_THRESHOLD:-0.35}                    # objectness 阈值
+EXTRA_CANDIDATE_SLOTS=${EXTRA_CANDIDATE_SLOTS:-16}                   # 额外解码的低 objectness slot 数
+CANDIDATE_OBJECTNESS_FLOOR=${CANDIDATE_OBJECTNESS_FLOOR:-0.05}       # 额外候选 slot 的最低 objectness
 PEAK_THRESHOLD=${PEAK_THRESHOLD:-0.4}                                 # 点级峰选择阈值
 MIN_VISIBLE_CHANNELS=${MIN_VISIBLE_CHANNELS:-2}                       # 一条轨迹至少保留多少可见道
 MAX_PREDICTED_TRACKS=${MAX_PREDICTED_TRACKS:-96}                      # 每个样本最多输出多少条轨迹
@@ -43,6 +45,8 @@ uv run python -m autotrack.dl.predict_peak_slot_dataset \
   --plot-dpi "$PLOT_DPI" \
   --plot-style "$PLOT_STYLE" \
   --objectness-threshold "$OBJECTNESS_THRESHOLD" \
+  --extra-candidate-slots "$EXTRA_CANDIDATE_SLOTS" \
+  --candidate-objectness-floor "$CANDIDATE_OBJECTNESS_FLOOR" \
   --peak-threshold "$PEAK_THRESHOLD" \
   --min-visible-channels "$MIN_VISIBLE_CHANNELS" \
   --max-predicted-tracks "$MAX_PREDICTED_TRACKS" \

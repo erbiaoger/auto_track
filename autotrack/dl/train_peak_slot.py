@@ -99,6 +99,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--visibility-prior-loss-weight", type=float, default=0.75, help="Visibility prior supervision loss weight.")
     parser.add_argument("--slot-competition-loss-weight", type=float, default=0.15, help="Penalty for multiple slots selecting the same peaks.")
     parser.add_argument("--crossing-loss-weight", type=float, default=0.2, help="Margin loss against switching to competing peaks.")
+    parser.add_argument("--gt-coverage-loss-weight", type=float, default=0.5, help="Loss weight requiring every GT to be explainable by at least one slot.")
+    parser.add_argument("--gt-coverage-temperature", type=float, default=0.2, help="Softmin temperature for GT coverage loss.")
+    parser.add_argument("--close-pair-separation-loss-weight", type=float, default=0.3, help="Loss weight for separating close GT vehicle pairs.")
+    parser.add_argument("--close-pair-margin", type=float, default=0.5, help="Margin for close-pair slot separation loss.")
+    parser.add_argument("--close-pair-min-common-channels", type=int, default=8, help="Minimum shared visible channels for a close GT pair.")
+    parser.add_argument("--close-pair-min-gap-s", type=float, default=0.15, help="Minimum mean time gap for close-pair metrics/loss.")
+    parser.add_argument("--close-pair-max-gap-s", type=float, default=1.5, help="Maximum mean time gap for close-pair metrics/loss.")
     parser.add_argument("--physics-speed-min-kmh", type=float, default=60.0, help="Minimum speed for physics violation metrics.")
     parser.add_argument("--physics-speed-max-kmh", type=float, default=100.0, help="Maximum speed for physics violation metrics.")
     parser.add_argument("--metric-objectness-threshold", type=float, default=0.35, help="Objectness threshold for metrics.")
@@ -541,6 +548,14 @@ def _evaluate(
                     visibility_prior_loss_weight=float(args.visibility_prior_loss_weight),
                     slot_competition_loss_weight=float(args.slot_competition_loss_weight),
                     crossing_loss_weight=float(args.crossing_loss_weight),
+                    gt_coverage_loss_weight=float(args.gt_coverage_loss_weight),
+                    gt_coverage_temperature=float(args.gt_coverage_temperature),
+                    close_pair_separation_loss_weight=float(args.close_pair_separation_loss_weight),
+                    close_pair_margin=float(args.close_pair_margin),
+                    close_pair_min_common_channels=int(args.close_pair_min_common_channels),
+                    close_pair_min_gap_s=float(args.close_pair_min_gap_s),
+                    close_pair_max_gap_s=float(args.close_pair_max_gap_s),
+                    close_pair_window_seconds=float(meta.get("window_seconds", 120.0)),
                     collect_metrics=True,
                 )
                 metrics.update(
@@ -550,6 +565,10 @@ def _evaluate(
                         objectness_threshold=float(args.metric_objectness_threshold),
                         point_threshold=float(args.metric_point_threshold),
                         matcher=str(args.matcher),
+                        close_pair_window_seconds=float(meta.get("window_seconds", 120.0)),
+                        close_pair_min_common_channels=int(args.close_pair_min_common_channels),
+                        close_pair_min_gap_s=float(args.close_pair_min_gap_s),
+                        close_pair_max_gap_s=float(args.close_pair_max_gap_s),
                     )
                 )
                 metrics.update(
@@ -803,6 +822,14 @@ def main() -> int:
                         visibility_prior_loss_weight=float(args.visibility_prior_loss_weight),
                         slot_competition_loss_weight=float(args.slot_competition_loss_weight),
                         crossing_loss_weight=float(args.crossing_loss_weight),
+                        gt_coverage_loss_weight=float(args.gt_coverage_loss_weight),
+                        gt_coverage_temperature=float(args.gt_coverage_temperature),
+                        close_pair_separation_loss_weight=float(args.close_pair_separation_loss_weight),
+                        close_pair_margin=float(args.close_pair_margin),
+                        close_pair_min_common_channels=int(args.close_pair_min_common_channels),
+                        close_pair_min_gap_s=float(args.close_pair_min_gap_s),
+                        close_pair_max_gap_s=float(args.close_pair_max_gap_s),
+                        close_pair_window_seconds=float(meta.get("window_seconds", 120.0)),
                         collect_metrics=bool(collect_loss_metrics),
                     )
                     _sync_for_timing(device, sync_timing)
@@ -829,6 +856,10 @@ def main() -> int:
                                 objectness_threshold=float(args.metric_objectness_threshold),
                                 point_threshold=float(args.metric_point_threshold),
                                 matcher=str(args.matcher),
+                                close_pair_window_seconds=float(meta.get("window_seconds", 120.0)),
+                                close_pair_min_common_channels=int(args.close_pair_min_common_channels),
+                                close_pair_min_gap_s=float(args.close_pair_min_gap_s),
+                                close_pair_max_gap_s=float(args.close_pair_max_gap_s),
                             )
                         )
                         metrics.update(

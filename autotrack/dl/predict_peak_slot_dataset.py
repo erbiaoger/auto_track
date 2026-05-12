@@ -61,6 +61,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--plot-dpi", type=int, default=160, help="DPI for overlay PNG figures.")
     parser.add_argument("--plot-style", default="waveform", choices=["waveform", "heatmap"], help="Overlay plot style: GUI-like waveform or heatmap.")
     parser.add_argument("--objectness-threshold", type=float, default=0.35, help="Predicted slot objectness threshold. Lower values favor recall.")
+    parser.add_argument("--extra-candidate-slots", type=int, default=16, help="Decode this many extra below-threshold slots by objectness rank.")
+    parser.add_argument("--candidate-objectness-floor", type=float, default=0.05, help="Minimum objectness for extra decoded candidate slots.")
     parser.add_argument("--peak-threshold", type=float, default=0.4, help="Minimum selected peak probability.")
     parser.add_argument("--min-visible-channels", type=int, default=2, help="Minimum selected peaks for a predicted track.")
     parser.add_argument("--max-predicted-tracks", type=int, default=96, help="Maximum slots kept per sample.")
@@ -84,6 +86,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--none-weight", type=float, default=0.35, help="GT-none weight for loss reporting.")
     parser.add_argument("--no-object-weight", type=float, default=0.15, help="Unmatched slot weight for loss reporting.")
     parser.add_argument("--metric-point-threshold", type=float, default=0.05, help="Normalized time-error threshold for TP.")
+    parser.add_argument("--close-pair-min-common-channels", type=int, default=8, help="Minimum shared visible channels for close-pair metrics.")
+    parser.add_argument("--close-pair-min-gap-s", type=float, default=0.15, help="Minimum mean time gap for close-pair metrics.")
+    parser.add_argument("--close-pair-max-gap-s", type=float, default=1.5, help="Maximum mean time gap for close-pair metrics.")
     parser.add_argument("--no-ground-truth-csv", action="store_true", help="Do not write ground_truth_tracks.csv.")
     return parser.parse_args()
 
@@ -193,13 +198,26 @@ def _active_predictions(
     direction = torch.argmax(outputs_cpu["direction_logits"][batch_index], dim=-1)
     speed = outputs_cpu["speed"][batch_index]
     time_prior = outputs_cpu.get("time_prior")
-    order = torch.argsort(obj, descending=True)[: min(int(max_predicted_tracks), int(obj.shape[0]))]
+    ranked_slots = torch.argsort(obj, descending=True).tolist()
+    active_slots = [int(slot) for slot in ranked_slots if float(obj[int(slot)].item()) >= float(objectness_threshold)]
+    active_set = set(active_slots)
+    extra_slots: list[int] = []
+    extra_limit = max(0, int(inference_config.extra_candidate_slots))
+    if extra_limit > 0:
+        for slot in ranked_slots:
+            slot_i = int(slot)
+            if slot_i in active_set:
+                continue
+            if float(obj[slot_i].item()) < float(inference_config.candidate_objectness_floor):
+                continue
+            extra_slots.append(slot_i)
+            if len(extra_slots) >= extra_limit:
+                break
+    order = (active_slots + extra_slots)[: min(int(max_predicted_tracks), int(obj.shape[0]))]
+    slot_rank = {int(slot): int(rank) for rank, slot in enumerate(ranked_slots)}
     predictions: list[dict[str, Any]] = []
-    for rank, slot_tensor in enumerate(order.tolist()):
-        slot = int(slot_tensor)
+    for slot in order:
         score = float(obj[slot].item())
-        if score < float(objectness_threshold):
-            continue
         direction_label = int(direction[slot].item())
         decoder_mode = str(inference_config.decoder_mode).lower()
         path_options: list[tuple[list[dict[str, float | int]], float]] = []
@@ -251,7 +269,7 @@ def _active_predictions(
             norm_path_score = float(path_score) / float(max(1, len(channels)))
             predictions.append(
                 {
-                    "rank": int(rank),
+                    "rank": int(slot_rank.get(slot, len(slot_rank))),
                     "slot": slot,
                     "beam_index": int(option_idx),
                     "score": score,
@@ -549,6 +567,8 @@ def main() -> int:
         viterbi_beam_size=int(args.viterbi_beam_size),
         time_prior_weight=float(time_prior_weight),
         global_conflict_penalty=float(args.global_conflict_penalty),
+        extra_candidate_slots=int(args.extra_candidate_slots),
+        candidate_objectness_floor=float(args.candidate_objectness_floor),
         viterbi_topk=int(args.viterbi_topk),
         viterbi_candidate_threshold=float(args.viterbi_candidate_threshold),
         viterbi_speed_min_kmh=float(args.viterbi_speed_min_kmh),
@@ -615,6 +635,10 @@ def main() -> int:
                         no_object_weight=float(args.no_object_weight),
                         none_weight=float(args.none_weight),
                         matcher=str(args.matcher),
+                        close_pair_window_seconds=float(meta.get("window_seconds", 120.0)),
+                        close_pair_min_common_channels=int(args.close_pair_min_common_channels),
+                        close_pair_min_gap_s=float(args.close_pair_min_gap_s),
+                        close_pair_max_gap_s=float(args.close_pair_max_gap_s),
                         collect_metrics=True,
                     )
                     det_metrics = peak_slot_detection_metrics(
@@ -623,6 +647,10 @@ def main() -> int:
                         objectness_threshold=float(args.objectness_threshold),
                         point_threshold=float(args.metric_point_threshold),
                         matcher=str(args.matcher),
+                        close_pair_window_seconds=float(meta.get("window_seconds", 120.0)),
+                        close_pair_min_common_channels=int(args.close_pair_min_common_channels),
+                        close_pair_min_gap_s=float(args.close_pair_min_gap_s),
+                        close_pair_max_gap_s=float(args.close_pair_max_gap_s),
                     )
                     det_metrics.update(
                         peak_slot_physics_metrics(
@@ -743,6 +771,8 @@ def main() -> int:
             "viterbi_beam_size": int(inference_config.viterbi_beam_size),
             "time_prior_weight": float(inference_config.time_prior_weight),
             "global_conflict_penalty": float(inference_config.global_conflict_penalty),
+            "extra_candidate_slots": int(inference_config.extra_candidate_slots),
+            "candidate_objectness_floor": float(inference_config.candidate_objectness_floor),
             "viterbi_candidate_threshold": float(inference_config.viterbi_candidate_threshold),
             "viterbi_speed_min_kmh": float(inference_config.viterbi_speed_min_kmh),
             "viterbi_speed_max_kmh": float(inference_config.viterbi_speed_max_kmh),

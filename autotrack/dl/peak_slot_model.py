@@ -97,6 +97,8 @@ class InferenceConfig:
     viterbi_beam_size: int = 8
     time_prior_weight: float = 2.0
     global_conflict_penalty: float = 2.0
+    extra_candidate_slots: int = 16
+    candidate_objectness_floor: float = 0.05
     physics_smooth_tolerance_s: float = 2.0
 
 
@@ -453,6 +455,112 @@ def _peak_switch_margin_loss(
     return torch.relu(margin + bad[valid] - good[valid]).mean()
 
 
+def _slot_gt_peak_nll(outputs: dict[str, torch.Tensor], targets: dict[str, torch.Tensor], q_count: int) -> torch.Tensor:
+    device = outputs["objectness_logits"].device
+    none_index = int(outputs["peak_logits"].shape[-1] - 1)
+    logp = torch.log_softmax(outputs["peak_logits"][:, :q_count], dim=-1)
+    gt_peak = targets["gt_peak_index"].to(device=device, dtype=torch.long).clamp(0, none_index)
+    gt_vis = targets["visibility"].to(device=device, dtype=torch.float32)
+    nll = -logp[:, :, None, :, :].expand(-1, -1, int(gt_peak.shape[1]), -1, -1).gather(
+        -1,
+        gt_peak[:, None, :, :, None].expand(-1, q_count, -1, -1, 1),
+    ).squeeze(-1)
+    return (nll * gt_vis[:, None, :, :]).sum(dim=-1) / torch.clamp(gt_vis.sum(dim=-1)[:, None, :], min=1.0)
+
+
+def _gt_coverage_loss(
+    outputs: dict[str, torch.Tensor],
+    targets: dict[str, torch.Tensor],
+    q_count: int,
+    *,
+    temperature: float,
+) -> torch.Tensor:
+    nll = _slot_gt_peak_nll(outputs, targets, q_count)
+    valid = targets["gt_valid"].to(device=nll.device, dtype=torch.bool)
+    has_vis = targets["visibility"].to(device=nll.device, dtype=torch.float32).sum(dim=-1) > 0.5
+    valid = valid & has_vis
+    if not torch.any(valid):
+        return torch.zeros((), dtype=nll.dtype, device=nll.device)
+    temp = max(1e-6, float(temperature))
+    weights = torch.softmax(-nll / temp, dim=1)
+    coverage = (weights * nll).sum(dim=1)
+    return coverage[valid].mean()
+
+
+def _close_pair_mask(
+    targets: dict[str, torch.Tensor],
+    *,
+    window_seconds: float,
+    min_common_channels: int,
+    min_gap_s: float,
+    max_gap_s: float,
+) -> torch.Tensor:
+    device = targets["gt_valid"].device
+    gt_valid = targets["gt_valid"].to(device=device, dtype=torch.bool)
+    visibility = targets["visibility"].to(device=device, dtype=torch.float32) > 0.5
+    peak_time = targets["peak_time"].to(device=device, dtype=torch.float32)
+    gt_peak = targets["gt_peak_index"].to(device=device, dtype=torch.long)
+    none_index = int(peak_time.shape[-1])
+    gt_peak_clamped = gt_peak.clamp(0, max(0, none_index - 1))
+    gt_time = peak_time[:, None, :, :].expand(-1, int(gt_peak.shape[1]), -1, -1).gather(3, gt_peak_clamped[:, :, :, None]).squeeze(3)
+    visible = visibility & (gt_peak < none_index)
+    common = visible[:, :, None, :] & visible[:, None, :, :]
+    common_count = common.sum(dim=-1)
+    gap_s = torch.abs(gt_time[:, :, None, :] - gt_time[:, None, :, :]) * float(window_seconds)
+    mean_gap = (gap_s * common.to(gap_s.dtype)).sum(dim=-1) / torch.clamp(common_count.to(gap_s.dtype), min=1.0)
+    pair_valid = gt_valid[:, :, None] & gt_valid[:, None, :]
+    pair_valid = pair_valid & (common_count >= int(min_common_channels))
+    pair_valid = pair_valid & (mean_gap >= float(min_gap_s)) & (mean_gap <= float(max_gap_s))
+    g_count = int(gt_valid.shape[1])
+    upper = torch.triu(torch.ones((g_count, g_count), dtype=torch.bool, device=device), diagonal=1)
+    return pair_valid & upper[None, :, :]
+
+
+def _close_pair_separation_loss(
+    outputs: dict[str, torch.Tensor],
+    targets: dict[str, torch.Tensor],
+    q_count: int,
+    *,
+    b_sel: torch.Tensor,
+    q_sel: torch.Tensor,
+    mapped_g: torch.Tensor,
+    margin: float,
+    window_seconds: float,
+    min_common_channels: int,
+    min_gap_s: float,
+    max_gap_s: float,
+) -> torch.Tensor:
+    if b_sel.numel() == 0:
+        return torch.zeros((), dtype=outputs["objectness_logits"].dtype, device=outputs["objectness_logits"].device)
+    nll = _slot_gt_peak_nll(outputs, targets, q_count)
+    close = _close_pair_mask(
+        targets,
+        window_seconds=float(window_seconds),
+        min_common_channels=int(min_common_channels),
+        min_gap_s=float(min_gap_s),
+        max_gap_s=float(max_gap_s),
+    )
+    if not torch.any(close):
+        return torch.zeros((), dtype=nll.dtype, device=nll.device)
+    batch_size, max_gt = int(targets["gt_valid"].shape[0]), int(targets["gt_valid"].shape[1])
+    gt_to_slot = torch.full((batch_size, max_gt), -1, dtype=torch.long, device=nll.device)
+    gt_to_slot[b_sel, mapped_g] = q_sel
+    b_pair, g1, g2 = torch.where(close)
+    q1 = gt_to_slot[b_pair, g1]
+    q2 = gt_to_slot[b_pair, g2]
+    valid = (q1 >= 0) & (q2 >= 0) & (q1 != q2)
+    if not torch.any(valid):
+        return torch.zeros((), dtype=nll.dtype, device=nll.device)
+    b_pair = b_pair[valid]
+    g1 = g1[valid]
+    g2 = g2[valid]
+    q1 = q1[valid]
+    q2 = q2[valid]
+    loss_1 = torch.relu(float(margin) + nll[b_pair, q1, g1] - nll[b_pair, q1, g2])
+    loss_2 = torch.relu(float(margin) + nll[b_pair, q2, g2] - nll[b_pair, q2, g1])
+    return 0.5 * (loss_1 + loss_2).mean()
+
+
 def peak_slot_set_loss(
     outputs: dict[str, torch.Tensor],
     targets: dict[str, torch.Tensor],
@@ -476,6 +584,14 @@ def peak_slot_set_loss(
     visibility_prior_loss_weight: float = 0.5,
     slot_competition_loss_weight: float = 0.1,
     crossing_loss_weight: float = 0.2,
+    gt_coverage_loss_weight: float = 0.5,
+    gt_coverage_temperature: float = 0.2,
+    close_pair_separation_loss_weight: float = 0.3,
+    close_pair_margin: float = 0.5,
+    close_pair_min_common_channels: int = 8,
+    close_pair_min_gap_s: float = 0.15,
+    close_pair_max_gap_s: float = 1.5,
+    close_pair_window_seconds: float = 120.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     device = outputs["objectness_logits"].device
     batch_size = int(outputs["objectness_logits"].shape[0])
@@ -568,6 +684,23 @@ def peak_slot_set_loss(
             if float(crossing_loss_weight) > 0.0
             else zero
         )
+        loss_close_pair_sep = (
+            _close_pair_separation_loss(
+                outputs,
+                targets,
+                q_count,
+                b_sel=b_sel,
+                q_sel=q_sel,
+                mapped_g=mapped_g,
+                margin=float(close_pair_margin),
+                window_seconds=float(close_pair_window_seconds),
+                min_common_channels=int(close_pair_min_common_channels),
+                min_gap_s=float(close_pair_min_gap_s),
+                max_gap_s=float(close_pair_max_gap_s),
+            )
+            if float(close_pair_separation_loss_weight) > 0.0
+            else zero
+        )
     else:
         loss_peak = zero
         loss_dir = zero
@@ -577,11 +710,17 @@ def peak_slot_set_loss(
         loss_time_prior = zero
         loss_vis_prior = zero
         loss_crossing = zero
+        loss_close_pair_sep = zero
 
     obj_prob = torch.sigmoid(outputs["objectness_logits"][:, :q_count])
     gt_count = targets["gt_valid"].to(device=device, dtype=torch.float32).sum(dim=1)
     loss_count = F.smooth_l1_loss(obj_prob.sum(dim=1), gt_count, reduction="mean")
     loss_competition = _slot_peak_competition_loss(outputs, q_count) if float(slot_competition_loss_weight) > 0.0 else zero
+    loss_gt_coverage = (
+        _gt_coverage_loss(outputs, targets, q_count, temperature=float(gt_coverage_temperature))
+        if float(gt_coverage_loss_weight) > 0.0
+        else zero
+    )
     total = (
         float(object_loss_weight) * loss_obj
         + float(peak_loss_weight) * loss_peak
@@ -594,6 +733,8 @@ def peak_slot_set_loss(
         + float(visibility_prior_loss_weight) * loss_vis_prior
         + float(slot_competition_loss_weight) * loss_competition
         + float(crossing_loss_weight) * loss_crossing
+        + float(gt_coverage_loss_weight) * loss_gt_coverage
+        + float(close_pair_separation_loss_weight) * loss_close_pair_sep
     )
     if not collect_metrics:
         return total, {}
@@ -611,6 +752,8 @@ def peak_slot_set_loss(
         "loss_visibility_prior": float(loss_vis_prior.detach().cpu()),
         "loss_competition": float(loss_competition.detach().cpu()),
         "loss_crossing": float(loss_crossing.detach().cpu()),
+        "loss_gt_coverage": float(loss_gt_coverage.detach().cpu()),
+        "loss_close_pair_separation": float(loss_close_pair_sep.detach().cpu()),
         "matched": float(matched_total),
         "gt": float(gt_total),
         "max_objectness": float(torch.max(obj_prob).detach().cpu()),
@@ -626,6 +769,10 @@ def peak_slot_detection_metrics(
     objectness_threshold: float = 0.5,
     point_threshold: float = 0.05,
     matcher: str = "hungarian",
+    close_pair_window_seconds: float = 120.0,
+    close_pair_min_common_channels: int = 8,
+    close_pair_min_gap_s: float = 0.15,
+    close_pair_max_gap_s: float = 1.5,
 ) -> dict[str, float]:
     device = outputs["objectness_logits"].device
     q_count = int(outputs["num_regular_queries"])
@@ -648,6 +795,7 @@ def peak_slot_detection_metrics(
     gt_long_visible = 0
     good_short_visible = 0
     good_long_visible = 0
+    good_gt = torch.zeros_like(gt_valid, dtype=torch.bool)
     peak_time = targets["peak_time"].to(device=device, dtype=torch.float32)
     for b in range(int(obj.shape[0])):
         pred_count = int(active[b].sum().item())
@@ -697,6 +845,7 @@ def peak_slot_detection_metrics(
             time_errors.append(err_f)
             if err_f <= float(point_threshold):
                 good_total += 1
+                good_gt[b, gi] = True
                 dir_label = int(targets["direction"][b, gi].item())
                 visible_count = int((targets["visibility"][b, gi] > 0.5).sum().item())
                 if dir_label == 0:
@@ -707,6 +856,28 @@ def peak_slot_detection_metrics(
                     good_short_visible += 1
                 else:
                     good_long_visible += 1
+    close_mask = _close_pair_mask(
+        {
+            "gt_valid": gt_valid,
+            "visibility": targets["visibility"].to(device=device),
+            "peak_time": peak_time,
+            "gt_peak_index": targets["gt_peak_index"].to(device=device),
+        },
+        window_seconds=float(close_pair_window_seconds),
+        min_common_channels=int(close_pair_min_common_channels),
+        min_gap_s=float(close_pair_min_gap_s),
+        max_gap_s=float(close_pair_max_gap_s),
+    )
+    close_pair_total = int(close_mask.sum().detach().cpu())
+    if close_pair_total > 0:
+        close_b, close_g1, close_g2 = torch.where(close_mask)
+        both_good = good_gt[close_b, close_g1] & good_gt[close_b, close_g2]
+        one_or_more_good = good_gt[close_b, close_g1] | good_gt[close_b, close_g2]
+        close_pair_both = int(both_good.sum().detach().cpu())
+        close_pair_any = int(one_or_more_good.sum().detach().cpu())
+    else:
+        close_pair_both = 0
+        close_pair_any = 0
     precision = float(good_total / max(1, pred_total))
     recall = float(good_total / max(1, gt_total))
     f1 = float(2.0 * precision * recall / max(1e-12, precision + recall))
@@ -725,6 +896,10 @@ def peak_slot_detection_metrics(
         "track_recall_reverse": float(good_reverse / max(1, gt_reverse)),
         "track_recall_short_visible": float(good_short_visible / max(1, gt_short_visible)),
         "track_recall_long_visible": float(good_long_visible / max(1, gt_long_visible)),
+        "close_pair_gt_count": float(close_pair_total),
+        "close_pair_recall": float(close_pair_both / max(1, close_pair_total)),
+        "close_pair_both_detected_rate": float(close_pair_both / max(1, close_pair_total)),
+        "close_pair_miss_rate": float((close_pair_total - close_pair_any) / max(1, close_pair_total)),
         "gt_forward_count": float(gt_forward),
         "gt_reverse_count": float(gt_reverse),
         "gt_short_visible_count": float(gt_short_visible),

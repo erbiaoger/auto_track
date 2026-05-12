@@ -57,6 +57,13 @@ TIME_PRIOR_LOSS_WEIGHT=${TIME_PRIOR_LOSS_WEIGHT:-2.0}                 # 时间�
 VISIBILITY_PRIOR_LOSS_WEIGHT=${VISIBILITY_PRIOR_LOSS_WEIGHT:-0.75}    # 可见性先验 loss 权重
 SLOT_COMPETITION_LOSS_WEIGHT=${SLOT_COMPETITION_LOSS_WEIGHT:-0.15}    # slot 竞争 loss 权重
 CROSSING_LOSS_WEIGHT=${CROSSING_LOSS_WEIGHT:-0.2}                     # 交叉场景 loss 权重
+GT_COVERAGE_LOSS_WEIGHT=${GT_COVERAGE_LOSS_WEIGHT:-0.5}               # 每个 GT 至少被一个 slot 解释的覆盖 loss 权重
+GT_COVERAGE_TEMPERATURE=${GT_COVERAGE_TEMPERATURE:-0.2}               # GT coverage softmin 温度
+CLOSE_PAIR_SEPARATION_LOSS_WEIGHT=${CLOSE_PAIR_SEPARATION_LOSS_WEIGHT:-0.3} # 近车 pair 分离 loss 权重
+CLOSE_PAIR_MARGIN=${CLOSE_PAIR_MARGIN:-0.5}                           # 近车 pair 分离 margin
+CLOSE_PAIR_MIN_COMMON_CHANNELS=${CLOSE_PAIR_MIN_COMMON_CHANNELS:-8}   # 判定近车 pair 的最少共同可见通道数
+CLOSE_PAIR_MIN_GAP_S=${CLOSE_PAIR_MIN_GAP_S:-0.15}                    # 判定近车 pair 的最小平均时间差
+CLOSE_PAIR_MAX_GAP_S=${CLOSE_PAIR_MAX_GAP_S:-1.5}                     # 判定近车 pair 的最大平均时间差
 METRIC_OBJECTNESS_THRESHOLD=${METRIC_OBJECTNESS_THRESHOLD:-0.35}      # 评估 objectness 阈值
 METRIC_POINT_THRESHOLD=${METRIC_POINT_THRESHOLD:-0.05}                # 评估点阈值
 VAL_DATA_DIR=${VAL_DATA_DIR:-}                                        # 独立验证集目录，留空则使用切分
@@ -129,6 +136,13 @@ uv run python -m autotrack.dl.train_peak_slot \
   --visibility-prior-loss-weight "$VISIBILITY_PRIOR_LOSS_WEIGHT" \
   --slot-competition-loss-weight "$SLOT_COMPETITION_LOSS_WEIGHT" \
   --crossing-loss-weight "$CROSSING_LOSS_WEIGHT" \
+  --gt-coverage-loss-weight "$GT_COVERAGE_LOSS_WEIGHT" \
+  --gt-coverage-temperature "$GT_COVERAGE_TEMPERATURE" \
+  --close-pair-separation-loss-weight "$CLOSE_PAIR_SEPARATION_LOSS_WEIGHT" \
+  --close-pair-margin "$CLOSE_PAIR_MARGIN" \
+  --close-pair-min-common-channels "$CLOSE_PAIR_MIN_COMMON_CHANNELS" \
+  --close-pair-min-gap-s "$CLOSE_PAIR_MIN_GAP_S" \
+  --close-pair-max-gap-s "$CLOSE_PAIR_MAX_GAP_S" \
   --metric-objectness-threshold "$METRIC_OBJECTNESS_THRESHOLD" \
   --metric-point-threshold "$METRIC_POINT_THRESHOLD" \
   $val_data_args \
