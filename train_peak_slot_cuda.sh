@@ -2,13 +2,13 @@
 set -eu
 
 # 用法示例：
-# 1) 正常训练当前 v3 realistic 数据：
+# 1) 正常训练当前 v4 noisy/bad-channel 数据：
 #    DEVICE=cuda sh train_peak_slot_cuda.sh
 #
-# 2) 用旧的 v2 checkpoint 作为初始化，再训练当前 v3 realistic 数据：
-#    DATA_DIR=datasets/peak_slot_v3_120s_realistic/train \
-#    OUT_DIR=models/peak_slot_v3_120s_realistic_cuda \
-#    RESUME=models/peak_slot_v2_120s_cuda/checkpoint_best.pt \
+# 2) 用旧的 v3 checkpoint 作为初始化，再训练当前 v4 noisy/bad-channel 数据：
+#    DATA_DIR=datasets/peak_slot_v4_120s_noisy_badch/train \
+#    OUT_DIR=models/peak_slot_v4_120s_noisy_badch_cuda \
+#    RESUME=models/peak_slot_v3_120s_realistic_cuda/checkpoint_best.pt \
 #    RESUME_MODEL_ONLY=1 \
 #    AUTO_RESUME=0 \
 #    DEVICE=cuda \
@@ -17,13 +17,13 @@ set -eu
 #
 # 说明：
 # `RESUME_MODEL_ONLY=1` 只导入模型权重，不恢复 optimizer 和历史训练状态。
-# 当训练数据分布已经从 v2 切到 v3 realistic 时，这种做法比完整 resume 更稳。
+# 当训练数据分布已经切到 v4 noisy/bad-channel 时，这种做法比完整 resume 更稳。
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$SCRIPT_DIR"
 
-DATA_DIR=${DATA_DIR:-datasets/peak_slot_v3_120s_realistic/train}     # 训练数据目录
-OUT_DIR=${OUT_DIR:-models/peak_slot_v3_120s_realistic_cuda}          # 模型输出目录
+DATA_DIR=${DATA_DIR:-datasets/peak_slot_v4_120s_noisy_badch/train}   # 训练数据目录
+OUT_DIR=${OUT_DIR:-models/peak_slot_v4_120s_noisy_badch_cuda}        # 模型输出目录
 DEVICE=${DEVICE:-cuda}                                                # 训练设备
 EPOCHS=${EPOCHS:-1000}                                                # 目标总 epoch 数
 BATCH_SIZE=${BATCH_SIZE:-32}                                          # batch 大小
@@ -76,7 +76,7 @@ LOG_EVERY=${LOG_EVERY:-20}                                            # 每多�
 TIMING_EVERY=${TIMING_EVERY:-5}                                       # 每多少 epoch 打印一次耗时统计
 PROFILE_STEPS=${PROFILE_STEPS:-0}                                     # profile 的 step 数
 PROFILE_WARMUP=${PROFILE_WARMUP:-2}                                   # profile 预热 step 数
-RESUME=${RESUME:-}                                                    # 手动指定 resume checkpoint；可指向旧 v2 模型
+RESUME=${RESUME:-}                                                    # 手动指定 resume checkpoint；可指向旧 v3 模型
 AUTO_RESUME=${AUTO_RESUME:-1}                                         # 是否自动从当前 OUT_DIR 的 last checkpoint 续训
 RESUME_MODEL_ONLY=${RESUME_MODEL_ONLY:-0}                             # 是否只恢复模型权重；迁移到新数据分布时建议设为 1
 SEED=${SEED:-22}                                                      # 随机种子

@@ -27,12 +27,13 @@ Generate tensor shards without SAC I/O:
 WORKERS=8 sh generate_track_slot_dataset.sh
 ```
 
-The default generator uses realistic motion augmentation for Gaussian-window
-DAS outputs. Motion defaults are `constant_sparse,smooth_random,stop_go` with
-weights `0.84,0.15,0.01`; signal defaults avoid continuous background noise and
-instead add a moderate number of isolated Gaussian windows, light random dead
-channels, and lighter random missing channel-time blocks. The default sample
-count is `NUM_SAMPLES=80000`.
+The default generator now targets the v4 noisy/bad-channel setting for
+Gaussian-window DAS outputs. Motion defaults are
+`constant_sparse,smooth_random,stop_go` with weights `0.84,0.15,0.01`; signal
+defaults add continuous white/colored noise, channel bias/gain variation,
+baseline drift, denser isolated Gaussian windows, random dead channels, and
+random missing channel-time blocks. The default sample count is
+`NUM_SAMPLES=40000`.
 Direction sampling keeps the expected traffic prior (`PRIMARY_RATIO=0.8333333333`).
 
 Train on CUDA:
@@ -119,11 +120,10 @@ Predict directly on converted shards:
 MODEL=models/peak_slot_cuda/checkpoint_best.pt DATA_DIR=datasets/peak_slot/train sh predict_peak_slot_dataset.sh
 ```
 
-`predict_peak_slot_dataset.sh` defaults to recall-oriented inference
-(`OBJECTNESS_THRESHOLD=0.35`, `MIN_VISIBLE_CHANNELS=2`,
-`VITERBI_BEAM_SIZE=8`) while keeping cross-slot conflict suppression enabled
-with `GLOBAL_CONFLICT_PENALTY=2.0`. Raise the threshold if false positives
-become too high.
+`predict_peak_slot_dataset.sh` defaults to the tuned balanced inference
+configuration (`OBJECTNESS_THRESHOLD=0.45`, `MIN_VISIBLE_CHANNELS=4`,
+`EXTRA_CANDIDATE_SLOTS=8`) while keeping cross-slot conflict suppression enabled
+with `GLOBAL_CONFLICT_PENALTY=2.0`.
 
 Infer on SAC data:
 

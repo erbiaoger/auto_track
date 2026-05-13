@@ -63,8 +63,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--plot-direction-filter", default="all", choices=["all", "forward", "reverse"], help="Direction filter used only for overlay PNG plots.")
     parser.add_argument("--prediction-direction-filter", default="all", choices=["all", "forward", "reverse"], help="Direction filter applied to exported predictions and summary counts.")
     parser.add_argument("--objectness-threshold", type=float, default=0.35, help="Predicted slot objectness threshold. Lower values favor recall.")
-    parser.add_argument("--extra-candidate-slots", type=int, default=16, help="Decode this many extra below-threshold slots by objectness rank.")
-    parser.add_argument("--candidate-objectness-floor", type=float, default=0.05, help="Minimum objectness for extra decoded candidate slots.")
+    parser.add_argument("--extra-candidate-slots", type=int, default=32, help="Decode this many extra below-threshold slots by objectness rank.")
+    parser.add_argument("--candidate-objectness-floor", type=float, default=0.02, help="Minimum objectness for extra decoded candidate slots.")
     parser.add_argument("--peak-threshold", type=float, default=0.4, help="Minimum selected peak probability.")
     parser.add_argument("--min-visible-channels", type=int, default=2, help="Minimum selected peaks for a predicted track.")
     parser.add_argument("--max-predicted-tracks", type=int, default=96, help="Maximum slots kept per sample.")
@@ -107,7 +107,15 @@ def _load_meta(data_dir: Path) -> dict[str, Any]:
     meta_path = data_dir / "meta.json"
     if not meta_path.is_file():
         raise FileNotFoundError(f"meta.json not found: {meta_path}")
-    return json.loads(meta_path.read_text(encoding="utf-8"))
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    fmt = str(meta.get("format", ""))
+    if fmt and fmt != "peak_slot_shards_v1":
+        raise ValueError(
+            f"{data_dir} is not a peak_slot dataset: meta.json format={fmt!r}. "
+            "Run convert_track_slot_to_peak_slot.sh first, or set DATA_DIR to a directory "
+            "whose shards contain peak_time/peak_valid/peak_index."
+        )
+    return meta
 
 
 def _json_ready(value: Any) -> Any:
@@ -127,6 +135,25 @@ def _json_ready(value: Any) -> Any:
 
 
 def _targets_from_payload(payload: dict[str, torch.Tensor], idx: torch.Tensor) -> dict[str, torch.Tensor]:
+    required = {
+        "peak_time",
+        "peak_amp",
+        "peak_valid",
+        "peak_index",
+        "gt_peak_index",
+        "visibility",
+        "direction",
+        "speed",
+        "gt_valid",
+    }
+    missing = sorted(required - set(payload))
+    if missing:
+        keys = ", ".join(sorted(str(key) for key in payload.keys()))
+        raise KeyError(
+            f"Input shard is missing peak_slot fields: {missing}. "
+            f"Available keys: {keys}. This usually means DATA_DIR points to track_slot shards; "
+            "convert them with convert_track_slot_to_peak_slot.sh before prediction."
+        )
     targets = {
         "peak_time": payload["peak_time"][idx].to(torch.float32),
         "peak_amp": payload["peak_amp"][idx].to(torch.float32),
@@ -586,6 +613,107 @@ def _decoded_physics_counts(
     }
 
 
+def _gt_track_time_map(targets_cpu: dict[str, torch.Tensor], batch_index: int, gt_idx: int) -> dict[int, float]:
+    times: dict[int, float] = {}
+    for ch in torch.where(targets_cpu["visibility"][batch_index, gt_idx] > 0.5)[0].tolist():
+        peak_idx = int(targets_cpu["gt_peak_index"][batch_index, gt_idx, ch].item())
+        if peak_idx >= int(targets_cpu["peak_time"].shape[-1]):
+            continue
+        times[int(ch)] = float(targets_cpu["peak_time"][batch_index, int(ch), peak_idx].item())
+    return times
+
+
+def _prediction_time_norm_map(
+    pred: dict[str, Any],
+    targets_cpu: dict[str, torch.Tensor],
+    batch_index: int,
+) -> dict[int, float]:
+    return {
+        int(ch): float(targets_cpu["peak_time"][batch_index, int(ch), int(pk)].item())
+        for ch, pk in zip(pred["channels"], pred["peak_indices"])
+    }
+
+
+def _filtered_detection_counts(
+    predictions: list[dict[str, Any]],
+    targets_cpu: dict[str, torch.Tensor],
+    batch_index: int,
+    *,
+    point_threshold: float,
+    min_visible_channels: int,
+) -> dict[str, float]:
+    gt_indices = [int(idx) for idx in torch.where(targets_cpu["gt_valid"][batch_index])[0].tolist()]
+    gt_maps = {gt_idx: _gt_track_time_map(targets_cpu, batch_index, gt_idx) for gt_idx in gt_indices}
+    gt_dirs = {
+        gt_idx: LABEL_TO_DIRECTION.get(int(targets_cpu["direction"][batch_index, gt_idx].item()), "")
+        for gt_idx in gt_indices
+    }
+    candidates: list[tuple[float, int, int, int, int]] = []
+    for pred_idx, pred in enumerate(predictions):
+        pred_map = _prediction_time_norm_map(pred, targets_cpu, batch_index)
+        if len(pred_map) < int(min_visible_channels):
+            continue
+        for gt_idx in gt_indices:
+            if str(pred.get("direction", "")) != str(gt_dirs[gt_idx]):
+                continue
+            common = sorted(set(pred_map) & set(gt_maps[gt_idx]))
+            if not common:
+                continue
+            errors = [abs(float(pred_map[ch]) - float(gt_maps[gt_idx][ch])) for ch in common]
+            mean_error = float(np.mean(errors))
+            if mean_error <= float(point_threshold):
+                candidates.append((mean_error, pred_idx, gt_idx, len(common), len(gt_maps[gt_idx])))
+    candidates.sort(key=lambda item: (item[0], -item[3]))
+    matched_pred: set[int] = set()
+    matched_gt: set[int] = set()
+    matched_error_sum = 0.0
+    matched_common_sum = 0
+    forward_gt = 0
+    reverse_gt = 0
+    short_gt = 0
+    long_gt = 0
+    matched_forward = 0
+    matched_reverse = 0
+    matched_short = 0
+    matched_long = 0
+    for gt_idx in gt_indices:
+        direction = str(gt_dirs[gt_idx])
+        visible_count = len(gt_maps[gt_idx])
+        forward_gt += int(direction == "forward")
+        reverse_gt += int(direction == "reverse")
+        short_gt += int(visible_count < int(min_visible_channels))
+        long_gt += int(visible_count >= int(min_visible_channels))
+    for mean_error, pred_idx, gt_idx, common_count, _gt_visible_count in candidates:
+        if pred_idx in matched_pred or gt_idx in matched_gt:
+            continue
+        matched_pred.add(pred_idx)
+        matched_gt.add(gt_idx)
+        matched_error_sum += float(mean_error)
+        matched_common_sum += int(common_count)
+        direction = str(gt_dirs[gt_idx])
+        visible_count = len(gt_maps[gt_idx])
+        matched_forward += int(direction == "forward")
+        matched_reverse += int(direction == "reverse")
+        matched_short += int(visible_count < int(min_visible_channels))
+        matched_long += int(visible_count >= int(min_visible_channels))
+    return {
+        "tp": float(len(matched_gt)),
+        "pred": float(len(predictions)),
+        "gt": float(len(gt_indices)),
+        "time_error_sum": float(matched_error_sum),
+        "time_error_count": float(len(matched_gt)),
+        "matched_common_channels": float(matched_common_sum),
+        "gt_forward": float(forward_gt),
+        "gt_reverse": float(reverse_gt),
+        "gt_short": float(short_gt),
+        "gt_long": float(long_gt),
+        "matched_forward": float(matched_forward),
+        "matched_reverse": float(matched_reverse),
+        "matched_short": float(matched_short),
+        "matched_long": float(matched_long),
+    }
+
+
 def _plot_sample_overlay(
     out_path: Path,
     *,
@@ -795,6 +923,7 @@ def main() -> int:
     duplicate_removed_total = 0
     close_pair_kept_total = 0
     raw_candidate_total = 0
+    filtered_det_sums: dict[str, float] = defaultdict(float)
     sample_count = 0
     csv_sample_count = 0
     plot_sample_count = 0
@@ -929,6 +1058,15 @@ def main() -> int:
                         filtered_pred_total += pred_count
                         filtered_count_abs_error += abs(pred_count - gt_count)
                         filtered_count_exact += int(pred_count == gt_count)
+                        filtered_det_counts = _filtered_detection_counts(
+                            predictions,
+                            targets_cpu,
+                            b,
+                            point_threshold=float(args.metric_point_threshold),
+                            min_visible_channels=int(args.min_visible_channels),
+                        )
+                        for key, value in filtered_det_counts.items():
+                            filtered_det_sums[key] += float(value)
                         top_score = float(predictions[0]["score"]) if predictions else float("nan")
                         sample_writer.writerow(
                             {
@@ -970,6 +1108,12 @@ def main() -> int:
                 gt_fp.close()
     filtered_count_mae = float(filtered_count_abs_error / max(1, sample_count))
     filtered_count_acc = float(filtered_count_exact / max(1, sample_count))
+    filtered_tp = float(filtered_det_sums["tp"])
+    filtered_pred = float(filtered_det_sums["pred"])
+    filtered_gt = float(filtered_det_sums["gt"])
+    filtered_precision = filtered_tp / max(1.0, filtered_pred)
+    filtered_recall = filtered_tp / max(1.0, filtered_gt)
+    filtered_f1 = 2.0 * filtered_precision * filtered_recall / max(1e-12, filtered_precision + filtered_recall)
     summary = {
         "mode": "peak_slot_tensor_shard_prediction",
         "data_dir": str(data_dir),
@@ -1020,6 +1164,20 @@ def main() -> int:
             "count_acc": filtered_count_acc,
             "duplicate_removed_count": int(duplicate_removed_total),
             "close_pair_kept_count": int(close_pair_kept_total),
+        },
+        "filtered_detection_metrics": {
+            "track_tp": filtered_tp,
+            "pred_count": filtered_pred,
+            "gt_count": filtered_gt,
+            "track_precision": filtered_precision,
+            "track_recall": filtered_recall,
+            "track_f1": filtered_f1,
+            "time_mae_norm": float(filtered_det_sums["time_error_sum"] / max(1.0, filtered_det_sums["time_error_count"])),
+            "matched_common_channels_mean": float(filtered_det_sums["matched_common_channels"] / max(1.0, filtered_tp)),
+            "track_recall_forward": float(filtered_det_sums["matched_forward"] / max(1.0, filtered_det_sums["gt_forward"])),
+            "track_recall_reverse": float(filtered_det_sums["matched_reverse"] / max(1.0, filtered_det_sums["gt_reverse"])),
+            "track_recall_short_visible": float(filtered_det_sums["matched_short"] / max(1.0, filtered_det_sums["gt_short"])),
+            "track_recall_long_visible": float(filtered_det_sums["matched_long"] / max(1.0, filtered_det_sums["gt_long"])),
         },
         "filtered_physics_metrics": {
             "pair_count": int(decoded_pair_total),

@@ -4,8 +4,8 @@ set -eu
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$SCRIPT_DIR"
 
-REALISM_PRESET=${REALISM_PRESET:-xi_gauss_50}                         # 真实化预设名称，仅写入元数据便于追踪
-OUT_DIR=${OUT_DIR:-datasets/track_slot_v3_120s_realistic/train}      # track_slot 数据集输出目录
+REALISM_PRESET=${REALISM_PRESET:-xi_gauss_50_noisy_badch}             # 真实化预设名称，仅写入元数据便于追踪
+OUT_DIR=${OUT_DIR:-datasets/track_slot_v4_120s_noisy_badch/train}    # track_slot 数据集输出目录
 NUM_SAMPLES=${NUM_SAMPLES:-40000}                                    # 总样本数
 SHARD_SIZE=${SHARD_SIZE:-256}                                        # 每个 shard 的样本数
 N_CH=${N_CH:-50}                                                     # 通道数
@@ -33,17 +33,17 @@ STOP_RESPONSE_SIGMA_SCALE=${STOP_RESPONSE_SIGMA_SCALE:-3.0}          # stop-go �
 STOP_RESPONSE_AMP_SCALE=${STOP_RESPONSE_AMP_SCALE:-1.2}              # stop-go 附近高斯窗幅值放大倍数
 RESTART_SPEED_RATIO_MIN=${RESTART_SPEED_RATIO_MIN:-0.95}             # stop 后恢复速度最小比例
 RESTART_SPEED_RATIO_MAX=${RESTART_SPEED_RATIO_MAX:-1.05}             # stop 后恢复速度最大比例
-NOISE_STD=${NOISE_STD:-0.0}                                          # 连续白噪声强度，当前默认关闭
-COLORED_NOISE_STD=${COLORED_NOISE_STD:-0.0}                          # 连续相关噪声强度，当前默认关闭
+NOISE_STD=${NOISE_STD:-0.04}                                         # 连续白噪声强度
+COLORED_NOISE_STD=${COLORED_NOISE_STD:-0.08}                         # 连续相关噪声强度
 COLORED_NOISE_CORR_S=${COLORED_NOISE_CORR_S:-0.8}                    # 相关噪声时间相关长度 s
-CHANNEL_BIAS_STD=${CHANNEL_BIAS_STD:-0.0}                            # 通道常值偏置强度，当前默认关闭
-CHANNEL_GAIN_STD=${CHANNEL_GAIN_STD:-0.0}                            # 通道增益扰动强度，当前默认关闭
-BASELINE_DRIFT_STD=${BASELINE_DRIFT_STD:-0.0}                        # 慢变基线漂移强度，当前默认关闭
+CHANNEL_BIAS_STD=${CHANNEL_BIAS_STD:-0.03}                           # 通道常值偏置强度
+CHANNEL_GAIN_STD=${CHANNEL_GAIN_STD:-0.08}                           # 通道增益扰动强度
+BASELINE_DRIFT_STD=${BASELINE_DRIFT_STD:-0.04}                       # 慢变基线漂移强度
 BASELINE_DRIFT_CORR_S=${BASELINE_DRIFT_CORR_S:-6.0}                  # 基线漂移相关长度 s
 DEAD_CHANNEL_INDICES=${DEAD_CHANNEL_INDICES:-}                       # 固定坏道列表，逗号分隔；当前默认不启用
-RANDOM_DEAD_CHANNEL_RATIO=${RANDOM_DEAD_CHANNEL_RATIO:-0.18}         # 启用随机坏道的样本比例
-RANDOM_DEAD_CHANNEL_MIN=${RANDOM_DEAD_CHANNEL_MIN:-1}                # 随机坏道最少条数
-RANDOM_DEAD_CHANNEL_MAX=${RANDOM_DEAD_CHANNEL_MAX:-7}                # 随机坏道最多条数
+RANDOM_DEAD_CHANNEL_RATIO=${RANDOM_DEAD_CHANNEL_RATIO:-0.30}         # 启用随机坏道的样本比例
+RANDOM_DEAD_CHANNEL_MIN=${RANDOM_DEAD_CHANNEL_MIN:-2}                # 随机坏道最少条数
+RANDOM_DEAD_CHANNEL_MAX=${RANDOM_DEAD_CHANNEL_MAX:-10}               # 随机坏道最多条数
 ZERO_BACKGROUND_RATIO=${ZERO_BACKGROUND_RATIO:-1.0}                  # 启用局部缺失块的样本比例
 ZERO_BACKGROUND_RATE=${ZERO_BACKGROUND_RATE:-45.0}                   # 每个样本期望缺失块数量
 ZERO_BACKGROUND_CHANNEL_MIN=${ZERO_BACKGROUND_CHANNEL_MIN:-1}        # 缺失块最小通道宽度
@@ -59,14 +59,15 @@ INTERACTION_TYPES=${INTERACTION_TYPES:-crossing,overtake,near_parallel} # 困难
 INTERACTION_TIME_MIN_FRAC=${INTERACTION_TIME_MIN_FRAC:-0.05}         # 交互最早发生时间占比
 INTERACTION_TIME_MAX_FRAC=${INTERACTION_TIME_MAX_FRAC:-0.95}         # 交互最晚发生时间占比
 ISOLATED_NOISE_RATIO=${ISOLATED_NOISE_RATIO:-1.0}                    # 启用孤立高斯干扰的样本比例
-ISOLATED_NOISE_RATE=${ISOLATED_NOISE_RATE:-220.0}                    # 每个样本期望孤立高斯干扰数量
+ISOLATED_NOISE_RATE=${ISOLATED_NOISE_RATE:-280.0}                    # 每个样本期望孤立高斯干扰数量
 ISOLATED_NOISE_AMP_MIN=${ISOLATED_NOISE_AMP_MIN:-1.0}                # 孤立高斯干扰最小幅值
 ISOLATED_NOISE_AMP_MAX=${ISOLATED_NOISE_AMP_MAX:-6.0}                # 孤立高斯干扰最大幅值
 ISOLATED_NOISE_SIGMA_MIN=${ISOLATED_NOISE_SIGMA_MIN:-0.08}           # 孤立高斯干扰最小 sigma s
 ISOLATED_NOISE_SIGMA_MAX=${ISOLATED_NOISE_SIGMA_MAX:-0.35}           # 孤立高斯干扰最大 sigma s
 INPUT_MODE=${INPUT_MODE:-raw}                                        # 输入特征模式
 X_DTYPE=${X_DTYPE:-float16}                                          # 保存到磁盘的数据类型
-WORKERS=${WORKERS:-32}                                               # 并行生成 worker 数
+MIN_VISIBLE_CHANNELS=${MIN_VISIBLE_CHANNELS:-4}                      # 车辆至少可见通道数；避免专门生成短可见轨迹
+WORKERS=${WORKERS:-100}                                               # 并行生成 worker 数
 SEED=${SEED:-42}                                                     # 随机种子
 OVERWRITE=${OVERWRITE:-1}                                            # 是否覆盖已有输出目录
 
@@ -138,6 +139,7 @@ uv run python -m autotrack.dl.generate_track_slot_dataset \
   --isolated-noise-amp-max "$ISOLATED_NOISE_AMP_MAX" \
   --isolated-noise-sigma-min "$ISOLATED_NOISE_SIGMA_MIN" \
   --isolated-noise-sigma-max "$ISOLATED_NOISE_SIGMA_MAX" \
+  --min-visible-channels "$MIN_VISIBLE_CHANNELS" \
   --input-mode "$INPUT_MODE" \
   --x-dtype "$X_DTYPE" \
   --workers "$WORKERS" \

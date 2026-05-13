@@ -66,7 +66,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--x-dtype", choices=["float32", "float16"], default="float32", help="Stored dtype for x tensor.")
     parser.add_argument("--shard-size", type=int, default=256, help="Samples per shard.")
     parser.add_argument("--peak-candidates-per-channel", type=int, default=64, help="Peak candidates K per channel.")
-    parser.add_argument("--peak-min-distance-s", type=float, default=0.5, help="Minimum distance between peaks on one channel.")
+    parser.add_argument("--peak-min-distance-s", type=float, default=0.15, help="Minimum distance between peaks on one channel.")
     parser.add_argument("--peak-min-height", type=float, default=0.02, help="Minimum normalized peak height.")
     parser.add_argument("--peak-prominence", type=float, default=0.02, help="Minimum normalized peak prominence.")
     parser.add_argument("--peak-match-tolerance-s", type=float, default=0.25, help="Metadata value for GT matching tolerance.")

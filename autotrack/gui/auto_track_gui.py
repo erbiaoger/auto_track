@@ -175,11 +175,11 @@ class AutoTrackGUI(QMainWindow):
         _apply_tooltip(self.dl_model_path_btn, dl_model_tip)
         self.dl_model_path_btn.clicked.connect(self.browse_dl_model)
 
-        self.dl_objectness_threshold_input = QLineEdit("0.5")
+        self.dl_objectness_threshold_input = QLineEdit("0.35")
         _apply_tooltip(self.dl_objectness_threshold_input, "Deep Learning query 置信度阈值。越高越少误检，但可能漏车。")
         self.dl_visibility_threshold_input = QLineEdit("0.5")
         _apply_tooltip(self.dl_visibility_threshold_input, "每条轨迹中通道点是否可见的阈值。")
-        self.dl_min_visible_channels_input = QLineEdit("3")
+        self.dl_min_visible_channels_input = QLineEdit("2")
         _apply_tooltip(self.dl_min_visible_channels_input, "一条深度学习轨迹至少需要多少个可见通道点。")
         self.dl_refine_radius_samples_input = QLineEdit("120")
         _apply_tooltip(self.dl_refine_radius_samples_input, "深度学习预测点附近做局部峰值修正的搜索半径（采样点）。")

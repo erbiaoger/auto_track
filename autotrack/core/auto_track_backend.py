@@ -576,7 +576,8 @@ class AutoTrackBackend:
                 ratio = overlap / max(1, min(len(ex.points), len(tr.points)))
                 speed_diff = abs(float(ex.mean_speed_kmh) - float(tr.mean_speed_kmh))
                 speed_ok = (not np.isfinite(speed_diff)) or speed_diff <= 15.0
-                if ratio >= 0.6 and speed_ok:
+                unique_support = len(set(p.ch_idx for p in tr.points) - set(p.ch_idx for p in ex.points))
+                if ratio >= 0.75 and unique_support < 3 and speed_ok:
                     duplicate = True
                     break
             if not duplicate:
@@ -765,9 +766,9 @@ class AutoTrackBackend:
         dl_model_path: str = "",
         dl_model_family: str = "auto",
         dl_device: str = "",
-        dl_objectness_threshold: float = 0.5,
+        dl_objectness_threshold: float = 0.35,
         dl_visibility_threshold: float = 0.5,
-        dl_min_visible_channels: int = 3,
+        dl_min_visible_channels: int = 2,
         dl_refine_radius_samples: int = 120,
     ) -> dict:
         if self.data_all.size == 0:

@@ -12,7 +12,7 @@ Example:
         --out-dir datasets/peak_slot/train \
         --peak-candidates-per-channel 64 \
         --workers 8 \
-        --peak-min-distance-s 0.5 \
+        --peak-min-distance-s 0.15 \
         --peak-match-tolerance-s 0.25 \
         --overwrite
 
@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--in-dir", required=True, type=Path, help="Source track_slot dataset directory.")
     parser.add_argument("--out-dir", required=True, type=Path, help="Output peak_slot dataset directory.")
     parser.add_argument("--peak-candidates-per-channel", type=int, default=64, help="Peak candidates K per channel.")
-    parser.add_argument("--peak-min-distance-s", type=float, default=0.5, help="Minimum distance between candidates on one channel.")
+    parser.add_argument("--peak-min-distance-s", type=float, default=0.15, help="Minimum distance between candidates on one channel.")
     parser.add_argument("--peak-min-height", type=float, default=0.02, help="Minimum normalized absolute heatmap height.")
     parser.add_argument("--peak-prominence", type=float, default=0.02, help="Minimum normalized peak prominence.")
     parser.add_argument("--peak-match-tolerance-s", type=float, default=0.25, help="Max GT-to-candidate match distance before GT injection.")

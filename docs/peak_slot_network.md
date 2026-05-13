@@ -123,12 +123,12 @@ The 120 s branch defaults generate shorter windows in separate directories:
 ```text
 window_seconds = 120
 vehicles_min/max = 24/36
-default generated samples = 80000
+default generated samples = 40000
 primary_ratio = 0.8333333333
-realism_preset = xi_gauss_50
-track-slot data = datasets/track_slot_v3_120s_realistic/train
-peak-slot data = datasets/peak_slot_v3_120s_realistic/train
-model output = models/peak_slot_v3_120s_realistic_cuda
+realism_preset = xi_gauss_50_noisy_badch
+track-slot data = datasets/track_slot_v4_120s_noisy_badch/train
+peak-slot data = datasets/peak_slot_v4_120s_noisy_badch/train
+model output = models/peak_slot_v4_120s_noisy_badch_cuda
 ```
 
 `generate_track_slot_dataset.py` now supports interaction-heavy training
@@ -139,23 +139,24 @@ samples:
 --interaction-types crossing,overtake,near_parallel
 --interaction-time-min-frac 0.05
 --interaction-time-max-frac 0.95
---noise-std 0.0
---colored-noise-std 0.0
---channel-bias-std 0.0
---channel-gain-std 0.0
---baseline-drift-std 0.0
+--noise-std 0.04
+--colored-noise-std 0.08
+--channel-bias-std 0.03
+--channel-gain-std 0.08
+--baseline-drift-std 0.04
 --dead-channel-indices
---random-dead-channel-ratio 0.18
---random-dead-channel-min 1 --random-dead-channel-max 3
+--random-dead-channel-ratio 0.30
+--random-dead-channel-min 2 --random-dead-channel-max 10
 --zero-background-ratio 1.0
 --zero-background-rate 45
 --zero-background-channel-min 1 --zero-background-channel-max 4
 --zero-background-duration-min-s 0.8 --zero-background-duration-max-s 4.0
 --primary-ratio 0.8333333333
 --isolated-noise-ratio 1.0
---isolated-noise-rate 36
+--isolated-noise-rate 280
 --isolated-noise-amp-min 1 --isolated-noise-amp-max 6
 --isolated-noise-sigma-min 0.08 --isolated-noise-sigma-max 0.35
+--min-visible-channels 4
 ```
 
 The interaction time is sampled across the full window, not only the middle.
@@ -180,11 +181,10 @@ infer_trajectory_model.py --model-family peak_slot
     -> auto_tracks_deep.csv
 ```
 
-For inspection plots, the default prediction command is recall-oriented:
-`OBJECTNESS_THRESHOLD=0.35`, `MIN_VISIBLE_CHANNELS=2`, and
-`VITERBI_BEAM_SIZE=8`, while cross-slot conflict suppression stays enabled with
-`GLOBAL_CONFLICT_PENALTY=2.0`. If overlays show too many false positives, first
-raise `OBJECTNESS_THRESHOLD`.
+For inspection plots, the default prediction command uses the tuned balanced
+configuration: `OBJECTNESS_THRESHOLD=0.45`, `MIN_VISIBLE_CHANNELS=4`, and
+`EXTRA_CANDIDATE_SLOTS=8`, while cross-slot conflict suppression stays enabled
+with `GLOBAL_CONFLICT_PENALTY=2.0`.
 
 ## Commands
 
@@ -192,7 +192,7 @@ raise `OBJECTNESS_THRESHOLD`.
 sh generate_track_slot_dataset.sh
 sh convert_track_slot_to_peak_slot.sh
 DEVICE=cuda EPOCHS=20 BATCH_SIZE=32 sh train_peak_slot_cuda.sh
-MODEL=models/peak_slot_v2_120s_cuda/checkpoint_best.pt DATA_DIR=datasets/peak_slot_v2_120s/test sh predict_peak_slot_dataset.sh
+MODEL=models/peak_slot_v4_120s_noisy_badch_cuda/checkpoint_best.pt DATA_DIR=datasets/peak_slot_v4_120s_noisy_badch/test sh predict_peak_slot_dataset.sh
 ```
 
 Training defaults reserve a fixed 10% tail-shard validation split and evaluate

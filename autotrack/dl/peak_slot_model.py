@@ -45,7 +45,7 @@ from autotrack.dl.trajectory_set_model import (
 @dataclass
 class PeakDetectionConfig:
     candidates_per_channel: int = 64
-    min_distance_s: float = 0.5
+    min_distance_s: float = 0.15
     min_height: float = 0.02
     prominence: float = 0.02
     match_tolerance_s: float = 0.25
@@ -77,7 +77,7 @@ class InferenceConfig:
     speed_norm_kmh: float = 150.0
     clip_ratio: float = 1.35
     peak_candidates: int = 64
-    peak_min_distance_s: float = 0.5
+    peak_min_distance_s: float = 0.15
     peak_min_height: float = 0.02
     peak_prominence: float = 0.02
     use_viterbi_decoder: bool = True
@@ -100,8 +100,8 @@ class InferenceConfig:
     conflict_mode: str = "soft"
     duplicate_overlap_ratio: float = 0.75
     min_unique_support_channels: int = 3
-    extra_candidate_slots: int = 16
-    candidate_objectness_floor: float = 0.05
+    extra_candidate_slots: int = 32
+    candidate_objectness_floor: float = 0.02
     physics_smooth_tolerance_s: float = 2.0
 
 
@@ -1538,12 +1538,23 @@ def predict_tracks_from_window(
         else None
     )
     max_tracks = min(int(cfg.max_tracks), int(obj.shape[0]))
-    order = np.argsort(obj)[::-1][:max_tracks]
-    tracks: list[Track] = []
-    for q_idx in order.tolist():
-        score = float(obj[q_idx])
-        if score < float(cfg.objectness_threshold):
+    ranked_slots = np.argsort(obj)[::-1].tolist()
+    active_slots = [int(q_idx) for q_idx in ranked_slots if float(obj[int(q_idx)]) >= float(cfg.objectness_threshold)]
+    active_set = set(active_slots)
+    extra_slots: list[int] = []
+    for q_idx in ranked_slots:
+        q_int = int(q_idx)
+        if q_int in active_set:
             continue
+        if float(obj[q_int]) < float(cfg.candidate_objectness_floor):
+            continue
+        extra_slots.append(q_int)
+        if len(extra_slots) >= int(cfg.extra_candidate_slots):
+            break
+    order = (active_slots + extra_slots)[:max_tracks]
+    tracks: list[Track] = []
+    for q_idx in order:
+        score = float(obj[q_idx])
         decoder_mode = str(cfg.decoder_mode).lower()
         path_options: list[list[dict[str, float | int]]] = []
         if bool(cfg.use_viterbi_decoder) and decoder_mode == "beam_global":
