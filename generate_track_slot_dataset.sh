@@ -6,7 +6,7 @@ cd "$SCRIPT_DIR"
 
 REALISM_PRESET=${REALISM_PRESET:-xi_gauss_50}                         # 真实化预设名称，仅写入元数据便于追踪
 OUT_DIR=${OUT_DIR:-datasets/track_slot_v3_120s_realistic/train}      # track_slot 数据集输出目录
-NUM_SAMPLES=${NUM_SAMPLES:-80000}                                    # 总样本数
+NUM_SAMPLES=${NUM_SAMPLES:-40000}                                    # 总样本数
 SHARD_SIZE=${SHARD_SIZE:-256}                                        # 每个 shard 的样本数
 N_CH=${N_CH:-50}                                                     # 通道数
 FS=${FS:-1000}                                                       # 采样率 Hz
@@ -69,6 +69,7 @@ X_DTYPE=${X_DTYPE:-float16}                                          # 保存到
 WORKERS=${WORKERS:-32}                                               # 并行生成 worker 数
 SEED=${SEED:-42}                                                     # 随机种子
 OVERWRITE=${OVERWRITE:-1}                                            # 是否覆盖已有输出目录
+
 
 overwrite_args=""
 if [ "$OVERWRITE" = "1" ] || [ "$OVERWRITE" = "true" ]; then

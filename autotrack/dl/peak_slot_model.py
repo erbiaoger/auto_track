@@ -97,6 +97,9 @@ class InferenceConfig:
     viterbi_beam_size: int = 8
     time_prior_weight: float = 2.0
     global_conflict_penalty: float = 2.0
+    conflict_mode: str = "soft"
+    duplicate_overlap_ratio: float = 0.75
+    min_unique_support_channels: int = 3
     extra_candidate_slots: int = 16
     candidate_objectness_floor: float = 0.05
     physics_smooth_tolerance_s: float = 2.0
@@ -1368,7 +1371,14 @@ def _track_stats(track_id: int, direction: str, points: list[TrackPoint]) -> Tra
     )
 
 
-def _deduplicate_tracks(tracks: list[Track], tol_samples: int, min_overlap: int) -> list[Track]:
+def _deduplicate_tracks(
+    tracks: list[Track],
+    tol_samples: int,
+    min_overlap: int,
+    *,
+    duplicate_overlap_ratio: float = 0.75,
+    min_unique_support_channels: int = 3,
+) -> list[Track]:
     kept: list[Track] = []
     for track in sorted(tracks, key=lambda item: item.total_score, reverse=True):
         tmap = {int(p.ch_idx): int(p.t_idx) for p in track.points}
@@ -1378,6 +1388,11 @@ def _deduplicate_tracks(tracks: list[Track], tol_samples: int, min_overlap: int)
             common = sorted(set(tmap) & set(emap))
             if len(common) < int(min_overlap):
                 continue
+            min_len = max(1, min(len(tmap), len(emap)))
+            overlap_ratio = float(len(common) / min_len)
+            unique_support = len(set(tmap) - set(emap))
+            if overlap_ratio < float(duplicate_overlap_ratio) or unique_support >= int(min_unique_support_channels):
+                continue
             diffs = np.array([abs(tmap[ch] - emap[ch]) for ch in common], dtype=np.float64)
             if float(np.median(diffs)) <= float(tol_samples):
                 duplicate = True
@@ -1385,6 +1400,93 @@ def _deduplicate_tracks(tracks: list[Track], tol_samples: int, min_overlap: int)
         if not duplicate:
             kept.append(track)
     return [_track_stats(i, track.direction, track.points) for i, track in enumerate(kept)]
+
+
+def _track_channel_time_map(track: Track) -> dict[int, float]:
+    return {int(point.ch_idx): float(point.t_idx) for point in track.points}
+
+
+def _track_duplicate_decision(
+    track: Track,
+    existing: Track,
+    *,
+    duplicate_overlap_ratio: float,
+    min_unique_support_channels: int,
+    dedup_tolerance_samples: int,
+    dedup_min_overlap_channels: int,
+) -> tuple[bool, bool]:
+    tmap = _track_channel_time_map(track)
+    emap = _track_channel_time_map(existing)
+    common = sorted(set(tmap) & set(emap))
+    if len(common) < int(dedup_min_overlap_channels):
+        return False, False
+    min_len = max(1, min(len(tmap), len(emap)))
+    unique_support = len(set(tmap) - set(emap))
+    overlap_ratio = float(len(common) / min_len)
+    diffs = np.array([abs(tmap[ch] - emap[ch]) for ch in common], dtype=np.float64)
+    median_diff = float(np.median(diffs)) if diffs.size else float("inf")
+    near_duplicate = (
+        str(track.direction) == str(existing.direction)
+        and overlap_ratio >= float(duplicate_overlap_ratio)
+        and median_diff <= float(dedup_tolerance_samples)
+    )
+    has_unique_support = unique_support >= int(min_unique_support_channels)
+    return bool(near_duplicate and not has_unique_support), bool(near_duplicate and has_unique_support)
+
+
+def _soft_filter_conflicting_tracks(tracks: list[Track], cfg: InferenceConfig) -> list[Track]:
+    mode = str(cfg.conflict_mode).lower()
+    if mode == "off":
+        return tracks
+    if mode == "hard":
+        kept_tracks: list[Track] = []
+        for track in sorted(tracks, key=lambda item: item.total_score, reverse=True):
+            tmap = _track_channel_time_map(track)
+            conflict = False
+            for existing in kept_tracks:
+                emap = _track_channel_time_map(existing)
+                common = sorted(set(tmap) & set(emap))
+                if len(common) < int(cfg.dedup_min_overlap_channels):
+                    continue
+                diffs = np.array([abs(tmap[ch] - emap[ch]) for ch in common], dtype=np.float64)
+                if float(np.median(diffs)) <= float(cfg.dedup_tolerance_samples):
+                    conflict = True
+                    break
+            if not conflict:
+                kept_tracks.append(track)
+        return kept_tracks
+    if mode != "soft":
+        raise ValueError(f"Unsupported conflict_mode: {cfg.conflict_mode}")
+    kept_tracks = []
+    pending = list(tracks)
+    while pending:
+        def adjusted_score(item: Track) -> float:
+            base = float(item.total_score)
+            item_channels = set(_track_channel_time_map(item))
+            max_overlap = 0.0
+            for existing_item in kept_tracks:
+                existing_channels = set(_track_channel_time_map(existing_item))
+                min_len = max(1, min(len(item_channels), len(existing_channels)))
+                max_overlap = max(max_overlap, float(len(item_channels & existing_channels) / min_len))
+            return base - float(cfg.global_conflict_penalty) * max_overlap
+
+        track = max(pending, key=adjusted_score)
+        pending.remove(track)
+        duplicate = False
+        for existing in kept_tracks:
+            duplicate, _ = _track_duplicate_decision(
+                track,
+                existing,
+                duplicate_overlap_ratio=float(cfg.duplicate_overlap_ratio),
+                min_unique_support_channels=int(cfg.min_unique_support_channels),
+                dedup_tolerance_samples=int(cfg.dedup_tolerance_samples),
+                dedup_min_overlap_channels=int(cfg.dedup_min_overlap_channels),
+            )
+            if duplicate:
+                break
+        if not duplicate:
+            kept_tracks.append(track)
+    return kept_tracks
 
 
 def predict_tracks_from_window(
@@ -1508,26 +1610,13 @@ def predict_tracks_from_window(
             used_slots.add(int(track.track_id))
         tracks = best_per_slot
     if str(cfg.decoder_mode).lower() == "beam_global" and float(cfg.global_conflict_penalty) > 0.0:
-        kept_tracks: list[Track] = []
-        for track in sorted(tracks, key=lambda item: item.total_score, reverse=True):
-            tmap = {int(p.ch_idx): int(p.t_idx) for p in track.points}
-            conflict = False
-            for existing in kept_tracks:
-                emap = {int(p.ch_idx): int(p.t_idx) for p in existing.points}
-                common = sorted(set(tmap) & set(emap))
-                if len(common) < int(cfg.dedup_min_overlap_channels):
-                    continue
-                diffs = np.array([abs(tmap[ch] - emap[ch]) for ch in common], dtype=np.float64)
-                if float(np.median(diffs)) <= float(cfg.dedup_tolerance_samples):
-                    conflict = True
-                    break
-            if not conflict:
-                kept_tracks.append(track)
-        tracks = kept_tracks
+        tracks = _soft_filter_conflicting_tracks(tracks, cfg)
     return _deduplicate_tracks(
         tracks,
         tol_samples=int(cfg.dedup_tolerance_samples),
         min_overlap=int(cfg.dedup_min_overlap_channels),
+        duplicate_overlap_ratio=float(cfg.duplicate_overlap_ratio),
+        min_unique_support_channels=int(cfg.min_unique_support_channels),
     )
 
 

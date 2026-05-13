@@ -60,6 +60,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--plot-samples", type=int, default=16, help="Number of overlay figures to write.")
     parser.add_argument("--plot-dpi", type=int, default=160, help="DPI for overlay PNG figures.")
     parser.add_argument("--plot-style", default="waveform", choices=["waveform", "heatmap"], help="Overlay plot style: GUI-like waveform or heatmap.")
+    parser.add_argument("--plot-direction-filter", default="all", choices=["all", "forward", "reverse"], help="Direction filter used only for overlay PNG plots.")
+    parser.add_argument("--prediction-direction-filter", default="all", choices=["all", "forward", "reverse"], help="Direction filter applied to exported predictions and summary counts.")
     parser.add_argument("--objectness-threshold", type=float, default=0.35, help="Predicted slot objectness threshold. Lower values favor recall.")
     parser.add_argument("--extra-candidate-slots", type=int, default=16, help="Decode this many extra below-threshold slots by objectness rank.")
     parser.add_argument("--candidate-objectness-floor", type=float, default=0.05, help="Minimum objectness for extra decoded candidate slots.")
@@ -71,6 +73,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--viterbi-beam-size", type=int, default=8, help="Number of candidate paths retained per slot in beam_global decoding.")
     parser.add_argument("--time-prior-weight", type=float, default=2.0, help="Penalty weight for peak distance from time_prior.")
     parser.add_argument("--global-conflict-penalty", type=float, default=2.0, help="Enable cross-slot overlap suppression when > 0.")
+    parser.add_argument("--conflict-mode", default="soft", choices=["soft", "hard", "off"], help="Cross-slot conflict handling. soft preserves close vehicles with unique support.")
+    parser.add_argument("--duplicate-overlap-ratio", type=float, default=0.75, help="Minimum channel overlap ratio before soft conflict handling treats two paths as duplicates.")
+    parser.add_argument("--min-unique-support-channels", type=int, default=3, help="Minimum unique peak-supported channels needed to preserve a close path.")
     parser.add_argument("--viterbi-topk", type=int, default=16, help="Top peak candidates per channel considered by Viterbi.")
     parser.add_argument("--viterbi-candidate-threshold", type=float, default=0.01, help="Low probability floor for candidates entering Viterbi.")
     parser.add_argument("--viterbi-speed-min-kmh", type=float, default=60.0, help="Minimum hard transition speed for Viterbi.")
@@ -183,6 +188,181 @@ def _weighted_mean(sums: defaultdict[str, float], weights: defaultdict[str, floa
     return {key: float(sums[key] / max(1e-12, weights[key])) for key in sorted(sums) if weights[key] > 0.0}
 
 
+def _filter_predictions_by_direction(predictions: list[dict[str, Any]], direction_filter: str) -> list[dict[str, Any]]:
+    direction = str(direction_filter).lower()
+    if direction == "all":
+        return predictions
+    return [pred for pred in predictions if str(pred.get("direction", "")).lower() == direction]
+
+
+def _prediction_peak_set(pred: dict[str, Any]) -> set[tuple[int, int]]:
+    return {(int(ch), int(pk)) for ch, pk in zip(pred["channels"], pred["peak_indices"])}
+
+
+def _prediction_time_map(
+    pred: dict[str, Any],
+    targets_cpu: dict[str, torch.Tensor],
+    batch_index: int,
+    *,
+    time_downsample: int,
+) -> dict[int, int]:
+    return {
+        int(ch): int(targets_cpu["peak_index"][batch_index, int(ch), int(pk)].item()) * int(time_downsample)
+        for ch, pk in zip(pred["channels"], pred["peak_indices"])
+    }
+
+
+def _prediction_duplicate_decision(
+    pred: dict[str, Any],
+    existing: dict[str, Any],
+    targets_cpu: dict[str, torch.Tensor],
+    batch_index: int,
+    *,
+    time_downsample: int,
+    dedup_tolerance_samples: int,
+    duplicate_overlap_ratio: float,
+    min_unique_support_channels: int,
+    dedup_min_overlap_channels: int,
+) -> tuple[bool, bool, str]:
+    pred_times = _prediction_time_map(pred, targets_cpu, batch_index, time_downsample=int(time_downsample))
+    existing_times = _prediction_time_map(existing, targets_cpu, batch_index, time_downsample=int(time_downsample))
+    common_channels = sorted(set(pred_times) & set(existing_times))
+    if len(common_channels) < int(dedup_min_overlap_channels):
+        return False, False, "insufficient_overlap"
+    min_len = max(1, min(len(pred_times), len(existing_times)))
+    overlap_ratio = float(len(common_channels) / min_len)
+    peak_set = _prediction_peak_set(pred)
+    existing_set = _prediction_peak_set(existing)
+    unique_support = len(peak_set - existing_set)
+    diffs = np.array([abs(pred_times[ch] - existing_times[ch]) for ch in common_channels], dtype=np.float64)
+    median_diff = float(np.median(diffs)) if diffs.size else float("inf")
+    same_direction = str(pred.get("direction", "")) == str(existing.get("direction", ""))
+    near_duplicate = (
+        same_direction
+        and overlap_ratio >= float(duplicate_overlap_ratio)
+        and median_diff <= float(dedup_tolerance_samples)
+    )
+    if near_duplicate and unique_support < int(min_unique_support_channels):
+        reason = f"duplicate overlap={overlap_ratio:.3f} unique={unique_support} median_dt_samples={median_diff:.1f}"
+        return True, False, reason
+    if near_duplicate:
+        reason = f"close_kept overlap={overlap_ratio:.3f} unique={unique_support} median_dt_samples={median_diff:.1f}"
+        return False, True, reason
+    return False, False, f"distinct overlap={overlap_ratio:.3f} unique={unique_support} median_dt_samples={median_diff:.1f}"
+
+
+def _filter_prediction_conflicts(
+    predictions: list[dict[str, Any]],
+    targets_cpu: dict[str, torch.Tensor],
+    batch_index: int,
+    *,
+    sample_index: int,
+    time_downsample: int,
+    inference_config: InferenceConfig,
+    diagnostics: Optional[dict[str, Any]] = None,
+) -> list[dict[str, Any]]:
+    mode = str(inference_config.conflict_mode).lower()
+    if diagnostics is not None:
+        diagnostics["raw_candidate_count"] = int(len(predictions))
+        diagnostics["duplicate_removed_count"] = 0
+        diagnostics["close_pair_kept_count"] = 0
+        diagnostics.setdefault("rows", [])
+    if mode == "off":
+        return predictions
+    kept: list[dict[str, Any]] = []
+    if mode == "soft":
+        pending = list(predictions)
+        while pending:
+            def adjusted_score(item: dict[str, Any]) -> float:
+                base = float(item.get("selection_score", item["score"]))
+                item_set = _prediction_peak_set(item)
+                max_overlap = 0.0
+                for existing_item in kept:
+                    existing_set = _prediction_peak_set(existing_item)
+                    min_len = max(1, min(len(item_set), len(existing_set)))
+                    max_overlap = max(max_overlap, float(len(item_set & existing_set) / min_len))
+                return base - float(inference_config.global_conflict_penalty) * max_overlap
+
+            pred = max(pending, key=adjusted_score)
+            pending.remove(pred)
+            duplicate = False
+            close_kept = False
+            reason = "kept"
+            for existing in kept:
+                duplicate, close_kept_one, reason = _prediction_duplicate_decision(
+                    pred,
+                    existing,
+                    targets_cpu,
+                    batch_index,
+                    time_downsample=int(time_downsample),
+                    dedup_tolerance_samples=int(inference_config.dedup_tolerance_samples),
+                    duplicate_overlap_ratio=float(inference_config.duplicate_overlap_ratio),
+                    min_unique_support_channels=int(inference_config.min_unique_support_channels),
+                    dedup_min_overlap_channels=int(inference_config.dedup_min_overlap_channels),
+                )
+                close_kept = close_kept or close_kept_one
+                if duplicate:
+                    break
+            if diagnostics is not None:
+                diagnostics["rows"].append(
+                    {
+                        "sample_index": int(sample_index),
+                        "slot": int(pred["slot"]),
+                        "rank": int(pred["rank"]),
+                        "score": f"{float(pred['score']):.6f}",
+                        "direction": str(pred["direction"]),
+                        "point_count": int(len(pred["channels"])),
+                        "action": "removed_duplicate" if duplicate else "kept",
+                        "reason": reason,
+                    }
+                )
+            if duplicate:
+                if diagnostics is not None:
+                    diagnostics["duplicate_removed_count"] += 1
+                continue
+            if close_kept and diagnostics is not None:
+                diagnostics["close_pair_kept_count"] += 1
+            kept.append(pred)
+        return kept
+    for pred in sorted(predictions, key=lambda item: float(item.get("selection_score", item["score"])), reverse=True):
+        duplicate = False
+        close_kept = False
+        reason = "kept"
+        if mode == "hard":
+            peak_set = _prediction_peak_set(pred)
+            for existing in kept:
+                existing_set = _prediction_peak_set(existing)
+                common = len(peak_set & existing_set)
+                min_len = max(1, min(len(peak_set), len(existing_set)))
+                if common >= 3 or common / min_len >= 0.35:
+                    duplicate = True
+                    reason = f"hard_conflict common={common} ratio={common / min_len:.3f}"
+                    break
+        else:
+            raise ValueError(f"Unsupported conflict_mode: {inference_config.conflict_mode}")
+        if diagnostics is not None:
+            diagnostics["rows"].append(
+                {
+                    "sample_index": int(sample_index),
+                    "slot": int(pred["slot"]),
+                    "rank": int(pred["rank"]),
+                    "score": f"{float(pred['score']):.6f}",
+                    "direction": str(pred["direction"]),
+                    "point_count": int(len(pred["channels"])),
+                    "action": "removed_duplicate" if duplicate else "kept",
+                    "reason": reason,
+                }
+            )
+        if duplicate:
+            if diagnostics is not None:
+                diagnostics["duplicate_removed_count"] += 1
+            continue
+        if close_kept and diagnostics is not None:
+            diagnostics["close_pair_kept_count"] += 1
+        kept.append(pred)
+    return kept
+
+
 def _active_predictions(
     outputs_cpu: dict[str, torch.Tensor],
     targets_cpu: dict[str, torch.Tensor],
@@ -197,6 +377,8 @@ def _active_predictions(
     dx_m: float,
     time_downsample: int,
     inference_config: InferenceConfig,
+    sample_index: int = -1,
+    diagnostics: Optional[dict[str, Any]] = None,
 ) -> list[dict[str, Any]]:
     obj = torch.sigmoid(outputs_cpu["objectness_logits"][batch_index])
     peak_prob = torch.softmax(outputs_cpu["peak_logits"][batch_index], dim=-1)
@@ -300,20 +482,20 @@ def _active_predictions(
             used_slots.add(slot)
         predictions = best_per_slot
     if str(inference_config.decoder_mode).lower() == "beam_global" and float(inference_config.global_conflict_penalty) > 0.0:
-        kept: list[dict[str, Any]] = []
-        for pred in sorted(predictions, key=lambda item: float(item.get("selection_score", item["score"])), reverse=True):
-            peak_set = {(int(ch), int(pk)) for ch, pk in zip(pred["channels"], pred["peak_indices"])}
-            conflict = False
-            for existing in kept:
-                existing_set = {(int(ch), int(pk)) for ch, pk in zip(existing["channels"], existing["peak_indices"])}
-                common = len(peak_set & existing_set)
-                min_len = max(1, min(len(peak_set), len(existing_set)))
-                if common >= 3 or common / min_len >= 0.35:
-                    conflict = True
-                    break
-            if not conflict:
-                kept.append(pred)
-        predictions = kept
+        predictions = _filter_prediction_conflicts(
+            predictions,
+            targets_cpu,
+            batch_index,
+            sample_index=int(sample_index),
+            time_downsample=int(time_downsample),
+            inference_config=inference_config,
+            diagnostics=diagnostics,
+        )
+    elif diagnostics is not None:
+        diagnostics["raw_candidate_count"] = int(len(predictions))
+        diagnostics["duplicate_removed_count"] = 0
+        diagnostics["close_pair_kept_count"] = 0
+        diagnostics.setdefault("rows", [])
     return predictions
 
 
@@ -572,6 +754,9 @@ def main() -> int:
         viterbi_beam_size=int(args.viterbi_beam_size),
         time_prior_weight=float(time_prior_weight),
         global_conflict_penalty=float(args.global_conflict_penalty),
+        conflict_mode=str(args.conflict_mode),
+        duplicate_overlap_ratio=float(args.duplicate_overlap_ratio),
+        min_unique_support_channels=int(args.min_unique_support_channels),
         extra_candidate_slots=int(args.extra_candidate_slots),
         candidate_objectness_floor=float(args.candidate_objectness_floor),
         viterbi_topk=int(args.viterbi_topk),
@@ -588,6 +773,7 @@ def main() -> int:
     )
     summary_path = out_dir / "summary.json"
     sample_summary_path = out_dir / "sample_summary.csv"
+    prediction_diagnostics_path = out_dir / "prediction_diagnostics.csv"
     pred_csv_path = out_dir / "predicted_tracks.csv"
     gt_csv_path = out_dir / "ground_truth_tracks.csv"
     plots_dir = out_dir / "plots"
@@ -606,6 +792,9 @@ def main() -> int:
     decoded_smooth_bad = 0
     decoded_peak_use_total = 0
     decoded_peak_conflict_total = 0
+    duplicate_removed_total = 0
+    close_pair_kept_total = 0
+    raw_candidate_total = 0
     sample_count = 0
     csv_sample_count = 0
     plot_sample_count = 0
@@ -613,12 +802,25 @@ def main() -> int:
     t0 = time.perf_counter()
     pred_fields = ["sample_index", "pred_track_id", "slot", "rank", "score", "direction", "speed_kmh", "channel", "peak_index", "time_norm", "peak_amp", "peak_prob"]
     gt_fields = ["sample_index", "gt_track_id", "direction", "channel", "peak_index", "time_norm"]
-    sample_fields = ["sample_index", "gt_count", "pred_count", "max_objectness", "mean_objectness", "top_score"]
-    with sample_summary_path.open("w", newline="", encoding="utf-8") as sample_fp, pred_csv_path.open("w", newline="", encoding="utf-8") as pred_fp:
+    sample_fields = [
+        "sample_index",
+        "gt_count",
+        "raw_candidate_count",
+        "pred_count",
+        "duplicate_removed_count",
+        "close_pair_kept_count",
+        "max_objectness",
+        "mean_objectness",
+        "top_score",
+    ]
+    diag_fields = ["sample_index", "slot", "rank", "score", "direction", "point_count", "action", "reason"]
+    with sample_summary_path.open("w", newline="", encoding="utf-8") as sample_fp, pred_csv_path.open("w", newline="", encoding="utf-8") as pred_fp, prediction_diagnostics_path.open("w", newline="", encoding="utf-8") as diag_fp:
         sample_writer = csv.DictWriter(sample_fp, fieldnames=sample_fields)
         pred_writer = csv.DictWriter(pred_fp, fieldnames=pred_fields)
+        diag_writer = csv.DictWriter(diag_fp, fieldnames=diag_fields)
         sample_writer.writeheader()
         pred_writer.writeheader()
+        diag_writer.writeheader()
         gt_fp = None
         gt_writer: Optional[csv.DictWriter] = None
         if not bool(args.no_ground_truth_csv):
@@ -675,6 +877,7 @@ def main() -> int:
                     outputs_cpu = {key: value.detach().cpu() if torch.is_tensor(value) else value for key, value in outputs.items()}
                     obj_cpu = torch.sigmoid(outputs_cpu["objectness_logits"])
                     for b, sample_index in enumerate(sample_indices):
+                        conflict_diagnostics: dict[str, Any] = {}
                         predictions = _active_predictions(
                             outputs_cpu,
                             targets_cpu,
@@ -688,7 +891,18 @@ def main() -> int:
                             dx_m=dx_m,
                             time_downsample=time_downsample,
                             inference_config=inference_config,
+                            sample_index=int(sample_index),
+                            diagnostics=conflict_diagnostics,
                         )
+                        predictions = _filter_predictions_by_direction(predictions, str(args.prediction_direction_filter))
+                        raw_candidate_count = int(conflict_diagnostics.get("raw_candidate_count", len(predictions)))
+                        duplicate_removed_count = int(conflict_diagnostics.get("duplicate_removed_count", 0))
+                        close_pair_kept_count = int(conflict_diagnostics.get("close_pair_kept_count", 0))
+                        raw_candidate_total += raw_candidate_count
+                        duplicate_removed_total += duplicate_removed_count
+                        close_pair_kept_total += close_pair_kept_count
+                        for row in conflict_diagnostics.get("rows", []):
+                            diag_writer.writerow(row)
                         gt_count = int(targets_cpu["gt_valid"][b].sum().item())
                         pred_count = int(len(predictions))
                         decoded_counts = _decoded_physics_counts(
@@ -720,7 +934,10 @@ def main() -> int:
                             {
                                 "sample_index": int(sample_index),
                                 "gt_count": gt_count,
+                                "raw_candidate_count": raw_candidate_count,
                                 "pred_count": pred_count,
+                                "duplicate_removed_count": duplicate_removed_count,
+                                "close_pair_kept_count": close_pair_kept_count,
                                 "max_objectness": f"{float(obj_cpu[b].max().item()):.6f}",
                                 "mean_objectness": f"{float(obj_cpu[b].mean().item()):.6f}",
                                 "top_score": "" if not math.isfinite(top_score) else f"{top_score:.6f}",
@@ -732,11 +949,12 @@ def main() -> int:
                                 _write_ground_truth_rows(gt_writer, sample_index=int(sample_index), targets_cpu=targets_cpu, batch_index=b)
                             csv_sample_count += 1
                         if int(args.plot_samples) > 0 and plot_sample_count < int(args.plot_samples):
+                            plot_predictions = _filter_predictions_by_direction(predictions, str(args.plot_direction_filter))
                             _plot_sample_overlay(
                                 plots_dir / f"sample_{int(sample_index):06d}.png",
                                 heatmap=x_cpu[b, 0],
                                 sample_index=int(sample_index),
-                                predictions=predictions,
+                                predictions=plot_predictions,
                                 targets_cpu=targets_cpu,
                                 batch_index=b,
                                 window_seconds=float(meta.get("window_seconds", 1.0)),
@@ -776,6 +994,9 @@ def main() -> int:
             "viterbi_beam_size": int(inference_config.viterbi_beam_size),
             "time_prior_weight": float(inference_config.time_prior_weight),
             "global_conflict_penalty": float(inference_config.global_conflict_penalty),
+            "conflict_mode": str(inference_config.conflict_mode),
+            "duplicate_overlap_ratio": float(inference_config.duplicate_overlap_ratio),
+            "min_unique_support_channels": int(inference_config.min_unique_support_channels),
             "extra_candidate_slots": int(inference_config.extra_candidate_slots),
             "candidate_objectness_floor": float(inference_config.candidate_objectness_floor),
             "viterbi_candidate_threshold": float(inference_config.viterbi_candidate_threshold),
@@ -785,13 +1006,20 @@ def main() -> int:
             "viterbi_inertia_penalty": float(inference_config.viterbi_inertia_penalty),
             "viterbi_slope_memory": float(inference_config.viterbi_slope_memory),
         },
+        "filters": {
+            "prediction_direction_filter": str(args.prediction_direction_filter),
+            "plot_direction_filter": str(args.plot_direction_filter),
+        },
         "loss_metrics": _weighted_mean(loss_sums, loss_weights),
         "batch_mean_detection_metrics": _weighted_mean(metric_sums, metric_weights),
         "filtered_count_metrics": {
+            "raw_candidate_count": int(raw_candidate_total),
             "pred_count": int(filtered_pred_total),
             "gt_count": int(filtered_gt_total),
             "count_mae": filtered_count_mae,
             "count_acc": filtered_count_acc,
+            "duplicate_removed_count": int(duplicate_removed_total),
+            "close_pair_kept_count": int(close_pair_kept_total),
         },
         "filtered_physics_metrics": {
             "pair_count": int(decoded_pair_total),
@@ -803,6 +1031,7 @@ def main() -> int:
         "outputs": {
             "summary_json": str(summary_path),
             "sample_summary_csv": str(sample_summary_path),
+            "prediction_diagnostics_csv": str(prediction_diagnostics_path),
             "predicted_tracks_csv": str(pred_csv_path),
             "ground_truth_tracks_csv": None if bool(args.no_ground_truth_csv) else str(gt_csv_path),
             "plots_dir": str(plots_dir) if int(args.plot_samples) > 0 else None,
