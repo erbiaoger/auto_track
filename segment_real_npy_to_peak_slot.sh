@@ -20,8 +20,8 @@ set -eu
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$SCRIPT_DIR"
 
-INPUT=${INPUT:-/Volumes/SanDisk2T4/MyProjects/BaFang/xi/saved_arrays/gauss_section.npy} # 输入真实 .npy 文件
-OUT_DIR=${OUT_DIR:-datasets/peak_slot/xi_gauss_50_120s_stride60}                           # 输出 peak_slot 数据目录
+INPUT=${INPUT:-/Volumes/SanDisk2T4/MyProjects/BaFang/xi/saved_arrays04/gauss_section.npy} # 输入真实 .npy 文件
+OUT_DIR=${OUT_DIR:-datasets/peak_slot/xi_gauss_50_120s_stride60_saved_arrays04}            # 输出 peak_slot 数据目录
 ARRAY_LAYOUT=${ARRAY_LAYOUT:-time_channel}                                                  # 输入数组布局
 FS=${FS:-1000}                                                                              # 采样率 Hz
 DX_M=${DX_M:-100}                                                                           # 通道间距 m
