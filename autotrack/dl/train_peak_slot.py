@@ -234,13 +234,27 @@ def _convert_x_dtype(x: torch.Tensor, x_transfer_dtype: str) -> torch.Tensor:
 
 
 class EpochShuffleSampler(Sampler[int]):
-    """Deterministic per-epoch sampler compatible with persistent workers."""
+    """Deterministic per-epoch sampler compatible with persistent workers.
 
-    def __init__(self, length: int, *, seed: int, epoch: int, shuffle: bool):
+    When shard offsets are available, keep accesses shard-local so worker shard
+    caches can actually help. We still shuffle shard order per epoch and shuffle
+    sample order inside each shard.
+    """
+
+    def __init__(
+        self,
+        length: int,
+        *,
+        seed: int,
+        epoch: int,
+        shuffle: bool,
+        shard_offsets: Optional[list[tuple[int, int]]] = None,
+    ):
         self.length = int(length)
         self.seed = int(seed)
         self.epoch = int(epoch)
         self.shuffle = bool(shuffle)
+        self.shard_offsets = list(shard_offsets or [])
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
@@ -250,6 +264,16 @@ class EpochShuffleSampler(Sampler[int]):
             return iter(range(self.length))
         gen = torch.Generator(device="cpu")
         gen.manual_seed(self.seed + self.epoch * 97_531)
+        if self.shard_offsets:
+            order: list[int] = []
+            for shard_id in torch.randperm(len(self.shard_offsets), generator=gen).tolist():
+                start, stop = self.shard_offsets[int(shard_id)]
+                shard_len = max(0, int(stop) - int(start))
+                if shard_len <= 0:
+                    continue
+                local_order = torch.randperm(shard_len, generator=gen).tolist()
+                order.extend(int(start) + int(offset) for offset in local_order)
+            return iter(order)
         return iter(torch.randperm(self.length, generator=gen).tolist())
 
     def __len__(self) -> int:
@@ -279,16 +303,22 @@ class PeakSlotShardDataset(Dataset):
         self.worker_shard_cache_size = int(worker_shard_cache_size)
         self._cache: OrderedDict[str, dict[str, torch.Tensor]] = OrderedDict()
         refs: list[tuple[str, int]] = []
+        shard_offsets: list[tuple[int, int]] = []
         limit = int(max_samples)
         for shard in shards:
+            shard_start = len(refs)
             n = _shard_sample_count(meta, all_shards, shard)
             for idx in range(n):
                 if limit > 0 and len(refs) >= limit:
                     break
                 refs.append((str(shard), int(idx)))
+            shard_stop = len(refs)
+            if shard_stop > shard_start:
+                shard_offsets.append((shard_start, shard_stop))
             if limit > 0 and len(refs) >= limit:
                 break
         self.refs = refs
+        self.shard_offsets = shard_offsets
 
     def __len__(self) -> int:
         return len(self.refs)
@@ -440,7 +470,13 @@ def _make_dataloader(
         x_transfer_dtype=str(x_transfer_dtype),
         worker_shard_cache_size=int(worker_shard_cache_size),
     )
-    sampler = EpochShuffleSampler(len(dataset), seed=int(seed), epoch=int(epoch), shuffle=bool(shuffle))
+    sampler = EpochShuffleSampler(
+        len(dataset),
+        seed=int(seed),
+        epoch=int(epoch),
+        shuffle=bool(shuffle),
+        shard_offsets=dataset.shard_offsets,
+    )
     loader_kwargs = {
         "dataset": dataset,
         "batch_size": int(batch_size),
