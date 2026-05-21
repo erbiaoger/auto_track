@@ -6,12 +6,12 @@ cd "$SCRIPT_DIR"
 
 DATA_DIR=${DATA_DIR:-datasets/peak_slot_v4_120s_noisy_badch/test}              # 待预测的数据目录
 MODEL=${MODEL:-models/peak_slot_v4_120s_noisy_badch_cuda/checkpoint_best.pt}   # checkpoint 路径
-OUT_DIR=${OUT_DIR:-models/peak_slot_v4_120s_noisy_badch_cuda/prediction_check_tuned} # 预测结果输出目录
+OUT_DIR=${OUT_DIR:-predicts/peak_slot_v4_120s_noisy_badch_cuda/prediction_check_tuned} # 预测结果输出目录
 DEVICE=${DEVICE:-cpu}                                                 # 推理设备
-BATCH_SIZE=${BATCH_SIZE:-16}                                          # 推理 batch 大小
+BATCH_SIZE=${BATCH_SIZE:-64}                                          # 推理 batch 大小
 MAX_SAMPLES=${MAX_SAMPLES:-256}                                       # 最多预测多少个样本
 MAX_CSV_SAMPLES=${MAX_CSV_SAMPLES:-32}                                # 最多导出多少个样本的 CSV
-PLOT_SAMPLES=${PLOT_SAMPLES:-16}                                      # 最多绘制多少张图
+PLOT_SAMPLES=${PLOT_SAMPLES:-60}                                      # 最多绘制多少张图
 PLOT_DPI=${PLOT_DPI:-160}                                             # 绘图 DPI
 PLOT_STYLE=${PLOT_STYLE:-waveform}                                    # 绘图风格：waveform 或 heatmap
 PLOT_DIRECTION_FILTER=${PLOT_DIRECTION_FILTER:-forward}                   # 绘图方向：all, forward, reverse

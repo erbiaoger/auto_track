@@ -14,6 +14,8 @@ datasets/*
 !datasets/README.md
 models/*
 !models/README.md
+predicts/*
+!predicts/.gitkeep
 *.sac
 *.mseed
 *.npz

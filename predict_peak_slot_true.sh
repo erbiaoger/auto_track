@@ -4,10 +4,10 @@ set -eu
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$SCRIPT_DIR"
 
-DATA_DIR=${DATA_DIR:-datasets/peak_slot_v2_120s/xi_gauss_50_120s_stride60}              # 真实/无标签数据目录
+DATA_DIR=${DATA_DIR:-datasets/xi_gauss_50_120s_large/test}              # 真实/无标签数据目录
 MODEL=${MODEL:-models/peak_slot_v4_120s_noisy_badch_cuda/checkpoint_best.pt}     # checkpoint 路径
-OUT_DIR=${OUT_DIR:-models/peak_slot_v4_120s_noisy_badch_cuda/prediction_check}   # 预测结果输出目录
-DEVICE=${DEVICE:-cpu}                                                 # 推理设备
+OUT_DIR=${OUT_DIR:-predicts/peak_slot_v4_120s_noisy_badch_cuda/prediction_large}   # 预测结果输出目录
+DEVICE=${DEVICE:-cuda}                                                 # 推理设备
 BATCH_SIZE=${BATCH_SIZE:-16}                                          # 推理 batch 大小
 MAX_SAMPLES=${MAX_SAMPLES:-256}                                       # 最多预测多少个样本
 MAX_CSV_SAMPLES=${MAX_CSV_SAMPLES:-32}                                # 最多导出多少个样本的 CSV
