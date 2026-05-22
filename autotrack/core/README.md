@@ -8,7 +8,8 @@ Core trajectory extraction and backend integration code.
   exposes them through the backend extraction API. It supports `query_points`,
   `query_masks`, and `track_slot`.
 - `auto_track_backend.py`: data loading, tiling, deduplication, stitching, CSV
-  export, and GUI-facing orchestration.
+  export, and GUI-facing orchestration. It accepts SAC folders and direct real
+  DAS `.npy` imports for the GUI.
 - `auto_track_torch_mps.py`: PyTorch/MPS helper path for classic extraction.
 
 The deep-learning adapter returns the same `Track` objects as the classic

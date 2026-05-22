@@ -25,7 +25,17 @@ def _resolve_model_family(model_path: str, requested_family: Optional[str]) -> s
     if family in {"query_points", "query_masks", "track_slot", "peak_slot"}:
         return family
     checkpoint = torch.load(str(Path(model_path).expanduser()), map_location="cpu", weights_only=False)
-    return str(checkpoint.get("model_family", "query_points")).strip().lower()
+    ckpt_family = str(checkpoint.get("model_family", "")).strip().lower()
+    if ckpt_family in {"query_points", "query_masks", "track_slot", "peak_slot"}:
+        return ckpt_family
+    model_config = dict(checkpoint.get("model_config", {}))
+    if "peak_candidates" in model_config:
+        return "peak_slot"
+    if "match_time_bins" in model_config:
+        return "query_masks"
+    if "max_tracks" in model_config:
+        return "track_slot"
+    return "query_points"
 
 
 def _load_cached_model(model_path: str, device: Optional[str], model_family: str):
@@ -70,16 +80,21 @@ def extract_all_deep_learning(
     vmax_kmh: float,
     config: Optional[dict] = None,
 ) -> list[Track]:
-    del direction
+    requested_direction = str(direction).strip().lower()
+    if requested_direction not in {"forward", "reverse"}:
+        raise ValueError("direction must be either forward or reverse")
     cfg = dict(config or {})
     model_path = str(cfg.get("model_path", "")).strip()
     if not model_path:
         raise ValueError("Deep-learning engine requires model_path in config")
+    diagnostics_sink = cfg.get("_diagnostics_sink")
 
     resolved_device = _resolve_device(cfg.get("device"))
     model_family = _resolve_model_family(model_path, cfg.get("model_family"))
     model, checkpoint, model_family = _load_cached_model(model_path, resolved_device, model_family)
     dataset_cfg = dict(checkpoint.get("dataset_config", {}))
+    trained_window_seconds = float(dict(checkpoint.get("dataset_meta", {})).get("window_seconds", 0.0) or 0.0)
+    infer_window_seconds = float(np.asarray(data, dtype=np.float32).shape[1]) / float(fs)
     if model_family == "peak_slot":
         from autotrack.dl import peak_slot_model as pk
 
@@ -129,6 +144,7 @@ def extract_all_deep_learning(
             objectness_threshold=float(cfg.get("objectness_threshold", 0.5)),
             visibility_threshold=float(cfg.get("visibility_threshold", 0.5)),
             min_visible_channels=int(cfg.get("min_visible_channels", 3)),
+            refine_radius_samples=int(cfg.get("refine_radius_samples", 120)),
             max_tracks=int(cfg.get("max_tracks", 96)),
             dedup_tolerance_samples=int(cfg.get("dedup_tolerance_samples", 180)),
             speed_norm_kmh=float(dataset_cfg.get("speed_norm_kmh", 150.0)),
@@ -167,11 +183,43 @@ def extract_all_deep_learning(
         predict_fn = pm.predict_tracks_from_window
     arr = np.asarray(data, dtype=np.float32)
     x_axis_m = np.arange(arr.shape[0], dtype=np.float64) * float(dx_m)
-    return predict_fn(
-        model=model,
-        data_window=arr,
-        fs=float(fs),
-        x_axis_m=x_axis_m,
-        config=inference_cfg,
-        device=resolved_device,
-    )
+    if model_family == "peak_slot" and isinstance(diagnostics_sink, dict):
+        tracks, diagnostics = predict_fn(
+            model=model,
+            data_window=arr,
+            fs=float(fs),
+            x_axis_m=x_axis_m,
+            config=inference_cfg,
+            device=resolved_device,
+            return_diagnostics=True,
+        )
+        diagnostics_sink.clear()
+        diagnostics_sink.update(diagnostics)
+        if trained_window_seconds > 0.0:
+            window_ratio = infer_window_seconds / max(1e-6, trained_window_seconds)
+            diagnostics_sink["trained_window_seconds"] = float(trained_window_seconds)
+            diagnostics_sink["infer_window_seconds"] = float(infer_window_seconds)
+            diagnostics_sink["window_seconds_ratio"] = float(window_ratio)
+            if abs(window_ratio - 1.0) > 0.1:
+                diagnostics_sink["warning_window_mismatch"] = (
+                    f"Checkpoint trained for {trained_window_seconds:.1f}s windows, "
+                    f"but inference used {infer_window_seconds:.1f}s "
+                    f"(ratio={window_ratio:.2f}). Peak normalization, candidate detection, "
+                    "and vehicle-count prior may all be miscalibrated."
+                )
+    else:
+        tracks = predict_fn(
+            model=model,
+            data_window=arr,
+            fs=float(fs),
+            x_axis_m=x_axis_m,
+            config=inference_cfg,
+            device=resolved_device,
+        )
+        if isinstance(diagnostics_sink, dict):
+            diagnostics_sink.clear()
+    return [
+        track
+        for track in tracks
+        if str(getattr(track, "direction", "")).strip().lower() == requested_direction
+    ]

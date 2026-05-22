@@ -5,6 +5,11 @@ Deep-learning code for DAS vehicle trajectory recognition.
 ## TrackSlotNet Files
 
 - `generate_track_slot_dataset.py`: creates tensor shards for TrackSlotNet
+- `generate_track_slot_dataset_from_real_npy.py`: creates TrackSlotNet shards by sampling real `.npy` background windows and overlaying synthetic vehicles. Use this when pure synthetic backgrounds are too far from the real sparse DAS distribution.
+  It now supports `--profile`, `--profile-strength`, `--window-sampler`, and
+  `--artifact-policy`, so the generator can default to a
+  `realism_profile.json`-driven mode while still letting explicit CLI
+  arguments override any profile-derived defaults.
   training. It writes `meta.json` and `shard_*.pt`; it does not write or read
   SAC files. The default motion mix is `constant_sparse,smooth_random,stop_go`
   with rare stop-go events. The default shell preset targets v4 noisy/bad-channel
@@ -31,6 +36,15 @@ Deep-learning code for DAS vehicle trajectory recognition.
 - `convert_track_slot_to_peak_slot.py`: converts existing TrackSlotNet shards
   into peak-candidate shards with `peak_time`, `peak_amp`, `peak_valid`, and
   `gt_peak_index`.
+- `analyze_peak_slot_domain_gap.py`: compares a reference peak-slot dataset and
+  a target peak-slot dataset, and can optionally run a PeakSlotNet checkpoint on
+  both to quantify objectness/count drift. It writes `summary.json` and
+  `report.md`, which is useful when synthetic validation looks good but real
+  data over-predicts.
+- `calibrate_realbg_generator.py`: compares one or more generated `track_slot`
+  or `peak_slot` datasets against `realism_profile.json`, scores their domain
+  mismatch, and writes `calibration_summary.json` plus
+  `calibration_report.md`.
 - `segment_real_npy_to_peak_slot.py`: cuts an unlabeled real DAS `.npy` array
   into overlapping PeakSlotNet shards for direct prediction/inspection.
 - `peak_slot_model.py`: PeakSlotNet model, Hungarian/greedy set loss, metrics,
@@ -58,6 +72,7 @@ Deep-learning code for DAS vehicle trajectory recognition.
 
 ```sh
 uv run python -m autotrack.dl.generate_track_slot_dataset --out-dir datasets/track_slot/train --num-samples 1024 --shard-size 128 --workers 8 --overwrite
+uv run python -m autotrack.dl.generate_track_slot_dataset_from_real_npy --input /Volumes/SanDisk2T4/MyProjects/BaFang/xi/00gauss_large.npy --out-dir datasets/track_slot_realbg/train --num-samples 1024 --shard-size 128 --window-seconds 120 --window-stride-seconds 60 --channel-count 50 --vehicles-min 6 --vehicles-max 24 --overwrite
 uv run python -m autotrack.dl.train_track_slot --data-dir datasets/track_slot/train --out-dir models/track_slot_cuda --device cuda --amp on
 uv run python -m autotrack.dl.train_track_slot --data-dir datasets/track_slot/train --out-dir models/track_slot_cuda --device cuda --amp on --epochs 200 --auto-resume
 uv run python -m autotrack.dl.plot_track_slot_history --run-dir models/track_slot_cuda --separate
@@ -68,6 +83,22 @@ uv run python -m autotrack.dl.segment_real_npy_to_peak_slot --input /Volumes/San
 uv run python -m autotrack.dl.plot_dataset_labels --data-dir datasets/peak_slot/train --out-dir /tmp/peak_slot_label_check --sample-indices 6 --plot-peaks
 uv run python -m autotrack.dl.train_peak_slot --data-dir datasets/peak_slot/train --out-dir models/peak_slot_cuda --device cuda --amp on
 uv run python -m autotrack.dl.predict_peak_slot_dataset --data-dir datasets/peak_slot/train --model models/peak_slot_cuda/checkpoint_best.pt --out-dir /tmp/peak_slot_prediction_check --device cuda --max-samples 128
+uv run python -m autotrack.dl.analyze_peak_slot_domain_gap --reference-dir datasets/peak_slot_v3_120s_realistic/test --target-dir datasets/peak_slot/xi_gauss_50_120s_stride60_saved_arrays04 --model models/peak_slot_v4_120s_noisy_badch_cuda/checkpoint_best.pt --out-dir /tmp/peak_slot_domain_gap --max-samples 64 --device cpu
+```
+
+The top-level helper shell below wraps the real-background generator with the
+current heavier sparse-artifact preset:
+
+```sh
+sh generate_track_slot_dataset_from_real_npy.sh
+```
+
+The profile-driven workflow adds three more top-level shells:
+
+```sh
+sh profile_real_npy_background.sh
+sh generate_track_slot_dataset_from_real_npy_profile.sh
+sh calibrate_realbg_generator.sh
 ```
 
 `--auto-resume` reads `<out-dir>/checkpoint_last.pt` when present. `--epochs`

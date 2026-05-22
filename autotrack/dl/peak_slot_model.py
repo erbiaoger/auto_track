@@ -1489,14 +1489,109 @@ def _soft_filter_conflicting_tracks(tracks: list[Track], cfg: InferenceConfig) -
     return kept_tracks
 
 
-def predict_tracks_from_window(
+def _soft_filter_conflicting_candidate_items(
+    items: list[dict[str, Any]],
+    cfg: InferenceConfig,
+) -> tuple[list[dict[str, Any]], list[tuple[int, str]]]:
+    mode = str(cfg.conflict_mode).lower()
+    if mode == "off":
+        return list(items), []
+    removed: list[tuple[int, str]] = []
+    if mode == "hard":
+        kept_items: list[dict[str, Any]] = []
+        for item in sorted(items, key=lambda rec: float(rec["track"].total_score), reverse=True):
+            tmap = _track_channel_time_map(item["track"])
+            conflict = False
+            for existing in kept_items:
+                emap = _track_channel_time_map(existing["track"])
+                common = sorted(set(tmap) & set(emap))
+                if len(common) < int(cfg.dedup_min_overlap_channels):
+                    continue
+                diffs = np.array([abs(tmap[ch] - emap[ch]) for ch in common], dtype=np.float64)
+                if float(np.median(diffs)) <= float(cfg.dedup_tolerance_samples):
+                    conflict = True
+                    break
+            if conflict:
+                removed.append((int(item["candidate_id"]), "removed_hard_conflict"))
+            else:
+                kept_items.append(item)
+        return kept_items, removed
+    if mode != "soft":
+        raise ValueError(f"Unsupported conflict_mode: {cfg.conflict_mode}")
+
+    kept_items: list[dict[str, Any]] = []
+    pending = list(items)
+    while pending:
+        def adjusted_score(rec: dict[str, Any]) -> float:
+            base = float(rec["track"].total_score)
+            item_channels = set(_track_channel_time_map(rec["track"]))
+            max_overlap = 0.0
+            for existing_item in kept_items:
+                existing_channels = set(_track_channel_time_map(existing_item["track"]))
+                min_len = max(1, min(len(item_channels), len(existing_channels)))
+                max_overlap = max(max_overlap, float(len(item_channels & existing_channels) / min_len))
+            return base - float(cfg.global_conflict_penalty) * max_overlap
+
+        item = max(pending, key=adjusted_score)
+        pending.remove(item)
+        duplicate = False
+        for existing in kept_items:
+            duplicate, _ = _track_duplicate_decision(
+                item["track"],
+                existing["track"],
+                duplicate_overlap_ratio=float(cfg.duplicate_overlap_ratio),
+                min_unique_support_channels=int(cfg.min_unique_support_channels),
+                dedup_tolerance_samples=int(cfg.dedup_tolerance_samples),
+                dedup_min_overlap_channels=int(cfg.dedup_min_overlap_channels),
+            )
+            if duplicate:
+                break
+        if duplicate:
+            removed.append((int(item["candidate_id"]), "removed_soft_conflict"))
+        else:
+            kept_items.append(item)
+    return kept_items, removed
+
+
+def _deduplicate_candidate_items(
+    items: list[dict[str, Any]],
+    cfg: InferenceConfig,
+) -> tuple[list[dict[str, Any]], list[tuple[int, str]]]:
+    kept: list[dict[str, Any]] = []
+    removed: list[tuple[int, str]] = []
+    for item in sorted(items, key=lambda rec: float(rec["track"].total_score), reverse=True):
+        track = item["track"]
+        tmap = {int(p.ch_idx): int(p.t_idx) for p in track.points}
+        duplicate = False
+        for existing in kept:
+            emap = {int(p.ch_idx): int(p.t_idx) for p in existing["track"].points}
+            common = sorted(set(tmap) & set(emap))
+            if len(common) < int(cfg.dedup_min_overlap_channels):
+                continue
+            min_len = max(1, min(len(tmap), len(emap)))
+            overlap_ratio = float(len(common) / min_len)
+            unique_support = len(set(tmap) - set(emap))
+            if overlap_ratio < float(cfg.duplicate_overlap_ratio) or unique_support >= int(cfg.min_unique_support_channels):
+                continue
+            diffs = np.array([abs(tmap[ch] - emap[ch]) for ch in common], dtype=np.float64)
+            if float(np.median(diffs)) <= float(cfg.dedup_tolerance_samples):
+                duplicate = True
+                break
+        if duplicate:
+            removed.append((int(item["candidate_id"]), "removed_dedup"))
+        else:
+            kept.append(item)
+    return kept, removed
+
+
+def _predict_tracks_from_window_impl(
     model: PeakSlotPredictor,
     data_window: np.ndarray,
     fs: float,
     x_axis_m: np.ndarray,
     config: Optional[InferenceConfig] = None,
     device: Optional[str] = None,
-) -> list[Track]:
+) -> tuple[list[Track], dict[str, Any]]:
     cfg = config or InferenceConfig()
     arr = np.asarray(data_window, dtype=np.float32)
     x = prepare_window_input(
@@ -1552,11 +1647,25 @@ def predict_tracks_from_window(
         if len(extra_slots) >= int(cfg.extra_candidate_slots):
             break
     order = (active_slots + extra_slots)[:max_tracks]
-    tracks: list[Track] = []
+
+    candidate_items: list[dict[str, Any]] = []
+    diagnostics: dict[str, Any] = {
+        "model_family": "peak_slot",
+        "time_downsample": int(cfg.time_downsample),
+        "peak_index": peak_index.detach().cpu().numpy(),
+        "peak_valid": peak_valid.detach().cpu().numpy(),
+        "peak_amp": peak_amp.detach().cpu().numpy(),
+        "active_slots": list(active_slots),
+        "extra_slots": list(extra_slots),
+        "ranked_slots": list(ranked_slots),
+        "objectness": np.asarray(obj, dtype=np.float32),
+        "candidates": [],
+    }
+
     for q_idx in order:
         score = float(obj[q_idx])
         decoder_mode = str(cfg.decoder_mode).lower()
-        path_options: list[list[dict[str, float | int]]] = []
+        path_options: list[tuple[list[dict[str, float | int]], float]] = []
         if bool(cfg.use_viterbi_decoder) and decoder_mode == "beam_global":
             decoded_options = decode_peak_slot_paths(
                 peak_prob[q_idx],
@@ -1571,27 +1680,36 @@ def predict_tracks_from_window(
                 config=cfg,
                 time_prior=None if time_prior_np is None else time_prior_np[q_idx],
             )
-            path_options = [list(item["path"]) for item in decoded_options]
+            path_options = [(list(item["path"]), float(item["score"])) for item in decoded_options]
         elif bool(cfg.use_viterbi_decoder) and decoder_mode != "argmax":
             path_options = [
-                decode_peak_slot_path(
-                    peak_prob[q_idx],
-                    peak_time,
-                    peak_valid,
-                    peak_index,
-                    direction_label=int(dirs[q_idx]),
-                    predicted_speed_kmh=float(speeds[q_idx]) * float(cfg.speed_norm_kmh),
-                    x_axis_m=np.asarray(x_axis_m, dtype=np.float64),
-                    time_downsample=int(cfg.time_downsample),
-                    fs=float(fs),
-                    config=cfg,
-                    time_prior=None if time_prior_np is None else time_prior_np[q_idx],
+                (
+                    decode_peak_slot_path(
+                        peak_prob[q_idx],
+                        peak_time,
+                        peak_valid,
+                        peak_index,
+                        direction_label=int(dirs[q_idx]),
+                        predicted_speed_kmh=float(speeds[q_idx]) * float(cfg.speed_norm_kmh),
+                        x_axis_m=np.asarray(x_axis_m, dtype=np.float64),
+                        time_downsample=int(cfg.time_downsample),
+                        fs=float(fs),
+                        config=cfg,
+                        time_prior=None if time_prior_np is None else time_prior_np[q_idx],
+                    ),
+                    0.0,
                 )
             ]
         else:
-            path_options = [argmax_peak_slot_path(peak_prob[q_idx], peak_valid, peak_threshold=float(cfg.peak_threshold))]
-        for decoded in path_options:
+            path_options = [
+                (
+                    argmax_peak_slot_path(peak_prob[q_idx], peak_valid, peak_threshold=float(cfg.peak_threshold)),
+                    0.0,
+                )
+            ]
+        for option_idx, (decoded, path_score) in enumerate(path_options):
             points: list[TrackPoint] = []
+            point_records: list[dict[str, Any]] = []
             for item in decoded:
                 ch = int(item["ch"])
                 choice = int(item["peak_idx"])
@@ -1599,36 +1717,113 @@ def predict_tracks_from_window(
                 t_idx = int(peak_index[ch, choice].item()) * int(cfg.time_downsample)
                 t_idx = int(max(0, min(int(arr.shape[1]) - 1, t_idx)))
                 offset = float(x_axis_m[int(ch)]) if int(ch) < len(x_axis_m) else float(ch)
+                amp = float(abs(arr[int(ch), t_idx]))
+                point_records.append(
+                    {
+                        "ch_idx": int(ch),
+                        "peak_idx": int(choice),
+                        "t_idx": int(t_idx),
+                        "time_s": float(t_idx) / float(fs),
+                        "offset_m": offset,
+                        "offset_km": offset * 1e-3,
+                        "peak_prob": prob,
+                        "amp": amp,
+                    }
+                )
                 points.append(
                     TrackPoint(
                         ch_idx=int(ch),
-                        t_idx=t_idx,
+                        t_idx=int(t_idx),
                         time_s=float(t_idx) / float(fs),
                         offset_m=offset,
-                        amp=float(abs(arr[int(ch), t_idx])),
+                        amp=amp,
                         score=score * prob,
                     )
                 )
-            if len(points) >= int(cfg.min_visible_channels):
-                tracks.append(_track_stats(int(q_idx), LABEL_TO_DIRECTION.get(int(dirs[q_idx]), "forward"), points))
-    if str(cfg.decoder_mode).lower() == "beam_global":
-        best_per_slot: list[Track] = []
-        used_slots: set[int] = set()
-        for track in sorted(tracks, key=lambda item: item.total_score, reverse=True):
-            if int(track.track_id) in used_slots:
+            if len(points) < int(cfg.min_visible_channels):
+                diagnostics["candidates"].append(
+                    {
+                        "candidate_id": int(len(diagnostics["candidates"])),
+                        "slot": int(q_idx),
+                        "beam_index": int(option_idx),
+                        "source": "active" if int(q_idx) in active_set else "extra",
+                        "direction": LABEL_TO_DIRECTION.get(int(dirs[q_idx]), "forward"),
+                        "objectness": score,
+                        "speed_kmh": float(speeds[q_idx]) * float(cfg.speed_norm_kmh),
+                        "path_score": float(path_score),
+                        "status": "removed_short",
+                        "point_count": int(len(points)),
+                        "points": point_records,
+                    }
+                )
                 continue
-            best_per_slot.append(track)
-            used_slots.add(int(track.track_id))
-        tracks = best_per_slot
-    if str(cfg.decoder_mode).lower() == "beam_global" and float(cfg.global_conflict_penalty) > 0.0:
-        tracks = _soft_filter_conflicting_tracks(tracks, cfg)
-    return _deduplicate_tracks(
-        tracks,
-        tol_samples=int(cfg.dedup_tolerance_samples),
-        min_overlap=int(cfg.dedup_min_overlap_channels),
-        duplicate_overlap_ratio=float(cfg.duplicate_overlap_ratio),
-        min_unique_support_channels=int(cfg.min_unique_support_channels),
+            track = _track_stats(int(q_idx), LABEL_TO_DIRECTION.get(int(dirs[q_idx]), "forward"), points)
+            rec = {
+                "candidate_id": int(len(diagnostics["candidates"])),
+                "slot": int(q_idx),
+                "beam_index": int(option_idx),
+                "source": "active" if int(q_idx) in active_set else "extra",
+                "direction": track.direction,
+                "objectness": score,
+                "speed_kmh": float(speeds[q_idx]) * float(cfg.speed_norm_kmh),
+                "path_score": float(path_score),
+                "status": "raw",
+                "point_count": int(len(points)),
+                "points": point_records,
+            }
+            diagnostics["candidates"].append(rec)
+            candidate_items.append({**rec, "track": track})
+
+    if str(cfg.decoder_mode).lower() == "beam_global":
+        best_per_slot: list[dict[str, Any]] = []
+        used_slots: set[int] = set()
+        for item in sorted(candidate_items, key=lambda rec: float(rec["track"].total_score), reverse=True):
+            slot = int(item["slot"])
+            if slot in used_slots:
+                diagnostics["candidates"][int(item["candidate_id"])]["status"] = "removed_non_best_beam"
+                continue
+            best_per_slot.append(item)
+            used_slots.add(slot)
+        candidate_items = best_per_slot
+
+    candidate_items, removed_conflicts = _soft_filter_conflicting_candidate_items(candidate_items, cfg)
+    for candidate_id, status in removed_conflicts:
+        diagnostics["candidates"][int(candidate_id)]["status"] = status
+
+    candidate_items, removed_dedup = _deduplicate_candidate_items(candidate_items, cfg)
+    for candidate_id, status in removed_dedup:
+        diagnostics["candidates"][int(candidate_id)]["status"] = status
+
+    final_tracks: list[Track] = []
+    final_candidate_ids: list[int] = []
+    for new_id, item in enumerate(candidate_items):
+        diagnostics["candidates"][int(item["candidate_id"])]["status"] = "final"
+        final_candidate_ids.append(int(item["candidate_id"]))
+        final_tracks.append(_track_stats(int(new_id), item["track"].direction, item["track"].points))
+    diagnostics["final_candidate_ids"] = final_candidate_ids
+    return final_tracks, diagnostics
+
+
+def predict_tracks_from_window(
+    model: PeakSlotPredictor,
+    data_window: np.ndarray,
+    fs: float,
+    x_axis_m: np.ndarray,
+    config: Optional[InferenceConfig] = None,
+    device: Optional[str] = None,
+    return_diagnostics: bool = False,
+) -> list[Track] | tuple[list[Track], dict[str, Any]]:
+    tracks, diagnostics = _predict_tracks_from_window_impl(
+        model=model,
+        data_window=data_window,
+        fs=fs,
+        x_axis_m=x_axis_m,
+        config=config,
+        device=device,
     )
+    if return_diagnostics:
+        return tracks, diagnostics
+    return tracks
 
 
 def save_checkpoint(

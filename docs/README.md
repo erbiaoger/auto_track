@@ -12,5 +12,9 @@ Design and algorithm notes for the project.
 - `track_slot_method_complete.md`: complete TrackSlotNet method note covering
   physical model, math formulation, network structure, training, inference, and
   visualization.
+- `realbg_profile_workflow.md`: profile-driven real-background generation,
+  calibration, and PeakSlotNet data-production workflow.
+- `real_data_label_gui.md`: real-data auto-label + manual calibration GUI
+  workflow and label-file format.
 - `project_structure.md`: high-level package layout.
 - `network_structure.png`: generated network diagram asset.

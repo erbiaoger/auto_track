@@ -22,6 +22,7 @@ from autotrack.core.track_extractor_graph import Track, TrackPoint
 from autotrack.dl.trajectory_set_model import (
     LABEL_TO_DIRECTION,
     WindowDatasetConfig,
+    _refine_t_idx,
     auto_torch_device,
     prepare_window_input,
 )
@@ -46,6 +47,7 @@ class InferenceConfig:
     objectness_threshold: float = 0.5
     visibility_threshold: float = 0.5
     min_visible_channels: int = 3
+    refine_radius_samples: int = 120
     max_tracks: int = 96
     dedup_tolerance_samples: int = 180
     dedup_min_overlap_channels: int = 3
@@ -531,8 +533,9 @@ def predict_tracks_from_window(
             continue
         points: list[TrackPoint] = []
         for ch in chs.tolist():
-            t_idx = int(round(float(np.clip(time_norm[q_idx, ch], 0.0, 1.0)) * float(max(1, n_samples - 1))))
-            t_idx = int(max(0, min(n_samples - 1, t_idx)))
+            t_idx_raw = int(round(float(np.clip(time_norm[q_idx, ch], 0.0, 1.0)) * float(max(1, n_samples - 1))))
+            t_idx_raw = int(max(0, min(n_samples - 1, t_idx_raw)))
+            t_idx = _refine_t_idx(arr, int(ch), t_idx_raw, int(cfg.refine_radius_samples))
             amp = float(abs(arr[int(ch), t_idx]))
             if int(ch) < len(x_axis_m):
                 offset = float(x_axis_m[int(ch)])
