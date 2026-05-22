@@ -13,6 +13,7 @@ import xml.etree.ElementTree as ET
 
 import numpy as np
 from obspy import Stream, Trace, read
+import torch
 
 from autotrack.core.track_extractor_graph import ExtractorConfig, Track, TrackPoint, extract_all
 
@@ -46,6 +47,10 @@ class AutoTrackBackend:
         self.tracks: list[Track] = []
         self.last_summary: dict = {}
         self.last_import_info: dict = {"position_sort_enabled": False}
+        self.last_peak_slot_diagnostics: dict = {}
+        self.tensor_shard_path: Optional[str] = None
+        self.tensor_shard_sample_index = 0
+        self.tensor_shard_sample_count = 0
 
         self.st_visual = Stream()
         self.init_error: Optional[str] = None
@@ -284,12 +289,24 @@ class AutoTrackBackend:
         folder: str,
         use_position_xlsx: bool = False,
         position_xlsx_path: Optional[str] = None,
+        npy_fs_hz: Optional[float] = None,
+        npy_dx_m: Optional[float] = None,
     ) -> tuple[np.ndarray, float, np.ndarray, float, dict]:
         folder_path = Path(folder)
         if not folder_path.exists():
-            raise FileNotFoundError(f"Data folder does not exist: {folder_path}")
+            raise FileNotFoundError(f"Input path does not exist: {folder_path}")
+
+        if folder_path.is_file():
+            suffix = folder_path.suffix.lower()
+            if suffix not in {".npy", ".pt", ".pth"}:
+                raise ValueError(f"Unsupported input file: {folder_path}. Only .npy and tensor shard .pt/.pth files are accepted for single-file import.")
+            if use_position_xlsx:
+                raise ValueError("Position XLSX ordering is only supported for SAC folder import, not single-file .npy/.pt imports.")
+            if suffix == ".npy":
+                return self._read_npy_data(folder_path, fs_hz=npy_fs_hz, dx_m=npy_dx_m)
+            return self._read_tensor_shard_data(folder_path)
         if not folder_path.is_dir():
-            raise NotADirectoryError(f"Not a directory: {folder_path}")
+            raise NotADirectoryError(f"Not a directory or supported input file (.npy/.pt/.pth): {folder_path}")
 
         sac_files = sorted(folder_path.glob("*.sac"))
         if not sac_files:
@@ -344,15 +361,132 @@ class AutoTrackBackend:
 
         return data, fs, x_axis, dx_m, import_info
 
+    def _read_npy_data(
+        self,
+        npy_path: Path,
+        *,
+        fs_hz: Optional[float] = None,
+        dx_m: Optional[float] = None,
+    ) -> tuple[np.ndarray, float, np.ndarray, float, dict]:
+        arr = np.load(str(npy_path), mmap_mode="r")
+        if arr.ndim != 2:
+            raise ValueError(f"Expected a 2-D .npy array, got shape {arr.shape}")
+
+        # Real DAS arrays in this project are typically stored as [time, channel].
+        # The GUI/backend expects [channel, time], so transpose when time is the leading dimension.
+        data = np.array(arr, dtype=np.float32, copy=True)
+        if data.shape[0] > data.shape[1]:
+            data = data.T
+            array_layout = "time_channel"
+        else:
+            array_layout = "channel_time"
+
+        data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
+        n_channels = int(data.shape[0])
+        resolved_fs = float(fs_hz) if fs_hz is not None and float(fs_hz) > 0 else float(self.fs)
+        resolved_dx = float(dx_m) if dx_m is not None and float(dx_m) > 0 else float(self.dx_m)
+        x_axis = np.arange(n_channels, dtype=np.float64) * resolved_dx
+        import_info = {
+            "position_sort_enabled": False,
+            "input_kind": "npy",
+            "input_file": str(npy_path),
+            "array_layout": array_layout,
+            "channels": int(data.shape[0]),
+            "samples": int(data.shape[1]),
+            "fs_hz": float(resolved_fs),
+            "dx_m": float(resolved_dx),
+        }
+        return data, float(resolved_fs), x_axis, float(resolved_dx), import_info
+
+    def _read_tensor_shard_data(
+        self,
+        shard_path: Path,
+        *,
+        sample_index: int = 0,
+    ) -> tuple[np.ndarray, float, np.ndarray, float, dict]:
+        payload = torch.load(str(shard_path), map_location="cpu", weights_only=False)
+        if not isinstance(payload, dict):
+            raise ValueError(f"Tensor shard payload must be a dict: {shard_path}")
+        if "x" not in payload:
+            raise ValueError(f"Tensor shard does not contain key 'x': {shard_path}")
+
+        x = payload["x"]
+        if not torch.is_tensor(x):
+            raise ValueError(f"Tensor shard field 'x' must be a torch.Tensor: {shard_path}")
+        if x.ndim != 4:
+            raise ValueError(f"Expected tensor shard x with shape [N,in_channels,C,T], got {tuple(x.shape)} from {shard_path}")
+        if int(x.shape[0]) <= 0:
+            raise ValueError(f"Tensor shard contains no samples: {shard_path}")
+
+        sample_count = int(x.shape[0])
+        in_channels = int(x.shape[1])
+        n_channels = int(x.shape[2])
+        n_samples = int(x.shape[3])
+        if in_channels <= 0 or n_channels <= 0 or n_samples <= 0:
+            raise ValueError(f"Invalid tensor shard shape {tuple(x.shape)} in {shard_path}")
+        sample_index = max(0, min(int(sample_index), sample_count - 1))
+
+        sample_x = x[sample_index]
+        if in_channels == 1:
+            data = sample_x[0].detach().cpu().to(torch.float32).numpy()
+            selected_channel = 0
+        else:
+            # GUI expects one channel-time image. Prefer the first feature map,
+            # which matches the raw heatmap for current track_slot datasets.
+            data = sample_x[0].detach().cpu().to(torch.float32).numpy()
+            selected_channel = 0
+        if data.ndim != 2:
+            raise ValueError(f"Tensor shard sample must resolve to [channel,time], got {tuple(data.shape)} from {shard_path}")
+
+        meta_path = shard_path.with_name("meta.json")
+        meta: dict = {}
+        if meta_path.is_file():
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:  # noqa: BLE001
+                meta = {}
+
+        raw_fs = float(meta.get("fs", self.fs))
+        time_downsample = int(max(1, meta.get("time_downsample", 1)))
+        effective_fs = raw_fs / float(time_downsample)
+        if effective_fs <= 0:
+            effective_fs = float(self.fs)
+        dx_m = float(meta.get("dx_m", self.dx_m))
+        if dx_m <= 0:
+            dx_m = float(self.dx_m)
+        x_axis = np.arange(n_channels, dtype=np.float64) * dx_m
+
+        import_info = {
+            "position_sort_enabled": False,
+            "input_kind": "tensor_shard",
+            "input_file": str(shard_path),
+            "meta_file": str(meta_path) if meta_path.is_file() else "",
+            "dataset_format": str(meta.get("format", "")) if meta else "",
+            "sample_index": int(sample_index),
+            "sample_count": sample_count,
+            "selected_input_channel": selected_channel,
+            "in_channels": in_channels,
+            "channels": n_channels,
+            "samples": n_samples,
+            "fs_hz": float(effective_fs),
+            "dx_m": float(dx_m),
+            "window_seconds": float(meta.get("window_seconds", n_samples / effective_fs if effective_fs > 0 else 0.0)),
+        }
+        return np.asarray(data, dtype=np.float32), effective_fs, x_axis, dx_m, import_info
+
     def _load_data_all(
         self,
         use_position_xlsx: bool = False,
         position_xlsx_path: Optional[str] = None,
+        npy_fs_hz: Optional[float] = None,
+        npy_dx_m: Optional[float] = None,
     ) -> None:
         data, fs, x_axis, dx_m, import_info = self._read_data_all(
             self.files,
             use_position_xlsx=use_position_xlsx,
             position_xlsx_path=position_xlsx_path,
+            npy_fs_hz=npy_fs_hz,
+            npy_dx_m=npy_dx_m,
         )
         self.data_all = data
         self.fs = float(fs)
@@ -386,15 +520,48 @@ class AutoTrackBackend:
         reset_results: bool = True,
         use_position_xlsx: bool = False,
         position_xlsx_path: Optional[str] = None,
+        npy_fs_hz: Optional[float] = None,
+        npy_dx_m: Optional[float] = None,
     ) -> bool:
         folder = Path(data_folder).expanduser()
         self.files = str(folder)
         self.current_start = 0
         self.window_size = self.default_window_size
+        self.tensor_shard_path = None
+        self.tensor_shard_sample_index = 0
+        self.tensor_shard_sample_count = 0
         self._load_data_all(
             use_position_xlsx=use_position_xlsx,
             position_xlsx_path=position_xlsx_path,
+            npy_fs_hz=npy_fs_hz,
+            npy_dx_m=npy_dx_m,
         )
+        if str(self.last_import_info.get("input_kind")) == "tensor_shard":
+            self.tensor_shard_path = str(folder)
+            self.tensor_shard_sample_index = int(self.last_import_info.get("sample_index", 0))
+            self.tensor_shard_sample_count = int(self.last_import_info.get("sample_count", 0))
+        if reset_results:
+            self.clear_tracks()
+        self.update_view_window()
+        self.init_error = None
+        return True
+
+    def load_tensor_shard_sample(self, sample_index: int, reset_results: bool = True) -> bool:
+        if not self.tensor_shard_path:
+            raise ValueError("No tensor shard is currently loaded.")
+        shard_path = Path(self.tensor_shard_path).expanduser()
+        data, fs, x_axis, dx_m, import_info = self._read_tensor_shard_data(shard_path, sample_index=int(sample_index))
+        self.files = str(shard_path)
+        self.current_start = 0
+        self.window_size = self.default_window_size
+        self.data_all = data
+        self.fs = float(fs)
+        self.dt = 1.0 / self.fs
+        self.x_axis_m = x_axis
+        self.dx_m = float(dx_m)
+        self.last_import_info = dict(import_info)
+        self.tensor_shard_sample_index = int(import_info.get("sample_index", 0))
+        self.tensor_shard_sample_count = int(import_info.get("sample_count", 0))
         if reset_results:
             self.clear_tracks()
         self.update_view_window()
@@ -770,6 +937,7 @@ class AutoTrackBackend:
         dl_visibility_threshold: float = 0.5,
         dl_min_visible_channels: int = 2,
         dl_refine_radius_samples: int = 120,
+        dl_extra_config: Optional[dict] = None,
     ) -> dict:
         if self.data_all.size == 0:
             raise RuntimeError("No data loaded; cannot run auto extraction")
@@ -789,6 +957,7 @@ class AutoTrackBackend:
             raise ValueError("engine must be cpu_single / cpu_parallel / gpu / gpu_torch_mps / deep_learning")
         if engine == "deep_learning" and not str(dl_model_path).strip():
             raise ValueError("Deep Learning engine requires a model checkpoint path")
+        self.last_peak_slot_diagnostics = {}
         if not current_window_only:
             if tile_seconds <= 0:
                 raise ValueError("tile_seconds must be > 0")
@@ -851,10 +1020,11 @@ class AutoTrackBackend:
 
             extract_fn = extract_all_deep_learning
             workers = 1
-            engine_text = "Deep Learning(Trajectory Queries)"
+            resolved_family = str(dl_model_family).strip() or "auto"
+            engine_text = "Deep Learning(PeakSlotNet)" if resolved_family == "peak_slot" else "Deep Learning"
             extract_config = {
                 "model_path": str(dl_model_path).strip(),
-                "model_family": str(dl_model_family).strip() or "auto",
+                "model_family": resolved_family,
                 "device": str(dl_device).strip() or None,
                 "objectness_threshold": float(dl_objectness_threshold),
                 "visibility_threshold": float(dl_visibility_threshold),
@@ -862,7 +1032,9 @@ class AutoTrackBackend:
                 "refine_radius_samples": int(max(0, dl_refine_radius_samples)),
                 "max_tracks": int(cfg.max_tracks),
                 "dedup_tolerance_samples": int(nms_samples),
+                "_diagnostics_sink": self.last_peak_slot_diagnostics,
             }
+            extract_config.update(dict(dl_extra_config or {}))
 
         if current_window_only:
             if self.data_view.size == 0:
@@ -996,6 +1168,7 @@ class AutoTrackBackend:
                 "refine_radius_samples": int(dl_refine_radius_samples),
                 "dedup_tolerance_samples": int(nms_samples),
             }
+            extractor_config_summary.update(dict(dl_extra_config or {}))
         else:
             extractor_config_summary = {
                 "sigma_seconds": list(cfg.sigma_seconds),
@@ -1050,6 +1223,7 @@ class AutoTrackBackend:
     def clear_tracks(self) -> None:
         self.tracks = []
         self.last_summary = {}
+        self.last_peak_slot_diagnostics = {}
 
     def export_csv(self, csv_path: Optional[str] = None) -> tuple[str, str]:
         if not self.tracks:

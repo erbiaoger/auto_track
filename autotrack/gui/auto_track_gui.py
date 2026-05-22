@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
 import numpy as np
-from PyQt6.QtCore import QObject, QThread, QTimer, Qt, pyqtSignal
+from PyQt6.QtCore import QObject, QSettings, QSignalBlocker, QThread, QTimer, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
+    QFormLayout,
     QGridLayout,
     QHBoxLayout,
     QLabel,
@@ -19,6 +23,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QProgressBar,
+    QScrollArea,
     QSlider,
     QVBoxLayout,
     QWidget,
@@ -32,6 +37,165 @@ from matplotlib.figure import Figure
 from matplotlib.ticker import FuncFormatter
 
 from autotrack.core.auto_track_backend import AutoTrackBackend, DEFAULT_DATA_FOLDER
+
+
+DL_ADVANCED_PARAM_SPECS = [
+    {
+        "key": "peak_threshold",
+        "label": "Peak threshold",
+        "type": "float",
+        "default": 0.4,
+        "tooltip": "PeakSlotNet 点级峰选择阈值。",
+    },
+    {
+        "key": "max_tracks",
+        "label": "Max predicted tracks",
+        "type": "int",
+        "default": 96,
+        "tooltip": "每个窗口最多输出多少条深度学习轨迹。",
+    },
+    {
+        "key": "extra_candidate_slots",
+        "label": "Extra candidate slots",
+        "type": "int",
+        "default": 8,
+        "tooltip": "额外解码的低 objectness slot 数。",
+    },
+    {
+        "key": "candidate_objectness_floor",
+        "label": "Candidate objectness floor",
+        "type": "float",
+        "default": 0.20,
+        "tooltip": "额外候选 slot 的最低 objectness。",
+    },
+    {
+        "key": "decoder_mode",
+        "label": "Decoder mode",
+        "type": "choice",
+        "default": "beam_global",
+        "choices": ["beam_global", "beam", "argmax"],
+        "tooltip": "PeakSlotNet 解码模式。",
+    },
+    {
+        "key": "viterbi_beam_size",
+        "label": "Viterbi beam size",
+        "type": "int",
+        "default": 8,
+        "tooltip": "Viterbi / beam 搜索宽度。",
+    },
+    {
+        "key": "time_prior_weight",
+        "label": "Time prior weight",
+        "type": "float",
+        "default": 2.0,
+        "tooltip": "时间先验权重。",
+    },
+    {
+        "key": "global_conflict_penalty",
+        "label": "Global conflict penalty",
+        "type": "float",
+        "default": 2.0,
+        "tooltip": "跨 slot 冲突惩罚。",
+    },
+    {
+        "key": "conflict_mode",
+        "label": "Conflict mode",
+        "type": "choice",
+        "default": "soft",
+        "choices": ["soft", "hard", "off"],
+        "tooltip": "冲突处理模式。",
+    },
+    {
+        "key": "duplicate_overlap_ratio",
+        "label": "Duplicate overlap ratio",
+        "type": "float",
+        "default": 0.70,
+        "tooltip": "soft 模式下判定重复轨迹的最小重合比例。",
+    },
+    {
+        "key": "min_unique_support_channels",
+        "label": "Min unique support channels",
+        "type": "int",
+        "default": 4,
+        "tooltip": "近车轨迹至少有多少独立峰支撑时保留。",
+    },
+    {
+        "key": "viterbi_topk",
+        "label": "Viterbi top-k",
+        "type": "int",
+        "default": 16,
+        "tooltip": "每道保留多少候选峰。",
+    },
+    {
+        "key": "viterbi_candidate_threshold",
+        "label": "Viterbi candidate threshold",
+        "type": "float",
+        "default": 0.01,
+        "tooltip": "候选峰最低概率阈值。",
+    },
+    {
+        "key": "viterbi_speed_min_kmh",
+        "label": "Viterbi speed min (km/h)",
+        "type": "float",
+        "default": 60.0,
+        "tooltip": "解码允许最小速度。",
+    },
+    {
+        "key": "viterbi_speed_max_kmh",
+        "label": "Viterbi speed max (km/h)",
+        "type": "float",
+        "default": 100.0,
+        "tooltip": "解码允许最大速度。",
+    },
+    {
+        "key": "viterbi_max_skip_channels",
+        "label": "Viterbi max skip channels",
+        "type": "int",
+        "default": 4,
+        "tooltip": "最多允许跳过多少道。",
+    },
+    {
+        "key": "viterbi_inertia_penalty",
+        "label": "Viterbi inertia penalty",
+        "type": "float",
+        "default": 2.5,
+        "tooltip": "速度惯性惩罚。",
+    },
+    {
+        "key": "viterbi_slope_memory",
+        "label": "Viterbi slope memory",
+        "type": "float",
+        "default": 0.75,
+        "tooltip": "斜率记忆系数。",
+    },
+]
+
+
+def _default_dl_advanced_params() -> dict[str, object]:
+    return {str(spec["key"]): spec["default"] for spec in DL_ADVANCED_PARAM_SPECS}
+
+
+def _peak_slot_recommended_advanced_params() -> dict[str, object]:
+    return {
+        "peak_threshold": 0.4,
+        "max_tracks": 96,
+        "extra_candidate_slots": 8,
+        "candidate_objectness_floor": 0.20,
+        "decoder_mode": "beam_global",
+        "viterbi_beam_size": 8,
+        "time_prior_weight": 2.0,
+        "global_conflict_penalty": 2.0,
+        "conflict_mode": "soft",
+        "duplicate_overlap_ratio": 0.70,
+        "min_unique_support_channels": 4,
+        "viterbi_topk": 16,
+        "viterbi_candidate_threshold": 0.01,
+        "viterbi_speed_min_kmh": 60.0,
+        "viterbi_speed_max_kmh": 100.0,
+        "viterbi_max_skip_channels": 4,
+        "viterbi_inertia_penalty": 2.5,
+        "viterbi_slope_memory": 0.75,
+    }
 
 
 class ExtractWorker(QObject):
@@ -55,10 +219,139 @@ class ExtractWorker(QObject):
             self.failed.emit(str(exc))
 
 
+class DeepLearningParamsDialog(QDialog):
+    def __init__(self, parent: QWidget | None, current_values: dict[str, object]):
+        super().__init__(parent)
+        self.setWindowTitle("Deep Learning Parameters")
+        self.resize(560, 620)
+        self._inputs: dict[str, QWidget] = {}
+        self._values: dict[str, object] = dict(current_values)
+
+        layout = QVBoxLayout(self)
+
+        note = QLabel(
+            "这里配置 GUI Deep Learning 模式会实际用到的推理参数。"
+            " `BATCH_SIZE`、`MAX_SAMPLES`、`MAX_CSV_SAMPLES`、`PLOT_*`、`MATCHER`、"
+            "`PLOT_DIRECTION_FILTER`、`PREDICTION_DIRECTION_FILTER` 属于离线数据集预测脚本参数，"
+            "当前 GUI 不消费，所以不在这里暴露。"
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        form_host = QWidget()
+        form = QFormLayout(form_host)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+
+        for spec in DL_ADVANCED_PARAM_SPECS:
+            key = str(spec["key"])
+            tooltip = str(spec.get("tooltip", ""))
+            label = QLabel(str(spec["label"]))
+            label.setToolTip(tooltip)
+            if str(spec["type"]) == "choice":
+                widget = QComboBox()
+                for choice in spec.get("choices", []):
+                    widget.addItem(str(choice), str(choice))
+                idx = widget.findData(str(current_values.get(key, spec["default"])))
+                if idx >= 0:
+                    widget.setCurrentIndex(idx)
+            else:
+                widget = QLineEdit(str(current_values.get(key, spec["default"])))
+            widget.setToolTip(tooltip)
+            self._inputs[key] = widget
+            form.addRow(label, widget)
+
+        scroll.setWidget(form_host)
+        layout.addWidget(scroll, stretch=1)
+
+        button_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        reset_btn = button_box.addButton("Reset Defaults", QDialogButtonBox.ButtonRole.ResetRole)
+        reset_btn.clicked.connect(self._reset_defaults)
+        button_box.accepted.connect(self._accept_with_validation)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
+    def _reset_defaults(self) -> None:
+        defaults = _default_dl_advanced_params()
+        for spec in DL_ADVANCED_PARAM_SPECS:
+            key = str(spec["key"])
+            widget = self._inputs[key]
+            value = defaults[key]
+            if isinstance(widget, QComboBox):
+                idx = widget.findData(str(value))
+                if idx >= 0:
+                    widget.setCurrentIndex(idx)
+            elif isinstance(widget, QLineEdit):
+                widget.setText(str(value))
+
+    def _collect_values(self) -> dict[str, object]:
+        values: dict[str, object] = {}
+        for spec in DL_ADVANCED_PARAM_SPECS:
+            key = str(spec["key"])
+            widget = self._inputs[key]
+            typ = str(spec["type"])
+            if isinstance(widget, QComboBox):
+                raw = str(widget.currentData())
+            elif isinstance(widget, QLineEdit):
+                raw = widget.text().strip()
+            else:
+                raise TypeError(f"Unsupported widget type for {key}")
+            if typ == "int":
+                values[key] = int(float(raw))
+            elif typ == "float":
+                values[key] = float(raw)
+            elif typ == "choice":
+                values[key] = str(raw)
+            else:
+                values[key] = raw
+
+        if float(values["peak_threshold"]) < 0.0 or float(values["peak_threshold"]) > 1.0:
+            raise ValueError("Peak threshold must be in [0, 1].")
+        if int(values["max_tracks"]) < 1:
+            raise ValueError("Max predicted tracks must be >= 1.")
+        if int(values["extra_candidate_slots"]) < 0:
+            raise ValueError("Extra candidate slots must be >= 0.")
+        if float(values["candidate_objectness_floor"]) < 0.0 or float(values["candidate_objectness_floor"]) > 1.0:
+            raise ValueError("Candidate objectness floor must be in [0, 1].")
+        if int(values["viterbi_beam_size"]) < 1:
+            raise ValueError("Viterbi beam size must be >= 1.")
+        if float(values["duplicate_overlap_ratio"]) < 0.0 or float(values["duplicate_overlap_ratio"]) > 1.0:
+            raise ValueError("Duplicate overlap ratio must be in [0, 1].")
+        if int(values["min_unique_support_channels"]) < 0:
+            raise ValueError("Min unique support channels must be >= 0.")
+        if int(values["viterbi_topk"]) < 1:
+            raise ValueError("Viterbi top-k must be >= 1.")
+        if float(values["viterbi_candidate_threshold"]) < 0.0 or float(values["viterbi_candidate_threshold"]) > 1.0:
+            raise ValueError("Viterbi candidate threshold must be in [0, 1].")
+        if float(values["viterbi_speed_min_kmh"]) <= 0.0 or float(values["viterbi_speed_max_kmh"]) <= 0.0:
+            raise ValueError("Viterbi speed bounds must be > 0.")
+        if float(values["viterbi_speed_min_kmh"]) > float(values["viterbi_speed_max_kmh"]):
+            raise ValueError("Viterbi speed min cannot be greater than max.")
+        if int(values["viterbi_max_skip_channels"]) < 0:
+            raise ValueError("Viterbi max skip channels must be >= 0.")
+        return values
+
+    def _accept_with_validation(self) -> None:
+        try:
+            self._values = self._collect_values()
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "DL Parameter Error", str(exc))
+            return
+        self.accept()
+
+    def values(self) -> dict[str, object]:
+        return dict(self._values)
+
+
 class AutoTrackGUI(QMainWindow):
     def __init__(self, data_folder: str = DEFAULT_DATA_FOLDER):
         super().__init__()
         self.setWindowTitle("Vehicle Trajectory Auto-Extraction System (Peak Map + Dynamic Programming)")
+        self.settings = QSettings("BaFang", "AutoTrackGUI")
+        self._migrate_persisted_settings()
 
         self.backend = AutoTrackBackend(data_folder=data_folder)
         self.worker_thread: QThread | None = None
@@ -68,6 +361,8 @@ class AutoTrackGUI(QMainWindow):
         self._auto_scroll_paused_by_worker = False
         self._worker_mode: str = "idle"  # idle / manual / auto_follow
         self._auto_extract_pending = False
+        self.dl_advanced_params = self._load_dl_advanced_params()
+        self.show_peak_slot_diagnostics_check: QCheckBox | None = None
 
         self.fig = Figure(figsize=(11, 6))
         self.canvas = FigureCanvas(self.fig)
@@ -90,10 +385,10 @@ class AutoTrackGUI(QMainWindow):
             return label
 
         path_layout = QVBoxLayout()
-        data_folder_tip = "SAC 数据目录。导入后按距离头或道号顺序组成时空图。"
-        path_layout.addWidget(_make_label("SAC Data Folder", data_folder_tip))
+        data_folder_tip = "输入 SAC 数据目录，或直接输入单个真实 DAS `.npy` 文件、tensor shard `.pt/.pth` 文件。`.npy` 默认按 `[time, channel]` 解释；`.pt` shard 默认载入其中第 1 个样本，导入后可在图上滚轮切换 sample。"
+        path_layout.addWidget(_make_label("Data Folder / Input File", data_folder_tip))
         self.path_input = QLineEdit(str(Path(data_folder)))
-        self.path_input.setPlaceholderText("Enter SAC data folder path")
+        self.path_input.setPlaceholderText("Enter SAC folder, .npy file, or tensor shard .pt path")
         _apply_tooltip(self.path_input, data_folder_tip)
 
         position_xlsx_tip = "可选：开启后按位置表（xlsx）中的里程位置排序通道。默认关闭，不影响原有流程。"
@@ -107,6 +402,14 @@ class AutoTrackGUI(QMainWindow):
         self.position_xlsx_btn = QPushButton("Browse XLSX...")
         _apply_tooltip(self.position_xlsx_btn, position_xlsx_tip)
         self.position_xlsx_btn.clicked.connect(self.browse_position_xlsx)
+        npy_fs_tip = "可选：仅对单个 .npy 导入生效。留空则默认按 1000 Hz 解释。"
+        npy_dx_tip = "可选：仅对单个 .npy 导入生效。留空则默认按 100 m 通道间距解释。"
+        self.npy_fs_input = QLineEdit("")
+        self.npy_fs_input.setPlaceholderText("NPY fs (Hz), optional")
+        _apply_tooltip(self.npy_fs_input, npy_fs_tip)
+        self.npy_dx_input = QLineEdit("")
+        self.npy_dx_input.setPlaceholderText("NPY dx (m), optional")
+        _apply_tooltip(self.npy_dx_input, npy_dx_tip)
 
         path_btn_layout = QHBoxLayout()
         browse_btn = QPushButton("Browse...")
@@ -119,10 +422,14 @@ class AutoTrackGUI(QMainWindow):
         position_xlsx_layout = QHBoxLayout()
         position_xlsx_layout.addWidget(self.position_xlsx_input)
         position_xlsx_layout.addWidget(self.position_xlsx_btn)
+        npy_layout = QHBoxLayout()
+        npy_layout.addWidget(self.npy_fs_input)
+        npy_layout.addWidget(self.npy_dx_input)
 
         path_layout.addWidget(self.path_input)
         path_layout.addWidget(self.use_position_xlsx_check)
         path_layout.addLayout(position_xlsx_layout)
+        path_layout.addLayout(npy_layout)
         path_layout.addLayout(path_btn_layout)
 
         window_lock_layout = QGridLayout()
@@ -160,29 +467,40 @@ class AutoTrackGUI(QMainWindow):
         self.engine_combo.addItem("CPU Single-thread (Compatible)", "cpu_single")
         self.engine_combo.addItem("GPU (PyTorch MPS)", "gpu_torch_mps")
         self.engine_combo.addItem("GPU (CuPy / CUDA)", "gpu")
-        self.engine_combo.addItem("Deep Learning (Trajectory Queries)", "deep_learning")
+        self.engine_combo.addItem("Deep Learning (PeakSlotNet)", "deep_learning")
         self.engine_combo.setCurrentIndex(2)
         _apply_tooltip(
             self.engine_combo,
-            "提取后端选择。Deep Learning 需要选择训练好的 PyTorch checkpoint；Apple 芯片可用 GPU (PyTorch MPS)。",
+            "提取后端选择。Deep Learning 这里固定按 PeakSlotNet 推理；需要选择训练好的 peak_slot PyTorch checkpoint。Apple 芯片可用 GPU (PyTorch MPS)。",
         )
 
-        dl_model_tip = "深度学习轨迹模型 checkpoint（由 train_trajectory_model.py 输出）。仅 Deep Learning engine 使用。"
+        dl_model_tip = "PeakSlotNet checkpoint（由 train_peak_slot.py 输出）。仅 Deep Learning engine 使用。"
         self.dl_model_path_input = QLineEdit("")
-        self.dl_model_path_input.setPlaceholderText("Optional: trajectory model .pt checkpoint")
+        self.dl_model_path_input.setPlaceholderText("Select peak_slot .pt checkpoint")
         _apply_tooltip(self.dl_model_path_input, dl_model_tip)
+        self.dl_model_path_input.textChanged.connect(self._save_dl_model_path)
         self.dl_model_path_btn = QPushButton("Browse Model...")
         _apply_tooltip(self.dl_model_path_btn, dl_model_tip)
         self.dl_model_path_btn.clicked.connect(self.browse_dl_model)
+        self.dl_params_btn = QPushButton("DL Params...")
+        _apply_tooltip(self.dl_params_btn, "打开 Deep Learning 推理参数面板。")
+        self.dl_params_btn.clicked.connect(self.open_dl_params_dialog)
+        self.show_peak_slot_diagnostics_check = QCheckBox("PeakSlot diagnostics")
+        self.show_peak_slot_diagnostics_check.setChecked(False)
+        _apply_tooltip(
+            self.show_peak_slot_diagnostics_check,
+            "显示 PeakSlotNet 解码诊断叠加：候选峰、被过滤候选轨迹、最终保留轨迹的选峰点。",
+        )
+        self.show_peak_slot_diagnostics_check.toggled.connect(lambda _checked: self.redraw())
 
-        self.dl_objectness_threshold_input = QLineEdit("0.35")
-        _apply_tooltip(self.dl_objectness_threshold_input, "Deep Learning query 置信度阈值。越高越少误检，但可能漏车。")
+        self.dl_objectness_threshold_input = QLineEdit("0.45")
+        _apply_tooltip(self.dl_objectness_threshold_input, "PeakSlotNet objectness 阈值。越高越少误检，但可能漏车。")
         self.dl_visibility_threshold_input = QLineEdit("0.5")
-        _apply_tooltip(self.dl_visibility_threshold_input, "每条轨迹中通道点是否可见的阈值。")
-        self.dl_min_visible_channels_input = QLineEdit("2")
-        _apply_tooltip(self.dl_min_visible_channels_input, "一条深度学习轨迹至少需要多少个可见通道点。")
+        _apply_tooltip(self.dl_visibility_threshold_input, "每条 PeakSlot 轨迹中通道点是否可见的阈值。")
+        self.dl_min_visible_channels_input = QLineEdit("4")
+        _apply_tooltip(self.dl_min_visible_channels_input, "一条 PeakSlot 轨迹至少需要多少个可见通道点。")
         self.dl_refine_radius_samples_input = QLineEdit("120")
-        _apply_tooltip(self.dl_refine_radius_samples_input, "深度学习预测点附近做局部峰值修正的搜索半径（采样点）。")
+        _apply_tooltip(self.dl_refine_radius_samples_input, "PeakSlot 解码点附近做局部峰值修正的搜索半径（采样点）。")
 
         self.direction_combo = QComboBox()
         self.direction_combo.addItem("forward", "forward")
@@ -229,8 +547,12 @@ class AutoTrackGUI(QMainWindow):
         dl_model_layout = QHBoxLayout()
         dl_model_layout.addWidget(self.dl_model_path_input)
         dl_model_layout.addWidget(self.dl_model_path_btn)
+        dl_model_layout.addWidget(self.dl_params_btn)
         params_layout.addWidget(_make_label("DL model", dl_model_tip), row, 0)
         params_layout.addLayout(dl_model_layout, row, 1)
+        row += 1
+        params_layout.addWidget(QLabel(""), row, 0)
+        params_layout.addWidget(self.show_peak_slot_diagnostics_check, row, 1)
         row += 1
         params_layout.addWidget(
             _make_label("DL objectness", "Deep Learning query 置信度阈值。越高越少误检，但可能漏车。"),
@@ -406,13 +728,247 @@ class AutoTrackGUI(QMainWindow):
 
         if self.backend.init_error:
             self.status_label.setText(f"Startup note: {self.backend.init_error}")
+        self._connect_persisted_inputs()
+        self._restore_persisted_inputs()
+        self._load_startup_data()
         self.on_position_xlsx_toggled(self.use_position_xlsx_check.isChecked())
-        self._sync_window_seconds_input(force=True)
         self._update_window_slider()
         self.redraw()
 
+    def _migrate_persisted_settings(self) -> None:
+        version = int(self.settings.value("settings_schema_version", 0) or 0)
+        if version < 2:
+            old_obj = str(self.settings.value("dl_objectness_threshold_input", "", type=str) or "").strip()
+            old_min_vis = str(self.settings.value("dl_min_visible_channels_input", "", type=str) or "").strip()
+            if old_obj in {"", "0.35"}:
+                self.settings.setValue("dl_objectness_threshold_input", "0.45")
+            if old_min_vis in {"", "2"}:
+                self.settings.setValue("dl_min_visible_channels_input", "4")
+            self.settings.setValue("settings_schema_version", 2)
+        if version < 3:
+            old_obj = str(self.settings.value("dl_objectness_threshold_input", "", type=str) or "").strip()
+            old_min_vis = str(self.settings.value("dl_min_visible_channels_input", "", type=str) or "").strip()
+            if old_obj in {"", "0.35", "0.40"}:
+                self.settings.setValue("dl_objectness_threshold_input", "0.45")
+            if old_min_vis in {"", "1", "2", "3"}:
+                self.settings.setValue("dl_min_visible_channels_input", "4")
+
+            raw_adv = str(self.settings.value("dl_advanced_params_json", "", type=str) or "").strip()
+            if raw_adv:
+                try:
+                    adv = json.loads(raw_adv)
+                except Exception:  # noqa: BLE001
+                    adv = {}
+            else:
+                adv = {}
+            if not isinstance(adv, dict):
+                adv = {}
+            merged = dict(_default_dl_advanced_params())
+            merged.update(adv)
+            recommended = _peak_slot_recommended_advanced_params()
+            legacy_like = (
+                int(merged.get("extra_candidate_slots", 8)) >= 16
+                or float(merged.get("candidate_objectness_floor", 0.2)) < 0.1
+                or float(merged.get("duplicate_overlap_ratio", 0.7)) >= 0.75
+                or int(merged.get("min_unique_support_channels", 4)) <= 3
+            )
+            if legacy_like or not raw_adv:
+                merged.update(recommended)
+                self.settings.setValue("dl_advanced_params_json", json.dumps(merged, ensure_ascii=True))
+            self.settings.setValue("settings_schema_version", 3)
+
+    def _persisted_line_edits(self) -> dict[str, QLineEdit]:
+        return {
+            "path_input": self.path_input,
+            "position_xlsx_input": self.position_xlsx_input,
+            "npy_fs_input": self.npy_fs_input,
+            "npy_dx_input": self.npy_dx_input,
+            "window_seconds_input": self.window_seconds_input,
+            "dl_model_path_input": self.dl_model_path_input,
+            "dl_objectness_threshold_input": self.dl_objectness_threshold_input,
+            "dl_visibility_threshold_input": self.dl_visibility_threshold_input,
+            "dl_min_visible_channels_input": self.dl_min_visible_channels_input,
+            "dl_refine_radius_samples_input": self.dl_refine_radius_samples_input,
+            "speed_min_input": self.speed_min_input,
+            "speed_max_input": self.speed_max_input,
+            "prominence_input": self.prominence_input,
+            "min_peak_distance_input": self.min_peak_distance_input,
+            "min_track_channels_input": self.min_track_channels_input,
+            "edge_min_track_channels_input": self.edge_min_track_channels_input,
+            "edge_time_margin_seconds_input": self.edge_time_margin_seconds_input,
+            "edge_min_score_scale_input": self.edge_min_score_scale_input,
+            "tile_seconds_input": self.tile_seconds_input,
+            "overlap_seconds_input": self.overlap_seconds_input,
+            "nms_time_radius_input": self.nms_time_radius_input,
+        }
+
+    def _persisted_checkboxes(self) -> dict[str, QCheckBox]:
+        return {
+            "use_position_xlsx_check": self.use_position_xlsx_check,
+            "lock_window_check": self.lock_window_check,
+            "auto_scroll_check": self.auto_scroll_check,
+            "template_enhance_check": self.template_enhance_check,
+            "show_peak_slot_diagnostics_check": self.show_peak_slot_diagnostics_check,
+        }
+
+    def _persisted_combos(self) -> dict[str, QComboBox]:
+        return {
+            "engine_combo": self.engine_combo,
+            "direction_combo": self.direction_combo,
+        }
+
+    def _connect_persisted_inputs(self) -> None:
+        for widget in self._persisted_line_edits().values():
+            widget.textChanged.connect(self._save_persisted_inputs)
+        for widget in self._persisted_checkboxes().values():
+            widget.toggled.connect(self._save_persisted_inputs)
+        for widget in self._persisted_combos().values():
+            widget.currentIndexChanged.connect(self._save_persisted_inputs)
+
+    def _restore_persisted_inputs(self) -> None:
+        for key, widget in self._persisted_line_edits().items():
+            if key == "dl_model_path_input":
+                continue
+            stored = str(self.settings.value(key, "", type=str) or "")
+            if not stored:
+                continue
+            with QSignalBlocker(widget):
+                widget.setText(stored)
+
+        for key, widget in self._persisted_checkboxes().items():
+            stored = self.settings.value(key, None)
+            if stored is None:
+                continue
+            with QSignalBlocker(widget):
+                widget.setChecked(str(stored).lower() in {"1", "true", "yes"})
+
+        for key, widget in self._persisted_combos().items():
+            stored = str(self.settings.value(key, "", type=str) or "")
+            if not stored:
+                continue
+            idx = widget.findData(stored)
+            if idx >= 0:
+                with QSignalBlocker(widget):
+                    widget.setCurrentIndex(idx)
+
+        last_dl_model_path = str(self.settings.value("last_dl_model_path", "", type=str) or "").strip()
+        if last_dl_model_path:
+            path = Path(last_dl_model_path).expanduser()
+            if path.is_file():
+                with QSignalBlocker(self.dl_model_path_input):
+                    self.dl_model_path_input.setText(str(path))
+            else:
+                self.settings.remove("last_dl_model_path")
+        self._apply_restored_window_seconds()
+
+    def _apply_restored_window_seconds(self) -> None:
+        if self.backend.fs <= 0:
+            return
+        text = self.window_seconds_input.text().strip()
+        if not text:
+            self._sync_window_seconds_input(force=True)
+            return
+        try:
+            window_seconds = float(text)
+            if window_seconds <= 0:
+                raise ValueError
+            new_size = int(round(window_seconds * self.backend.fs))
+            max_samples = int(self.backend.data_all.shape[1]) if self.backend.data_all.size > 0 else new_size
+            new_size = max(1000, min(new_size, max_samples))
+            self.backend.window_size = new_size
+            if self.backend.data_all.size > 0:
+                self.backend.current_start = min(
+                    int(self.backend.current_start),
+                    max(0, max_samples - new_size),
+                )
+                self.backend.update_view_window()
+            with QSignalBlocker(self.window_seconds_input):
+                self.window_seconds_input.setText(f"{float(self.backend.window_size) / float(self.backend.fs):.2f}")
+        except Exception:  # noqa: BLE001
+            self._sync_window_seconds_input(force=True)
+
+    def _load_startup_data(self) -> None:
+        startup_path = self.path_input.text().strip()
+        if not startup_path:
+            return
+        use_position_xlsx = bool(self.use_position_xlsx_check.isChecked())
+        position_xlsx_path = self.position_xlsx_input.text().strip()
+        npy_fs_hz = self._parse_optional_positive_float(self.npy_fs_input)
+        npy_dx_m = self._parse_optional_positive_float(self.npy_dx_input)
+        try:
+            self.backend.load_data_folder(
+                startup_path,
+                reset_results=True,
+                use_position_xlsx=use_position_xlsx,
+                position_xlsx_path=position_xlsx_path if use_position_xlsx and position_xlsx_path else None,
+                npy_fs_hz=npy_fs_hz,
+                npy_dx_m=npy_dx_m,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.status_label.setText(f"Startup note: failed to load saved input: {exc}")
+            return
+        self.path_input.setText(self.backend.files)
+        self.progress.setValue(0)
+        self._set_import_status(prefix="Startup loaded")
+        self._apply_restored_window_seconds()
+
+    def _load_dl_advanced_params(self) -> dict[str, object]:
+        defaults = _default_dl_advanced_params()
+        raw = str(self.settings.value("dl_advanced_params_json", "", type=str) or "").strip()
+        if not raw:
+            return defaults
+        try:
+            loaded = json.loads(raw)
+        except Exception:  # noqa: BLE001
+            return defaults
+        if not isinstance(loaded, dict):
+            return defaults
+        merged = dict(defaults)
+        for spec in DL_ADVANCED_PARAM_SPECS:
+            key = str(spec["key"])
+            if key in loaded:
+                merged[key] = loaded[key]
+        return merged
+
+    def _save_dl_model_path(self, text: str) -> None:
+        value = str(text).strip()
+        if value:
+            self.settings.setValue("last_dl_model_path", value)
+        else:
+            self.settings.remove("last_dl_model_path")
+
+    def _save_persisted_inputs(self, *_args) -> None:
+        for key, widget in self._persisted_line_edits().items():
+            if key == "dl_model_path_input":
+                continue
+            self.settings.setValue(key, widget.text())
+        for key, widget in self._persisted_checkboxes().items():
+            self.settings.setValue(key, bool(widget.isChecked()))
+        for key, widget in self._persisted_combos().items():
+            self.settings.setValue(key, str(widget.currentData()))
+
+    def _save_dl_advanced_params(self) -> None:
+        self.settings.setValue("dl_advanced_params_json", json.dumps(self.dl_advanced_params, ensure_ascii=True))
+
+    def open_dl_params_dialog(self) -> None:
+        dialog = DeepLearningParamsDialog(self, self.dl_advanced_params)
+        if dialog.exec() != int(QDialog.DialogCode.Accepted):
+            return
+        self.dl_advanced_params = dialog.values()
+        self._save_dl_advanced_params()
+        self.status_label.setText("Deep Learning advanced parameters updated")
+
     def browse_folder(self) -> None:
         start_dir = self.path_input.text().strip() or str(Path.cwd())
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Input File",
+            start_dir,
+            "Supported Files (*.npy *.pt *.pth);;NumPy Array (*.npy);;Tensor Shard (*.pt *.pth);;All Files (*)",
+        )
+        if selected:
+            self.path_input.setText(selected)
+            return
         selected = QFileDialog.getExistingDirectory(self, "Select SAC Data Folder", start_dir)
         if selected:
             self.path_input.setText(selected)
@@ -455,10 +1011,12 @@ class AutoTrackGUI(QMainWindow):
     def import_data(self) -> None:
         folder = self.path_input.text().strip()
         if not folder:
-            QMessageBox.warning(self, "Import Failed", "Please enter a folder path.")
+            QMessageBox.warning(self, "Import Failed", "Please enter a SAC folder, .npy file, or tensor shard .pt path.")
             return
         use_position_xlsx = bool(self.use_position_xlsx_check.isChecked())
         position_xlsx_path = self.position_xlsx_input.text().strip()
+        npy_fs_hz = self._parse_optional_positive_float(self.npy_fs_input)
+        npy_dx_m = self._parse_optional_positive_float(self.npy_dx_input)
         if use_position_xlsx and (not position_xlsx_path):
             QMessageBox.warning(self, "Import Failed", "Please select a position XLSX file first.")
             return
@@ -470,6 +1028,8 @@ class AutoTrackGUI(QMainWindow):
                 reset_results=True,
                 use_position_xlsx=use_position_xlsx,
                 position_xlsx_path=position_xlsx_path if use_position_xlsx else None,
+                npy_fs_hz=npy_fs_hz,
+                npy_dx_m=npy_dx_m,
             )
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Import Failed", str(exc))
@@ -477,25 +1037,82 @@ class AutoTrackGUI(QMainWindow):
             return
         self.path_input.setText(self.backend.files)
         self.progress.setValue(0)
-        import_info = dict(getattr(self.backend, "last_import_info", {}))
-        if bool(import_info.get("position_sort_enabled")):
-            matched = int(import_info.get("matched_channels", 0))
-            total = int(import_info.get("total_channels", 0))
-            unmatched = int(import_info.get("unmatched_channels", max(0, total - matched)))
-            if unmatched > 0:
-                suffix = f", unmatched={unmatched} (appended at end)"
-            else:
-                suffix = ", all matched"
-            self.status_label.setText(
-                f"Imported: {self.backend.files}\nPosition XLSX order ON: matched={matched}/{total}{suffix}"
-            )
-        else:
-            self.status_label.setText(f"Imported: {self.backend.files}")
+        self._set_import_status(prefix="Imported")
         self._sync_window_seconds_input(force=True)
         self._update_window_slider()
         self.redraw()
         if self.auto_scroll_check.isChecked() and self.worker_thread is None:
             self.auto_scroll_timer.start()
+
+    @staticmethod
+    def _parse_optional_positive_float(widget: QLineEdit) -> Optional[float]:
+        text = widget.text().strip()
+        if not text:
+            return None
+        value = float(text)
+        if value <= 0:
+            raise ValueError
+        return float(value)
+
+    def _set_import_status(self, *, prefix: str) -> None:
+        import_info = dict(getattr(self.backend, "last_import_info", {}))
+        if str(import_info.get("input_kind")) == "npy":
+            self.status_label.setText(
+                f"{prefix} NPY: "
+                f"{self.backend.files}\n"
+                f"Layout={import_info.get('array_layout')}, "
+                f"channels={import_info.get('channels')}, "
+                f"samples={import_info.get('samples')}, "
+                f"fs={float(import_info.get('fs_hz', 0.0)):.3f} Hz, "
+                f"dx={float(import_info.get('dx_m', 0.0)):.3f} m"
+            )
+            return
+        if str(import_info.get("input_kind")) == "tensor_shard":
+            sample_index = int(import_info.get("sample_index", 0)) + 1
+            sample_count = int(import_info.get("sample_count", 0))
+            self.status_label.setText(
+                f"{prefix} tensor shard sample: "
+                f"{self.backend.files}\n"
+                f"sample={sample_index}/{sample_count}, "
+                f"dataset={import_info.get('dataset_format') or 'unknown'}, "
+                f"channels={import_info.get('channels')}, "
+                f"samples={import_info.get('samples')}, "
+                f"fs={float(import_info.get('fs_hz', 0.0)):.3f} Hz"
+            )
+            return
+        if bool(import_info.get("position_sort_enabled")):
+            matched = int(import_info.get("matched_channels", 0))
+            total = int(import_info.get("total_channels", 0))
+            unmatched = int(import_info.get("unmatched_channels", max(0, total - matched)))
+            suffix = f", unmatched={unmatched} (appended at end)" if unmatched > 0 else ", all matched"
+            self.status_label.setText(
+                f"{prefix}: {self.backend.files}\nPosition XLSX order ON: matched={matched}/{total}{suffix}"
+            )
+            return
+        self.status_label.setText(f"{prefix}: {self.backend.files}")
+
+    def _switch_tensor_shard_sample(self, delta: int) -> bool:
+        if self.worker_thread is not None:
+            return False
+        import_info = dict(getattr(self.backend, "last_import_info", {}))
+        if str(import_info.get("input_kind")) != "tensor_shard":
+            return False
+        sample_count = int(import_info.get("sample_count", 0))
+        if sample_count <= 1:
+            return False
+        current = int(import_info.get("sample_index", 0))
+        target = max(0, min(sample_count - 1, current + int(delta)))
+        if target == current:
+            return False
+        self.auto_scroll_timer.stop()
+        self._auto_scroll_paused_by_worker = False
+        self.backend.load_tensor_shard_sample(target, reset_results=True)
+        self.progress.setValue(0)
+        self._sync_window_seconds_input(force=True)
+        self._update_window_slider()
+        self.redraw()
+        self._set_import_status(prefix="Switched")
+        return True
 
     def _set_running(self, running: bool) -> None:
         self.run_btn.setEnabled(not running)
@@ -506,11 +1123,14 @@ class AutoTrackGUI(QMainWindow):
         self.engine_combo.setEnabled(not running)
         self.dl_model_path_input.setEnabled(not running)
         self.dl_model_path_btn.setEnabled(not running)
+        self.dl_params_btn.setEnabled(not running)
         self.dl_objectness_threshold_input.setEnabled(not running)
         self.dl_visibility_threshold_input.setEnabled(not running)
         self.dl_min_visible_channels_input.setEnabled(not running)
         self.dl_refine_radius_samples_input.setEnabled(not running)
         self.template_enhance_check.setEnabled(not running)
+        if self.show_peak_slot_diagnostics_check is not None:
+            self.show_peak_slot_diagnostics_check.setEnabled(not running)
         self.lock_window_check.setEnabled(not running)
         self.window_seconds_input.setEnabled(not running)
         self.auto_scroll_check.setEnabled(not running)
@@ -535,7 +1155,7 @@ class AutoTrackGUI(QMainWindow):
             "cpu_single": "CPU Single-thread",
             "gpu_torch_mps": "GPU(PyTorch MPS)",
             "gpu": "GPU",
-            "deep_learning": "Deep Learning",
+            "deep_learning": "Deep Learning(PeakSlotNet)",
         }
         return mapping.get(str(engine_key), str(engine_key))
 
@@ -722,10 +1342,12 @@ class AutoTrackGUI(QMainWindow):
             "nms_time_radius": nms_time_radius,
             "enable_template_enhancement": enable_template_enhancement,
             "dl_model_path": dl_model_path,
+            "dl_model_family": "peak_slot",
             "dl_objectness_threshold": dl_objectness_threshold,
             "dl_visibility_threshold": dl_visibility_threshold,
             "dl_min_visible_channels": dl_min_visible_channels,
             "dl_refine_radius_samples": dl_refine_radius_samples,
+            "dl_extra_config": dict(self.dl_advanced_params),
             "current_window_only": bool(current_window_only),
         }
 
@@ -801,7 +1423,7 @@ class AutoTrackGUI(QMainWindow):
         engine_text = str(params.get("engine_text", self._engine_text(str(params.get("engine", "")))))
         ext_cfg = params.get("extractor_config", {})
         if str(params.get("engine", "")) == "deep_learning":
-            tmpl_text = "Trajectory Model"
+            tmpl_text = "PeakSlotNet"
         else:
             tmpl_on = bool(ext_cfg.get("use_template_enhancement", True))
             tmpl_text = "Template ON" if tmpl_on else "Template OFF"
@@ -893,6 +1515,70 @@ class AutoTrackGUI(QMainWindow):
                 x = offsets_km[i] + ratio * wiggle_amp
             self.ax.plot(x, t, color="0.45", linewidth=0.8, alpha=0.9)
 
+    def _plot_peak_slot_diagnostics(self) -> dict[str, int]:
+        if self.show_peak_slot_diagnostics_check is None or (not self.show_peak_slot_diagnostics_check.isChecked()):
+            return {"raw": 0, "final": 0, "removed": 0, "peaks": 0}
+        diag = dict(getattr(self.backend, "last_peak_slot_diagnostics", {}) or {})
+        if str(diag.get("model_family", "")) != "peak_slot":
+            return {"raw": 0, "final": 0, "removed": 0, "peaks": 0}
+
+        peak_index = np.asarray(diag.get("peak_index", []))
+        peak_valid = np.asarray(diag.get("peak_valid", []))
+        time_downsample = int(diag.get("time_downsample", 1) or 1)
+        candidates = list(diag.get("candidates", []))
+        peak_count = 0
+
+        if peak_index.ndim == 2 and peak_valid.shape == peak_index.shape:
+            peak_xs: list[float] = []
+            peak_ts: list[float] = []
+            for ch in range(int(peak_index.shape[0])):
+                for k in range(int(peak_index.shape[1])):
+                    if not bool(peak_valid[ch, k]):
+                        continue
+                    t_idx = int(peak_index[ch, k]) * int(max(1, time_downsample))
+                    if not (0 <= t_idx < int(self.backend.window_size)):
+                        continue
+                    peak_xs.append(float(self.backend.x_axis_m[ch]) * 1e-3)
+                    peak_ts.append(float(t_idx) / float(self.backend.fs))
+                    peak_count += 1
+            if peak_xs:
+                self.ax.scatter(
+                    np.asarray(peak_xs, dtype=np.float64),
+                    np.asarray(peak_ts, dtype=np.float64),
+                    s=8,
+                    marker=".",
+                    color="0.25",
+                    alpha=0.18,
+                    zorder=2,
+                )
+
+        raw_count = 0
+        removed_count = 0
+        final_count = 0
+        for cand in candidates:
+            points = list(cand.get("points", []))
+            if len(points) < 2:
+                continue
+            xs = np.asarray([float(p["offset_km"]) for p in points], dtype=np.float64)
+            ts = np.asarray([float(p["time_s"]) for p in points], dtype=np.float64)
+            status = str(cand.get("status", "raw"))
+            raw_count += 1
+            if status == "final":
+                final_count += 1
+                self.ax.plot(xs, ts, color="#00a651", linewidth=1.0, alpha=0.85, linestyle="--", zorder=4)
+                self.ax.scatter(xs, ts, s=24, facecolors="none", edgecolors="#00a651", linewidths=0.9, zorder=5)
+            elif status != "removed_short":
+                removed_count += 1
+                self.ax.plot(xs, ts, color="#d62728", linewidth=0.8, alpha=0.28, linestyle="--", zorder=3)
+                self.ax.scatter(xs, ts, s=12, marker="x", color="#d62728", alpha=0.28, zorder=3)
+
+        return {
+            "raw": int(raw_count),
+            "final": int(final_count),
+            "removed": int(removed_count),
+            "peaks": int(peak_count),
+        }
+
     def redraw(self) -> None:
         self.fig.clear()
         if self.backend.data_view.size == 0:
@@ -975,11 +1661,16 @@ class AutoTrackGUI(QMainWindow):
                     bbox={"facecolor": "white", "alpha": 0.55, "edgecolor": "none", "pad": 0.8},
                 )
 
+        diag_counts = self._plot_peak_slot_diagnostics()
         window_end = (self.backend.current_start + self.backend.window_size) / self.backend.fs
         window_start = self.backend.current_start / self.backend.fs
-        self.ax.set_title(
-            f"Tracks={track_count}, Points={point_count}, Window=[{window_start:.1f}, {window_end:.1f}] s"
-        )
+        title = f"Tracks={track_count}, Points={point_count}, Window=[{window_start:.1f}, {window_end:.1f}] s"
+        if self.show_peak_slot_diagnostics_check is not None and self.show_peak_slot_diagnostics_check.isChecked():
+            title += (
+                f" | PeakSlot diag: peaks={diag_counts['peaks']}, raw={diag_counts['raw']}, "
+                f"final={diag_counts['final']}, removed={diag_counts['removed']}"
+            )
+        self.ax.set_title(title)
         self._sync_window_seconds_input()
         self._update_window_slider()
         self.canvas.draw_idle()
@@ -1004,6 +1695,8 @@ class AutoTrackGUI(QMainWindow):
                 modifiers = None
         zoom = bool(modifiers and (modifiers & Qt.KeyboardModifier.ControlModifier))
         if zoom and self.lock_window_check.isChecked():
+            return
+        if not zoom and self._switch_tensor_shard_sample(delta=-step):
             return
         cursor_t = float(event.ydata) if event.ydata is not None else None
         if cursor_t is not None and self.backend.t_axis_view.size > 0:
