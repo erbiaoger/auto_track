@@ -1,6 +1,9 @@
 # 基于真实背景 Profile 的工作流
 
-这份文档是当前基于真实背景 profile 的 PeakSlotNet 数据生产说明。后续如果要复现我现在这条流程，直接看这一份就够了。
+这份文档说明两条基于真实 profile 的数据生产路线：
+
+- `profile + real background mix`
+- `profile-only synthetic`
 
 ## 目标
 
@@ -84,6 +87,28 @@ datasets/track_slot_realbg_120s_profile/train
 - 峰密度下调
 - 结构化、非均匀的伪影放置
 
+### 2B. 生成纯模拟但保留真实坏道结构的 `track_slot` 数据
+
+如果你不想再混入真实背景，而是只想记住真实里的固定坏道、高概率坏道和峰形参数，然后生成一套全标签的纯模拟数据，执行：
+
+```sh
+sh generate_track_slot_dataset_profile_only.sh
+```
+
+默认输出目录：
+
+```text
+datasets/track_slot_profile_only_120s/train
+```
+
+这条路线的特点是：
+
+- 不再读取真实背景窗口
+- 固定坏道每个样本都复现
+- 高概率坏道按 profile 里的真实频率采样
+- 主轨迹峰和孤立峰都使用同一套真实高斯窗参数
+- 所有车辆都来自生成器本身，因此都有标签
+
 ### 3. 转成 `peak_slot`
 
 ```sh
@@ -159,8 +184,8 @@ PROFILE=/tmp/real_profile_smoke/realism_profile.json DATA_DIRS=/tmp/track_slot_p
 - `window-sampler=profile_weighted` 表示使用 `realism_profile.json` 中记录的加权窗口采样。
 - `artifact-policy=manual` 表示保留旧的手工参数行为。
 - `artifact-policy=hybrid` 或 `profile_matched` 表示让 profile 注入车辆和伪影的默认参数。
-- 当前实现仍然是 `profile + real background mix`，不是 `profile-only`。
-- 也就是说，生成数据时仍然需要真实背景 `.npy` 文件。
+- `generate_track_slot_dataset_from_real_npy_profile.sh` 这条路线仍然是 `profile + real background mix`，因此生成阶段需要真实背景 `.npy` 文件。
+- 如果改走 `generate_track_slot_dataset_profile_only.sh`，则在生成阶段不再需要真实 `.npy`，只需要已经提取好的 `realism_profile.json`。
 
 ## 关键代码文件
 
@@ -168,5 +193,7 @@ PROFILE=/tmp/real_profile_smoke/realism_profile.json DATA_DIRS=/tmp/track_slot_p
   输出 `profile.json`、`realism_profile.json` 和 `report.md`。
 - `autotrack/dl/generate_track_slot_dataset_from_real_npy.py`
   支持 `--profile`、`--profile-strength`、`--window-sampler`、`--artifact-policy`。
+- `autotrack/dl/generate_track_slot_dataset.py`
+  支持 `--profile`，可根据 `realism_profile.json` 复用固定坏道、高概率坏道和真实峰形参数，但不混真实背景。
 - `autotrack/dl/calibrate_realbg_generator.py`
   用 `realism_profile.json` 对已有生成数据做分布评分。

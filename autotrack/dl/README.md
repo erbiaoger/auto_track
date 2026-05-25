@@ -5,6 +5,9 @@ Deep-learning code for DAS vehicle trajectory recognition.
 ## TrackSlotNet Files
 
 - `generate_track_slot_dataset.py`: creates tensor shards for TrackSlotNet
+  training. It now also accepts `--profile`, so a `realism_profile.json` can
+  inject fixed/probabilistic bad-channel structure plus real peak-shape
+  defaults into a fully synthetic labeled dataset.
 - `generate_track_slot_dataset_from_real_npy.py`: creates TrackSlotNet shards by sampling real `.npy` background windows and overlaying synthetic vehicles. Use this when pure synthetic backgrounds are too far from the real sparse DAS distribution.
   It now supports `--profile`, `--profile-strength`, `--window-sampler`, and
   `--artifact-policy`, so the generator can default to a
@@ -72,6 +75,7 @@ Deep-learning code for DAS vehicle trajectory recognition.
 
 ```sh
 uv run python -m autotrack.dl.generate_track_slot_dataset --out-dir datasets/track_slot/train --num-samples 1024 --shard-size 128 --workers 8 --overwrite
+uv run python -m autotrack.dl.generate_track_slot_dataset --out-dir datasets/track_slot_profile_only/train --profile datasets/profiles/xi_gauss_50_realbg/realism_profile.json --num-samples 1024 --shard-size 128 --vehicles-min 6 --vehicles-max 18 --overwrite
 uv run python -m autotrack.dl.generate_track_slot_dataset_from_real_npy --input /Volumes/SanDisk2T4/MyProjects/BaFang/xi/00gauss_large.npy --out-dir datasets/track_slot_realbg/train --num-samples 1024 --shard-size 128 --window-seconds 120 --window-stride-seconds 60 --channel-count 50 --vehicles-min 6 --vehicles-max 24 --overwrite
 uv run python -m autotrack.dl.train_track_slot --data-dir datasets/track_slot/train --out-dir models/track_slot_cuda --device cuda --amp on
 uv run python -m autotrack.dl.train_track_slot --data-dir datasets/track_slot/train --out-dir models/track_slot_cuda --device cuda --amp on --epochs 200 --auto-resume
@@ -98,6 +102,7 @@ The profile-driven workflow adds three more top-level shells:
 ```sh
 sh profile_real_npy_background.sh
 sh generate_track_slot_dataset_from_real_npy_profile.sh
+sh generate_track_slot_dataset_profile_only.sh
 sh calibrate_realbg_generator.sh
 ```
 
