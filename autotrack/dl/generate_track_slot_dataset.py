@@ -47,7 +47,7 @@ import math
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 
@@ -55,6 +55,8 @@ import torch
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate TrackSlotNet tensor training shards.")
     parser.add_argument("--out-dir", required=True, type=Path, help="Output directory for meta.json and .pt shards.")
+    parser.add_argument("--profile", type=Path, default=None, help="Optional realism_profile.json. Uses bad-channel layout and peak-shape defaults without sampling real backgrounds.")
+    parser.add_argument("--profile-strength", type=float, default=1.0, help="Blend factor in [0, 1] for numeric profile defaults that this generator consumes.")
     parser.add_argument("--realism-preset", default="custom", help="Human-readable preset name recorded in meta.json.")
     parser.add_argument("--num-samples", type=int, default=20000, help="Total generated windows.")
     parser.add_argument("--shard-size", type=int, default=256, help="Samples per .pt shard.")
@@ -79,6 +81,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--constant-perturb-width-max", type=int, default=2, help="Maximum sparse perturbation width in channel segments.")
     parser.add_argument("--smooth-speed-max-frac", type=float, default=0.05, help="Maximum absolute smooth speed variation fraction.")
     parser.add_argument("--smooth-speed-corr-channels", type=int, default=8, help="Smoothing width for random speed variation in channel segments.")
+    parser.add_argument("--track-time-jitter-max-s", type=float, default=0.0, help="Maximum smooth per-track timing jitter in seconds across channels.")
+    parser.add_argument("--track-time-jitter-corr-channels", type=int, default=6, help="Correlation width in channels for per-track timing jitter.")
+    parser.add_argument("--track-time-jitter-min-gap-ratio", type=float, default=0.35, help="Minimum retained fraction of the original per-channel travel time after timing jitter.")
     parser.add_argument("--stop-duration-min-s", type=float, default=1.0, help="Minimum stop-go delay in seconds.")
     parser.add_argument("--stop-duration-max-s", type=float, default=8.0, help="Maximum stop-go delay in seconds.")
     parser.add_argument("--stop-channel-width-min", type=int, default=1, help="Minimum number of path positions with widened stop response.")
@@ -149,6 +154,100 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+ARG_DEFAULTS: dict[str, Any] = {
+    "profile": None,
+    "profile_strength": 1.0,
+    "realism_preset": "custom",
+    "num_samples": 20000,
+    "shard_size": 256,
+    "n_ch": 50,
+    "fs": 1000.0,
+    "window_seconds": 240.0,
+    "time_downsample": 10,
+    "dx_m": 100.0,
+    "vehicles_min": 32,
+    "vehicles_max": 48,
+    "speed_min_kmh": 70.0,
+    "speed_max_kmh": 85.0,
+    "motion_mix": "constant_sparse,smooth_random,stop_go",
+    "motion_weights": "0.84,0.15,0.01",
+    "constant_perturb_prob": 0.05,
+    "constant_perturb_max_frac": 0.01,
+    "constant_perturb_width_min": 1,
+    "constant_perturb_width_max": 2,
+    "smooth_speed_max_frac": 0.05,
+    "smooth_speed_corr_channels": 8,
+    "track_time_jitter_max_s": 0.0,
+    "track_time_jitter_corr_channels": 6,
+    "track_time_jitter_min_gap_ratio": 0.35,
+    "stop_duration_min_s": 1.0,
+    "stop_duration_max_s": 8.0,
+    "stop_channel_width_min": 1,
+    "stop_channel_width_max": 3,
+    "stop_response_sigma_scale": 3.0,
+    "stop_response_amp_scale": 1.2,
+    "restart_speed_ratio_min": 0.95,
+    "restart_speed_ratio_max": 1.05,
+    "noise_std": 0.0,
+    "colored_noise_std": 0.0,
+    "colored_noise_corr_s": 0.8,
+    "channel_bias_std": 0.0,
+    "channel_gain_std": 0.0,
+    "baseline_drift_std": 0.0,
+    "baseline_drift_corr_s": 6.0,
+    "dead_channel_indices": "",
+    "random_dead_channel_ratio": 0.0,
+    "random_dead_channel_min": 1,
+    "random_dead_channel_max": 5,
+    "zero_background_ratio": 0.0,
+    "zero_background_rate": 12.0,
+    "zero_background_channel_min": 1,
+    "zero_background_channel_max": 4,
+    "zero_background_duration_min_s": 0.5,
+    "zero_background_duration_max_s": 4.0,
+    "amp_min": 6.0,
+    "amp_max": 6.0,
+    "sigma_min_s": 0.25,
+    "sigma_max_s": 0.25,
+    "primary_ratio": 0.8333333333,
+    "interaction_ratio": 0.3,
+    "interaction_types": "crossing,overtake,near_parallel",
+    "interaction_time_min_frac": 0.05,
+    "interaction_time_max_frac": 0.95,
+    "isolated_noise_ratio": 1.0,
+    "isolated_noise_rate": 120.0,
+    "isolated_noise_amp_min": 1.0,
+    "isolated_noise_amp_max": 6.0,
+    "isolated_noise_sigma_min_s": 0.08,
+    "isolated_noise_sigma_max_s": 0.35,
+    "min_visible_channels": 2,
+    "speed_norm_kmh": 150.0,
+    "clip_ratio": 1.35,
+    "input_mode": "raw",
+    "x_dtype": "float16",
+    "workers": 0,
+    "seed": 42,
+    "overwrite": False,
+}
+
+PROFILE_DIRECT_KEYS = {
+    "dead_channel_indices",
+    "random_dead_channel_ratio",
+    "random_dead_channel_min",
+    "random_dead_channel_max",
+    "zero_background_ratio",
+    "zero_background_rate",
+    "zero_background_channel_min",
+    "zero_background_channel_max",
+    "zero_background_duration_min_s",
+    "zero_background_duration_max_s",
+    "primary_ratio",
+    "min_visible_channels",
+    "isolated_noise_ratio",
+    "isolated_noise_rate",
+}
+
+
 def _rand_uniform(gen: torch.Generator, lo: float, hi: float) -> float:
     return float(lo + torch.rand((), generator=gen).item() * (hi - lo))
 
@@ -176,6 +275,114 @@ def _parse_float_csv(text: str) -> list[float]:
 
 def _parse_int_csv(text: str) -> list[int]:
     return [int(item) for item in _split_csv(text)]
+
+
+def _finite_value(value: Any, fallback: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return float(fallback)
+    if not math.isfinite(parsed):
+        return float(fallback)
+    return float(parsed)
+
+
+def _is_default_arg(args: argparse.Namespace, name: str) -> bool:
+    if name not in ARG_DEFAULTS:
+        return False
+    current = getattr(args, name)
+    default = ARG_DEFAULTS[name]
+    if isinstance(default, float):
+        return abs(float(current) - float(default)) <= 1e-9
+    return current == default
+
+
+def _blend_value(default_value: Any, profile_value: Any, strength: float) -> Any:
+    if isinstance(default_value, str):
+        return str(profile_value)
+    if isinstance(default_value, int) and not isinstance(default_value, bool):
+        blended = float(default_value) + float(strength) * (float(profile_value) - float(default_value))
+        return int(round(blended))
+    if isinstance(default_value, float):
+        return float(default_value) + float(strength) * (float(profile_value) - float(default_value))
+    return profile_value
+
+
+def _load_realism_profile(profile_path: Path) -> dict[str, Any]:
+    payload = json.loads(Path(profile_path).expanduser().read_text(encoding="utf-8"))
+    if str(payload.get("format", "")) != "realism_profile_v1":
+        raise ValueError(f"Unsupported realism profile format in {profile_path}")
+    return payload
+
+
+def _apply_profile_defaults(args: argparse.Namespace, profile: dict[str, Any] | None) -> dict[str, Any]:
+    if profile is None:
+        return {}
+    defaults = dict(profile.get("generator_defaults", {}))
+    strength = float(min(1.0, max(0.0, args.profile_strength)))
+    applied: dict[str, Any] = {}
+
+    for key in sorted(PROFILE_DIRECT_KEYS):
+        if key not in defaults or not _is_default_arg(args, key):
+            continue
+        base_default = ARG_DEFAULTS[key]
+        profile_value = defaults[key]
+        new_value = _blend_value(base_default, profile_value, strength)
+        setattr(args, key, new_value)
+        applied[key] = new_value
+
+    if "fixed_amp" in defaults:
+        fixed_amp = _finite_value(defaults.get("fixed_amp"), ARG_DEFAULTS["amp_min"])
+        for key in ["amp_min", "amp_max"]:
+            if _is_default_arg(args, key):
+                setattr(args, key, float(fixed_amp))
+                applied[key] = float(fixed_amp)
+
+    if "sigma_seconds" in defaults:
+        sigma_seconds = _finite_value(defaults.get("sigma_seconds"), ARG_DEFAULTS["sigma_min_s"])
+        for key in ["sigma_min_s", "sigma_max_s"]:
+            if _is_default_arg(args, key):
+                setattr(args, key, float(sigma_seconds))
+                applied[key] = float(sigma_seconds)
+
+    if "isolated_noise_amp_min" in defaults and _is_default_arg(args, "isolated_noise_amp_min"):
+        value = _finite_value(defaults.get("isolated_noise_amp_min"), ARG_DEFAULTS["isolated_noise_amp_min"])
+        args.isolated_noise_amp_min = float(value)
+        applied["isolated_noise_amp_min"] = float(value)
+    if "isolated_noise_amp_max" in defaults and _is_default_arg(args, "isolated_noise_amp_max"):
+        value = _finite_value(defaults.get("isolated_noise_amp_max"), ARG_DEFAULTS["isolated_noise_amp_max"])
+        args.isolated_noise_amp_max = float(value)
+        applied["isolated_noise_amp_max"] = float(value)
+    if "isolated_noise_sigma_min_s" in defaults and _is_default_arg(args, "isolated_noise_sigma_min_s"):
+        value = _finite_value(defaults.get("isolated_noise_sigma_min_s"), ARG_DEFAULTS["isolated_noise_sigma_min_s"])
+        args.isolated_noise_sigma_min_s = float(value)
+        applied["isolated_noise_sigma_min_s"] = float(value)
+    if "isolated_noise_sigma_max_s" in defaults and _is_default_arg(args, "isolated_noise_sigma_max_s"):
+        value = _finite_value(defaults.get("isolated_noise_sigma_max_s"), ARG_DEFAULTS["isolated_noise_sigma_max_s"])
+        args.isolated_noise_sigma_max_s = float(value)
+        applied["isolated_noise_sigma_max_s"] = float(value)
+
+    return applied
+
+
+def _resolve_profile_structures(profile: dict[str, Any] | None) -> dict[str, Any]:
+    if profile is None:
+        return {
+            "stable_dead_channels": [],
+            "probabilistic_dead_channels": [],
+        }
+    zero = profile.get("zero_components", {})
+    return {
+        "stable_dead_channels": [int(v) for v in zero.get("stable_dead_channel_indices", zero.get("dead_channel_indices", []))],
+        "probabilistic_dead_channels": [
+            {
+                "channel": int(item.get("channel", -1)),
+                "probability": float(item.get("probability", 0.0)),
+            }
+            for item in zero.get("probabilistic_dead_channels", [])
+            if isinstance(item, dict)
+        ],
+    }
 
 
 def _motion_models_and_weights(args: argparse.Namespace) -> tuple[list[str], list[float]]:
@@ -278,6 +485,46 @@ def _integrate_segment_times(
     return t_path
 
 
+def _apply_track_time_jitter(
+    t_path: torch.Tensor,
+    *,
+    anchor_pos: int,
+    args: argparse.Namespace,
+    gen: torch.Generator,
+) -> torch.Tensor:
+    n_ch = int(t_path.numel())
+    jitter_max_s = float(max(0.0, args.track_time_jitter_max_s))
+    if n_ch <= 1 or jitter_max_s <= 0.0:
+        return t_path
+    corr = int(max(1, args.track_time_jitter_corr_channels))
+    noise = torch.randn((n_ch,), generator=gen, dtype=torch.float32)
+    if corr > 1 and n_ch > 1:
+        kernel_width = min(corr, n_ch)
+        kernel = torch.ones((1, 1, kernel_width), dtype=torch.float32) / float(kernel_width)
+        pad_left = kernel_width // 2
+        pad_right = kernel_width - 1 - pad_left
+        padded = torch.nn.functional.pad(noise.view(1, 1, -1), (pad_left, pad_right), mode="replicate")
+        noise = torch.nn.functional.conv1d(padded, kernel).view(-1)
+    anchor_pos = int(max(0, min(n_ch - 1, anchor_pos)))
+    noise = noise - noise[anchor_pos]
+    max_abs = float(torch.max(torch.abs(noise)).item())
+    if max_abs <= 1e-9:
+        return t_path
+    amplitude = _rand_uniform(gen, 0.0, jitter_max_s)
+    jitter = noise / max_abs * float(amplitude)
+    candidate = t_path + jitter
+    out = candidate.clone()
+    out[anchor_pos] = t_path[anchor_pos]
+    base_dt = torch.diff(t_path)
+    min_gap_ratio = float(min(0.95, max(0.05, args.track_time_jitter_min_gap_ratio)))
+    min_dt = torch.clamp(base_dt * float(min_gap_ratio), min=1e-4)
+    for pos in range(anchor_pos + 1, n_ch):
+        out[pos] = max(float(candidate[pos].item()), float(out[pos - 1].item() + min_dt[pos - 1].item()))
+    for pos in range(anchor_pos - 1, -1, -1):
+        out[pos] = min(float(candidate[pos].item()), float(out[pos + 1].item() - min_dt[pos].item()))
+    return out
+
+
 def _effective_speed_kmh(t_center: torch.Tensor, dx_m: float, fallback_speed_kmh: float) -> float:
     if int(t_center.numel()) <= 1:
         return float(fallback_speed_kmh)
@@ -328,6 +575,12 @@ def _sample_track_times(
         dx_m=float(args.dx_m),
         anchor_pos=anchor_pos,
         anchor_time=float(anchor_time),
+    )
+    t_path = _apply_track_time_jitter(
+        t_path,
+        anchor_pos=anchor_pos,
+        args=args,
+        gen=gen,
     )
 
     if motion_model == "stop_go" and int(n_ch) > 1:
@@ -496,8 +749,19 @@ def _apply_channel_gain(args: argparse.Namespace, gen: torch.Generator, data_ds:
     data_ds *= torch.clamp(gain, min=0.2, max=3.0)
 
 
-def _sample_dead_channels(args: argparse.Namespace, gen: torch.Generator, n_ch: int) -> list[int]:
+def _sample_dead_channels(
+    args: argparse.Namespace,
+    gen: torch.Generator,
+    n_ch: int,
+    *,
+    probabilistic_dead_channels: list[dict[str, float]] | None = None,
+) -> list[int]:
     dead = {idx for idx in _parse_int_csv(str(args.dead_channel_indices)) if 0 <= idx < int(n_ch)}
+    for item in probabilistic_dead_channels or []:
+        ch = int(item.get("channel", -1))
+        prob = float(item.get("probability", 0.0))
+        if 0 <= ch < int(n_ch) and prob > 0.0 and torch.rand((), generator=gen).item() < min(1.0, max(0.0, prob)):
+            dead.add(ch)
     if (
         float(args.random_dead_channel_ratio) > 0.0
         and torch.rand((), generator=gen).item() < float(args.random_dead_channel_ratio)
@@ -582,6 +846,7 @@ def _generate_one(args: argparse.Namespace, index: int) -> dict[str, torch.Tenso
     gen = torch.Generator(device="cpu")
     gen.manual_seed(int(args.seed) + int(index) * 1_000_003)
     n_ch = int(args.n_ch)
+    probabilistic_dead_channels = [dict(item) for item in getattr(args, "profile_probabilistic_dead_channels", [])]
     window_samples = int(round(float(args.window_seconds) * float(args.fs)))
     time_downsample = int(max(1, args.time_downsample))
     t_down = int(max(1, len(range(0, window_samples, time_downsample))))
@@ -671,7 +936,7 @@ def _generate_one(args: argparse.Namespace, index: int) -> dict[str, torch.Tenso
         data_ds,
         visibility,
         gt_valid,
-        _sample_dead_channels(args, gen, n_ch),
+        _sample_dead_channels(args, gen, n_ch, probabilistic_dead_channels=probabilistic_dead_channels),
         min_visible_channels=int(args.min_visible_channels),
     )
     x = _prepare_input(data_ds, clip_ratio=float(args.clip_ratio), input_mode=str(args.input_mode))
@@ -717,6 +982,17 @@ def _generate_shard_worker(payload: tuple[dict[str, object], int, int, int]) -> 
 
 def main() -> int:
     args = parse_args()
+    profile = _load_realism_profile(Path(args.profile).expanduser()) if args.profile is not None else None
+    applied_profile_defaults = _apply_profile_defaults(args, profile)
+    profile_structures = _resolve_profile_structures(profile)
+    args.profile_stable_dead_channels = list(profile_structures["stable_dead_channels"])
+    args.profile_probabilistic_dead_channels = list(profile_structures["probabilistic_dead_channels"])
+    stable_dead_text = ",".join(str(int(idx)) for idx in args.profile_stable_dead_channels)
+    if stable_dead_text:
+        current_dead = _parse_int_csv(str(args.dead_channel_indices)) if str(args.dead_channel_indices).strip() else []
+        merged_dead = sorted(set(int(idx) for idx in current_dead + args.profile_stable_dead_channels))
+        args.dead_channel_indices = ",".join(str(int(idx)) for idx in merged_dead)
+
     if int(args.num_samples) <= 0:
         raise ValueError("--num-samples must be > 0")
     if int(args.shard_size) <= 0:
@@ -725,6 +1001,8 @@ def main() -> int:
         raise ValueError("--n-ch must be > 0")
     if int(args.vehicles_min) < 0 or int(args.vehicles_max) < int(args.vehicles_min):
         raise ValueError("--vehicles-max must be >= --vehicles-min >= 0")
+    if not (0.0 <= float(args.profile_strength) <= 1.0):
+        raise ValueError("--profile-strength must be in [0, 1]")
     if float(args.speed_min_kmh) <= 0.0 or float(args.speed_max_kmh) < float(args.speed_min_kmh):
         raise ValueError("speed range must be positive and ordered")
     motion_models, motion_weights = _motion_models_and_weights(args)
@@ -732,10 +1010,16 @@ def main() -> int:
         raise ValueError("--constant-perturb-prob must be in [0, 1]")
     if float(args.constant_perturb_max_frac) < 0.0 or float(args.smooth_speed_max_frac) < 0.0:
         raise ValueError("speed variation fractions must be >= 0")
+    if float(args.track_time_jitter_max_s) < 0.0:
+        raise ValueError("--track-time-jitter-max-s must be >= 0")
     if int(args.constant_perturb_width_min) <= 0 or int(args.constant_perturb_width_max) < int(args.constant_perturb_width_min):
         raise ValueError("constant perturb widths must be positive and ordered")
     if int(args.smooth_speed_corr_channels) <= 0:
         raise ValueError("--smooth-speed-corr-channels must be > 0")
+    if int(args.track_time_jitter_corr_channels) <= 0:
+        raise ValueError("--track-time-jitter-corr-channels must be > 0")
+    if not (0.0 < float(args.track_time_jitter_min_gap_ratio) <= 1.0):
+        raise ValueError("--track-time-jitter-min-gap-ratio must be in (0, 1]")
     if float(args.stop_duration_min_s) < 0.0 or float(args.stop_duration_max_s) < float(args.stop_duration_min_s):
         raise ValueError("stop duration range must be non-negative and ordered")
     if int(args.stop_channel_width_min) <= 0 or int(args.stop_channel_width_max) < int(args.stop_channel_width_min):
@@ -861,6 +1145,13 @@ def main() -> int:
         "motion_weights": motion_weights,
         "clip_ratio": float(args.clip_ratio),
         "input_mode": str(args.input_mode),
+        "profile_mode": {
+            "profile": str(Path(args.profile).expanduser()) if args.profile is not None else None,
+            "profile_strength": float(args.profile_strength),
+            "applied_profile_defaults": applied_profile_defaults,
+            "stable_dead_channels": list(args.profile_stable_dead_channels),
+            "probabilistic_dead_channels": list(args.profile_probabilistic_dead_channels),
+        },
         "generator_args": _args_payload(args),
     }
     (out_dir / "meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")

@@ -19,7 +19,7 @@ set -eu
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$SCRIPT_DIR"
 
-REAL_BG_INPUT="datasets/xi/large/03gauss_large.npy"
+REAL_BG_INPUT=${REAL_BG_INPUT:-/Volumes/SanDisk2T4/MyProjects/BaFang/xi/large/00gauss_large.npy}
 REAL_BG_WINDOW_STRIDE_SECONDS="60"
 
 PROFILE=${PROFILE:-datasets/profiles/xi_gauss_50_realbg/realism_profile.json}

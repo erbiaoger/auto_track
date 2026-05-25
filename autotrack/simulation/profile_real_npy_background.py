@@ -190,6 +190,67 @@ def _profile_zero_components(
     }
 
 
+def _profile_probabilistic_dead_channels(
+    window_zero_ratios: list[np.ndarray],
+) -> dict[str, Any]:
+    if not window_zero_ratios:
+        return {
+            "stable_dead_channel_indices": [],
+            "probabilistic_dead_channels": [],
+            "channel_zero_ratio_summary": [],
+        }
+    ratios = np.stack(window_zero_ratios, axis=0).astype(np.float64, copy=False)
+    mean_ratio = np.mean(ratios, axis=0)
+    q50_ratio = np.quantile(ratios, 0.50, axis=0)
+    q90_ratio = np.quantile(ratios, 0.90, axis=0)
+    freq_gt_080 = np.mean(ratios > 0.80, axis=0)
+    freq_gt_095 = np.mean(ratios > 0.95, axis=0)
+
+    stable_dead_channels: list[int] = []
+    probabilistic_dead_channels: list[dict[str, float]] = []
+    channel_zero_ratio_summary: list[dict[str, float]] = []
+    for ch in range(int(ratios.shape[1])):
+        mean_value = float(mean_ratio[ch])
+        q50_value = float(q50_ratio[ch])
+        q90_value = float(q90_ratio[ch])
+        freq80_value = float(freq_gt_080[ch])
+        freq95_value = float(freq_gt_095[ch])
+        channel_zero_ratio_summary.append(
+            {
+                "channel": int(ch),
+                "mean_zero_ratio": mean_value,
+                "median_zero_ratio": q50_value,
+                "q90_zero_ratio": q90_value,
+                "freq_zero_ratio_gt_0_80": freq80_value,
+                "freq_zero_ratio_gt_0_95": freq95_value,
+            }
+        )
+        if mean_value >= 0.95 or freq95_value >= 0.80:
+            stable_dead_channels.append(int(ch))
+            continue
+        if mean_value < 0.87:
+            continue
+        probability = max(0.25, min(0.95, 0.60 * mean_value + 0.40 * freq80_value))
+        probabilistic_dead_channels.append(
+            {
+                "channel": int(ch),
+                "probability": float(probability),
+                "mean_zero_ratio": mean_value,
+                "median_zero_ratio": q50_value,
+                "q90_zero_ratio": q90_value,
+                "freq_zero_ratio_gt_0_80": freq80_value,
+                "freq_zero_ratio_gt_0_95": freq95_value,
+            }
+        )
+    probabilistic_dead_channels.sort(key=lambda item: (-float(item["probability"]), int(item["channel"])))
+    channel_zero_ratio_summary.sort(key=lambda item: (-float(item["mean_zero_ratio"]), int(item["channel"])))
+    return {
+        "stable_dead_channel_indices": stable_dead_channels,
+        "probabilistic_dead_channels": probabilistic_dead_channels,
+        "channel_zero_ratio_summary": channel_zero_ratio_summary,
+    }
+
+
 def _extract_window_peak_rows(
     window_tc: np.ndarray,
     *,
@@ -348,6 +409,12 @@ def _build_generator_defaults(profile: dict[str, Any]) -> dict[str, Any]:
     drop_duration = zero_components["drop_block_duration_s"]
     stable_dead_channels = [int(v) for v in zero_components.get("stable_dead_channel_indices", [])]
     stable_dead_count = int(len(stable_dead_channels))
+    probabilistic_dead_channels = [
+        item
+        for item in zero_components.get("probabilistic_dead_channels", [])
+        if isinstance(item, dict)
+    ]
+    expected_prob_dead = float(sum(_finite_value(item.get("probability"), 0.0) for item in probabilistic_dead_channels))
 
     speed_min = max(40.0, _finite_value(speed_stats.get("q10"), 68.0))
     speed_max = max(speed_min + 1.0, _finite_value(speed_stats.get("q90"), 88.0))
@@ -359,13 +426,16 @@ def _build_generator_defaults(profile: dict[str, Any]) -> dict[str, Any]:
     clutter_top_up_rate = min(18.0, max(0.0, 0.05 * peak_q50))
     dead_q50 = max(0.0, _finite_value(dead_stats.get("q50"), 4.0))
     dead_q90 = max(dead_q50, _finite_value(dead_stats.get("q90"), dead_q50 + 2.0))
-    residual_dead_q50 = max(0.0, dead_q50 - float(stable_dead_count))
-    residual_dead_q90 = max(residual_dead_q50, dead_q90 - float(stable_dead_count))
+    residual_dead_q50 = max(0.0, dead_q50 - float(stable_dead_count) - expected_prob_dead)
+    residual_dead_q90 = max(residual_dead_q50, dead_q90 - float(stable_dead_count) - expected_prob_dead)
     drop_count_q50 = max(0.0, _finite_value(zero_components["drop_block_count_per_window"].get("q50"), 4.0))
     residual_drop_rate = 0.0 if stable_dead_count > 0 else min(1.0, max(0.0, 0.1 * drop_count_q50))
     duration_q10 = max(0.05, _finite_value(drop_duration.get("q10"), 0.4))
     duration_q50 = max(duration_q10, _finite_value(drop_duration.get("q50"), 1.2))
     duration_q90 = max(duration_q50, _finite_value(drop_duration.get("q90"), duration_q50 + 0.5))
+
+    canonical_peak_amp = max(0.05, _finite_value(peak_density["peak_value"].get("q90"), 0.60))
+    canonical_sigma_s = max(0.02, _finite_value(peak_density["peak_sigma_t_s"].get("q50"), 0.15))
 
     defaults = {
         "background_scale_min": 0.98,
@@ -376,20 +446,21 @@ def _build_generator_defaults(profile: dict[str, Any]) -> dict[str, Any]:
         "speed_min_kmh": float(speed_min),
         "speed_max_kmh": float(speed_max),
         "speed_norm_kmh": 150.0,
-        "fixed_amp": float(min(6.5, max(2.0, _finite_value(peak_density["peak_value"].get("q90"), 0.8) * 7.0))),
-        "sigma_seconds": float(min(0.40, max(0.05, _finite_value(peak_density["peak_sigma_t_s"].get("q50"), 0.15)))),
+        "fixed_amp": float(canonical_peak_amp),
+        "sigma_seconds": float(canonical_sigma_s),
         "primary_ratio": _clip01(_finite_value(proxy.get("direction_forward_ratio"), 0.83)),
         "min_visible_channels": int(max(4, round(min(16.0, visible_mean)))),
         "isolated_noise_ratio": 1.0 if clutter_top_up_rate >= 1.0 else 0.0,
         "isolated_noise_rate": float(clutter_top_up_rate),
-        "isolated_noise_amp_min": float(max(0.05, _finite_value(peak_density["peak_value"].get("q10"), 0.10) * 2.0)),
-        "isolated_noise_amp_max": float(max(0.15, _finite_value(peak_density["peak_value"].get("q50"), 0.25) * 2.5)),
-        "isolated_noise_sigma_min_s": float(max(0.02, 0.5 * _finite_value(peak_density["peak_sigma_t_s"].get("q10"), 0.05))),
-        "isolated_noise_sigma_max_s": float(max(0.03, 0.8 * _finite_value(peak_density["peak_sigma_t_s"].get("q50"), 0.12))),
+        "isolated_noise_amp_min": float(canonical_peak_amp),
+        "isolated_noise_amp_max": float(canonical_peak_amp),
+        "isolated_noise_sigma_min_s": float(canonical_sigma_s),
+        "isolated_noise_sigma_max_s": float(canonical_sigma_s),
         "per_vehicle_drop_channel_ratio": 1.0 if _finite_value(dead_stats.get("q50"), 0.0) >= 1.0 else 0.5,
         "per_vehicle_drop_channel_min": int(max(0, round(max(1.0, _finite_value(support_stats.get("q10"), 4.0) * 0.3)))),
         "per_vehicle_drop_channel_max": int(max(1, round(max(2.0, _finite_value(support_stats.get("q50"), 6.0) * 0.6)))),
         "dead_channel_indices": ",".join(str(idx) for idx in stable_dead_channels),
+        "probabilistic_dead_channel_indices": ",".join(str(int(item.get("channel", -1))) for item in probabilistic_dead_channels),
         "random_dead_channel_ratio": 1.0 if residual_dead_q50 >= 1.0 else 0.35,
         "random_dead_channel_min": int(round(residual_dead_q50)),
         "random_dead_channel_max": int(max(round(residual_dead_q50), round(residual_dead_q90))),
@@ -436,6 +507,8 @@ def _report_markdown(profile: dict[str, Any], realism_profile: dict[str, Any]) -
         f"- Peaks per window mean: `{peaks['total_peaks_per_window']['mean']:.2f}`",
         f"- Peaks per channel per window mean: `{peaks['peaks_per_channel_per_window']['mean']:.2f}`",
         f"- Peak sigma_t mean: `{peaks['peak_sigma_t_s']['mean']:.4f}` s",
+        f"- Stable dead channels: `{zero.get('stable_dead_channel_indices', [])}`",
+        f"- Probabilistic dead channels: `{[int(item.get('channel', -1)) for item in zero.get('probabilistic_dead_channels', [])]}`",
         "",
         "## Proxy Vehicle Statistics",
         "",
@@ -451,6 +524,7 @@ def _report_markdown(profile: dict[str, Any], realism_profile: dict[str, Any]) -
         f"- speed_min_kmh / speed_max_kmh: `{defaults['speed_min_kmh']:.2f}` / `{defaults['speed_max_kmh']:.2f}`",
         f"- fixed_amp / sigma_seconds: `{defaults['fixed_amp']:.3f}` / `{defaults['sigma_seconds']:.4f}`",
         f"- isolated_noise_rate: `{defaults['isolated_noise_rate']:.2f}`",
+        f"- probabilistic_dead_channel_indices: `{defaults.get('probabilistic_dead_channel_indices', '')}`",
         f"- random_dead_channel_min / max: `{defaults['random_dead_channel_min']}` / `{defaults['random_dead_channel_max']}`",
         f"- zero_background_rate: `{defaults['zero_background_rate']:.2f}`",
         "",
@@ -491,6 +565,7 @@ def main() -> int:
     norm_abs_q95: list[float] = []
     dead_channel_counts: list[float] = []
     drop_block_count_per_window: list[float] = []
+    window_zero_ratios: list[np.ndarray] = []
     vehicle_proxy_counts: list[float] = []
     crossing_proxy_per_window: list[float] = []
     near_parallel_proxy_per_window: list[float] = []
@@ -533,6 +608,7 @@ def main() -> int:
             zero_threshold=float(args.zero_threshold),
             component_time_downsample=int(args.component_time_downsample),
         )
+        window_zero_ratios.append(np.mean(np.abs(window_tc) <= float(args.zero_threshold), axis=0).astype(np.float32, copy=False))
         dead_channel_counts.append(float(zero_local["dead_channel_count"]))
         block_count = float(zero_local["drop_block_channel_width"].get("count", 0.0))
         drop_block_count_per_window.append(block_count)
@@ -596,6 +672,10 @@ def main() -> int:
             else float("nan")
         ),
     }
+    channel_dead_profile = _profile_probabilistic_dead_channels(window_zero_ratios)
+    zero_components["stable_dead_channel_indices"] = list(channel_dead_profile["stable_dead_channel_indices"])
+    zero_components["dead_channel_indices"] = list(channel_dead_profile["stable_dead_channel_indices"])
+    zero_components["dead_channel_count"] = int(len(channel_dead_profile["stable_dead_channel_indices"]))
 
     base_profile = {
         "input": str(Path(args.input).expanduser()),
@@ -654,6 +734,8 @@ def main() -> int:
             **zero_components,
             "dead_channel_count_per_window": _safe_stats(dead_channel_counts),
             "drop_block_count_per_window": _safe_stats(drop_block_count_per_window),
+            "probabilistic_dead_channels": channel_dead_profile["probabilistic_dead_channels"],
+            "channel_zero_ratio_summary": channel_dead_profile["channel_zero_ratio_summary"],
         },
         "vehicle_proxy": vehicle_proxy,
         "window_catalog": {

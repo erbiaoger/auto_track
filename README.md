@@ -111,6 +111,16 @@ accepts `--profile`, `--profile-strength`, `--window-sampler`, and
 `--artifact-policy`, so profile defaults can drive generation without removing
 explicit CLI control.
 
+Profile-only synthetic workflow:
+
+```sh
+sh generate_track_slot_dataset_profile_only.sh
+```
+
+This route reuses the profile's fixed bad channels, probabilistic bad channels,
+and real peak-shape parameters, but it no longer samples any real background
+window. Every vehicle in the output is synthetic and therefore labeled.
+
 Train on CUDA:
 
 ```sh

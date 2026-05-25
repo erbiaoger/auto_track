@@ -426,6 +426,7 @@ def _resolve_profile_structures(profile: dict[str, Any] | None) -> dict[str, Any
     if profile is None:
         return {
             "stable_dead_channels": [],
+            "probabilistic_dead_channels": [],
             "target_peak_total_q50": float("nan"),
             "target_peaks_per_channel_q50": float("nan"),
         }
@@ -433,6 +434,14 @@ def _resolve_profile_structures(profile: dict[str, Any] | None) -> dict[str, Any
     peaks = profile.get("peak_density", {})
     return {
         "stable_dead_channels": [int(v) for v in zero.get("stable_dead_channel_indices", zero.get("dead_channel_indices", []))],
+        "probabilistic_dead_channels": [
+            {
+                "channel": int(item.get("channel", -1)),
+                "probability": float(item.get("probability", 0.0)),
+            }
+            for item in zero.get("probabilistic_dead_channels", [])
+            if isinstance(item, dict)
+        ],
         "target_peak_total_q50": float(peaks.get("total_peaks_per_window", {}).get("q50", float("nan"))),
         "target_peaks_per_channel_q50": float(peaks.get("peaks_per_channel_per_window", {}).get("q50", float("nan"))),
     }
@@ -552,9 +561,15 @@ def _sample_dead_channels_structured(
     n_ch: int,
     *,
     stable_dead_channels: list[int],
+    probabilistic_dead_channels: list[dict[str, float]],
 ) -> list[int]:
     dead = set(int(idx) for idx in stable_dead_channels if 0 <= int(idx) < int(n_ch))
     dead.update(_parse_dead_channel_indices(str(args.dead_channel_indices), n_ch))
+    for item in probabilistic_dead_channels:
+        ch = int(item.get("channel", -1))
+        prob = float(item.get("probability", 0.0))
+        if 0 <= ch < int(n_ch) and prob > 0.0 and torch.rand((), generator=gen).item() < min(1.0, max(0.0, prob)):
+            dead.add(ch)
     if float(args.random_dead_channel_ratio) <= 0.0 or torch.rand((), generator=gen).item() >= float(args.random_dead_channel_ratio):
         return sorted(dead)
     count_min = int(max(0, args.random_dead_channel_min))
@@ -744,6 +759,7 @@ def _generate_one(
     start = int(window_starts[sampled_idx])
     _window_meta = profile_windows.get(start)
     stable_dead_channels = [int(v) for v in getattr(args, "profile_stable_dead_channels", [])]
+    probabilistic_dead_channels = [dict(item) for item in getattr(args, "profile_probabilistic_dead_channels", [])]
     window = np.array(real_bg[start : start + window_samples, :], dtype=np.float32, copy=True).T
     scale = _rand_uniform(gen, float(args.background_scale_min), float(args.background_scale_max))
     window *= float(scale)
@@ -833,6 +849,7 @@ def _generate_one(
             gen,
             n_ch,
             stable_dead_channels=stable_dead_channels,
+            probabilistic_dead_channels=probabilistic_dead_channels,
         ),
         min_visible_channels=int(args.min_visible_channels),
     )
@@ -901,6 +918,7 @@ def main() -> int:
     applied_profile_defaults = _apply_profile_defaults(args, profile)
     profile_structures = _resolve_profile_structures(profile)
     args.profile_stable_dead_channels = list(profile_structures["stable_dead_channels"])
+    args.profile_probabilistic_dead_channels = list(profile_structures["probabilistic_dead_channels"])
     args.profile_target_peak_total_q50 = float(profile_structures["target_peak_total_q50"])
     args.profile_target_peaks_per_channel_q50 = float(profile_structures["target_peaks_per_channel_q50"])
 
@@ -978,6 +996,7 @@ def main() -> int:
             "applied_profile_defaults": applied_profile_defaults,
             "profile_weighted_window_count": int(len(profile_windows)),
             "stable_dead_channels": list(args.profile_stable_dead_channels),
+            "probabilistic_dead_channels": list(args.profile_probabilistic_dead_channels),
             "target_peak_total_q50": args.profile_target_peak_total_q50,
             "target_peaks_per_channel_q50": args.profile_target_peaks_per_channel_q50,
         },
