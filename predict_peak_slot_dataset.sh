@@ -37,6 +37,25 @@ VITERBI_SPEED_MAX_KMH=${VITERBI_SPEED_MAX_KMH:-100}                   # 解码�
 VITERBI_MAX_SKIP_CHANNELS=${VITERBI_MAX_SKIP_CHANNELS:-4}             # 最多允许跳过多少道
 VITERBI_INERTIA_PENALTY=${VITERBI_INERTIA_PENALTY:-2.5}               # 速度惯性惩罚
 VITERBI_SLOPE_MEMORY=${VITERBI_SLOPE_MEMORY:-0.75}                    # 斜率记忆系数
+FUSION_MODE=${FUSION_MODE:-off}                                       # 融合模式：off, graph_extend
+FUSION_MIN_SEED_CHANNELS=${FUSION_MIN_SEED_CHANNELS:-4}               # 至少多少个 PeakSlot 点才尝试图搜索补全
+FUSION_EXTEND_LEFT=${FUSION_EXTEND_LEFT:-1}                           # 是否向低通道方向补全
+FUSION_EXTEND_RIGHT=${FUSION_EXTEND_RIGHT:-1}                         # 是否向高通道方向补全
+FUSION_GRAPH_PROMINENCE=${FUSION_GRAPH_PROMINENCE:-0.18}              # 融合图搜索峰 prominence
+FUSION_GRAPH_MIN_PEAK_DISTANCE=${FUSION_GRAPH_MIN_PEAK_DISTANCE:-120} # 融合图搜索峰最小间距
+FUSION_GRAPH_MAX_SKIP_CHANNELS=${FUSION_GRAPH_MAX_SKIP_CHANNELS:-8}   # 融合图搜索最大跳道
+FUSION_MIN_ADDED_CHANNELS=${FUSION_MIN_ADDED_CHANNELS:-1}             # 至少补多少个点才保留融合轨迹
+FUSION_NMS_TOLERANCE_SAMPLES=${FUSION_NMS_TOLERANCE_SAMPLES:-180}     # 同通道补点去重容差
+FUSION_BRIDGE_SEARCH_RADIUS_SAMPLES=${FUSION_BRIDGE_SEARCH_RADIUS_SAMPLES:-900} # 内部断点桥接搜索半径
+
+fusion_left_args="--fusion-extend-left"
+if [ "$FUSION_EXTEND_LEFT" = "0" ] || [ "$FUSION_EXTEND_LEFT" = "false" ]; then
+  fusion_left_args="--no-fusion-extend-left"
+fi
+fusion_right_args="--fusion-extend-right"
+if [ "$FUSION_EXTEND_RIGHT" = "0" ] || [ "$FUSION_EXTEND_RIGHT" = "false" ]; then
+  fusion_right_args="--no-fusion-extend-right"
+fi
 
 uv run python -m autotrack.dl.predict_peak_slot_dataset \
   --data-dir "$DATA_DIR" \
@@ -71,4 +90,14 @@ uv run python -m autotrack.dl.predict_peak_slot_dataset \
   --viterbi-speed-max-kmh "$VITERBI_SPEED_MAX_KMH" \
   --viterbi-max-skip-channels "$VITERBI_MAX_SKIP_CHANNELS" \
   --viterbi-inertia-penalty "$VITERBI_INERTIA_PENALTY" \
-  --viterbi-slope-memory "$VITERBI_SLOPE_MEMORY"
+  --viterbi-slope-memory "$VITERBI_SLOPE_MEMORY" \
+  --fusion-mode "$FUSION_MODE" \
+  --fusion-min-seed-channels "$FUSION_MIN_SEED_CHANNELS" \
+  $fusion_left_args \
+  $fusion_right_args \
+  --fusion-graph-prominence "$FUSION_GRAPH_PROMINENCE" \
+  --fusion-graph-min-peak-distance "$FUSION_GRAPH_MIN_PEAK_DISTANCE" \
+  --fusion-graph-max-skip-channels "$FUSION_GRAPH_MAX_SKIP_CHANNELS" \
+  --fusion-min-added-channels "$FUSION_MIN_ADDED_CHANNELS" \
+  --fusion-nms-tolerance-samples "$FUSION_NMS_TOLERANCE_SAMPLES" \
+  --fusion-bridge-search-radius-samples "$FUSION_BRIDGE_SEARCH_RADIUS_SAMPLES"

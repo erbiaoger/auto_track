@@ -35,6 +35,8 @@ from typing import Any, Iterator, Optional
 import numpy as np
 import torch
 
+from autotrack.core.track_extractor_graph import Track, TrackPoint
+from autotrack.core.track_fusion import extend_peakslot_tracks_with_graph
 from autotrack.dl.peak_slot_model import (
     InferenceConfig,
     argmax_peak_slot_path,
@@ -87,6 +89,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--viterbi-smoothness-penalty", type=float, default=0.6, help="Soft penalty for slope changes.")
     parser.add_argument("--viterbi-inertia-penalty", type=float, default=2.5, help="Penalty for deviating from the previous speed prediction.")
     parser.add_argument("--viterbi-slope-memory", type=float, default=0.75, help="Exponential memory for the slot's running slope.")
+    parser.add_argument("--fusion-mode", default="off", choices=["off", "graph_extend"], help="Optional graph-search extension after PeakSlotNet decoding.")
+    parser.add_argument("--fusion-min-seed-channels", type=int, default=4, help="Minimum PeakSlotNet points before graph extension is attempted.")
+    parser.add_argument("--fusion-extend-left", action=argparse.BooleanOptionalAction, default=True, help="Extend graph search toward lower channel indices.")
+    parser.add_argument("--fusion-extend-right", action=argparse.BooleanOptionalAction, default=True, help="Extend graph search toward higher channel indices.")
+    parser.add_argument("--fusion-graph-prominence", type=float, default=0.18, help="Graph peak prominence used during fusion.")
+    parser.add_argument("--fusion-graph-min-peak-distance", type=int, default=120, help="Graph minimum peak distance in samples of the fusion input.")
+    parser.add_argument("--fusion-graph-max-skip-channels", type=int, default=8, help="Maximum channel skip used by graph extension.")
+    parser.add_argument("--fusion-min-added-channels", type=int, default=1, help="Minimum added channels required to keep a fused track.")
+    parser.add_argument("--fusion-nms-tolerance-samples", type=int, default=180, help="Same-channel fusion tolerance in original sample units.")
+    parser.add_argument("--fusion-bridge-search-radius-samples", type=int, default=900, help="Internal gap bridge search radius in original sample units.")
     parser.add_argument(
         "--matcher",
         default="hungarian",
@@ -220,6 +232,181 @@ def _filter_predictions_by_direction(predictions: list[dict[str, Any]], directio
     if direction == "all":
         return predictions
     return [pred for pred in predictions if str(pred.get("direction", "")).lower() == direction]
+
+
+def _prediction_to_track(
+    pred: dict[str, Any],
+    targets_cpu: dict[str, torch.Tensor],
+    batch_index: int,
+    *,
+    fs: float,
+    dx_m: float,
+) -> Track:
+    points: list[TrackPoint] = []
+    for ch, peak_idx, prob in zip(pred["channels"], pred["peak_indices"], pred["peak_probs"]):
+        peak_sample = int(targets_cpu["peak_index"][batch_index, int(ch), int(peak_idx)].item())
+        t_idx = int(max(0, peak_sample))
+        points.append(
+            TrackPoint(
+                ch_idx=int(ch),
+                t_idx=t_idx,
+                time_s=float(t_idx) / float(fs),
+                offset_m=float(ch) * float(dx_m),
+                amp=float(targets_cpu["peak_amp"][batch_index, int(ch), int(peak_idx)].item()),
+                score=float(pred.get("score", 0.0)) * float(prob),
+            )
+        )
+    return Track(
+        track_id=int(pred.get("slot", 0)),
+        direction=str(pred.get("direction", "forward")),
+        points=points,
+        total_score=float(pred.get("selection_score", pred.get("score", 0.0))),
+        mean_speed_kmh=float(pred.get("speed_kmh", float("nan"))),
+    )
+
+
+def _nearest_peak_index_for_point(
+    point: TrackPoint,
+    targets_cpu: dict[str, torch.Tensor],
+    batch_index: int,
+    *,
+    time_downsample: int,
+) -> Optional[int]:
+    ch = int(point.ch_idx)
+    if ch < 0 or ch >= int(targets_cpu["peak_valid"].shape[1]):
+        return None
+    valid = torch.where(targets_cpu["peak_valid"][batch_index, ch])[0]
+    if valid.numel() <= 0:
+        return None
+    target_down = int(round(float(point.t_idx) / float(max(1, int(time_downsample)))))
+    indices = targets_cpu["peak_index"][batch_index, ch, valid].to(torch.long)
+    diffs = torch.abs(indices - int(target_down))
+    pos = int(torch.argmin(diffs).item())
+    return int(valid[pos].item())
+
+
+def _tracks_to_predictions(
+    tracks: list[Track],
+    source_predictions: list[dict[str, Any]],
+    targets_cpu: dict[str, torch.Tensor],
+    batch_index: int,
+    *,
+    time_downsample: int,
+) -> list[dict[str, Any]]:
+    by_slot = {int(pred.get("slot", idx)): pred for idx, pred in enumerate(source_predictions)}
+    out: list[dict[str, Any]] = []
+    for rank, track in enumerate(tracks):
+        src = by_slot.get(int(track.track_id), source_predictions[min(rank, len(source_predictions) - 1)] if source_predictions else {})
+        channels: list[int] = []
+        peak_indices: list[int] = []
+        peak_probs: list[float] = []
+        original_prob_by_ch = {
+            int(ch): float(prob)
+            for ch, prob in zip(src.get("channels", []), src.get("peak_probs", []))
+        }
+        for point in sorted(track.points, key=lambda item: int(item.ch_idx)):
+            peak_idx = _nearest_peak_index_for_point(
+                point,
+                targets_cpu,
+                batch_index,
+                time_downsample=int(time_downsample),
+            )
+            if peak_idx is None:
+                continue
+            channels.append(int(point.ch_idx))
+            peak_indices.append(int(peak_idx))
+            peak_probs.append(float(original_prob_by_ch.get(int(point.ch_idx), 0.0)))
+        if not channels:
+            continue
+        item = dict(src)
+        item.update(
+            {
+                "rank": int(src.get("rank", rank)),
+                "slot": int(src.get("slot", track.track_id)),
+                "score": float(src.get("score", max(0.0, track.total_score))),
+                "selection_score": float(src.get("selection_score", max(0.0, track.total_score))),
+                "path_score": float(src.get("path_score", track.total_score)),
+                "direction": str(track.direction),
+                "channels": channels,
+                "peak_indices": peak_indices,
+                "peak_probs": peak_probs,
+                "fusion_point_count": int(len(channels)),
+            }
+        )
+        out.append(item)
+    return out
+
+
+def _apply_graph_fusion_to_predictions(
+    predictions: list[dict[str, Any]],
+    heatmap: torch.Tensor,
+    targets_cpu: dict[str, torch.Tensor],
+    batch_index: int,
+    *,
+    fs: float,
+    dx_m: float,
+    time_downsample: int,
+    args: argparse.Namespace,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if str(args.fusion_mode).lower() != "graph_extend" or not predictions:
+        return predictions, {
+            "fusion_enabled": False,
+            "fusion_input_track_count": int(len(predictions)),
+            "fusion_output_track_count": int(len(predictions)),
+            "fusion_added_point_count": 0,
+        }
+    tracks = [
+        _prediction_to_track(
+            pred,
+            targets_cpu,
+            batch_index,
+            fs=float(fs) / float(max(1, int(time_downsample))),
+            dx_m=float(dx_m),
+        )
+        for pred in predictions
+    ]
+    fusion_input = heatmap.detach().cpu().to(torch.float32).numpy()
+    fused_tracks: list[Track] = []
+    diagnostics: dict[str, Any] = {
+        "fusion_enabled": True,
+        "fusion_input_track_count": 0,
+        "fusion_output_track_count": 0,
+        "fusion_added_point_count": 0,
+        "fusion_tracks": [],
+    }
+    for direction in sorted({str(track.direction) for track in tracks}):
+        direction_tracks = [track for track in tracks if str(track.direction) == direction]
+        direction_diagnostics: dict[str, Any] = {}
+        fused_tracks.extend(
+            extend_peakslot_tracks_with_graph(
+                data=fusion_input,
+                fs=float(fs) / float(max(1, int(time_downsample))),
+                dx_m=float(dx_m),
+                tracks=direction_tracks,
+                direction=str(direction),
+                vmin_kmh=float(args.viterbi_speed_min_kmh),
+                vmax_kmh=float(args.viterbi_speed_max_kmh),
+                config={
+                    "fusion_mode": str(args.fusion_mode),
+                    "fusion_min_seed_channels": int(args.fusion_min_seed_channels),
+                    "fusion_extend_left": bool(args.fusion_extend_left),
+                    "fusion_extend_right": bool(args.fusion_extend_right),
+                    "fusion_graph_prominence": float(args.fusion_graph_prominence),
+                    "fusion_graph_min_peak_distance": max(1, int(round(float(args.fusion_graph_min_peak_distance) / float(max(1, int(time_downsample)))))),
+                    "fusion_graph_max_skip_channels": int(args.fusion_graph_max_skip_channels),
+                    "fusion_min_added_channels": int(args.fusion_min_added_channels),
+                    "fusion_nms_tolerance_samples": max(1, int(round(float(args.fusion_nms_tolerance_samples) / float(max(1, int(time_downsample)))))),
+                    "fusion_bridge_search_radius_samples": max(1, int(round(float(args.fusion_bridge_search_radius_samples) / float(max(1, int(time_downsample)))))),
+                },
+                diagnostics=direction_diagnostics,
+            )
+        )
+        diagnostics["fusion_input_track_count"] += int(direction_diagnostics.get("fusion_input_track_count", 0))
+        diagnostics["fusion_output_track_count"] += int(direction_diagnostics.get("fusion_output_track_count", 0))
+        diagnostics["fusion_added_point_count"] += int(direction_diagnostics.get("fusion_added_point_count", 0))
+        diagnostics["fusion_tracks"].extend(list(direction_diagnostics.get("fusion_tracks", [])))
+    fused = _tracks_to_predictions(fused_tracks, predictions, targets_cpu, batch_index, time_downsample=1)
+    return fused, diagnostics
 
 
 def _prediction_peak_set(pred: dict[str, Any]) -> set[tuple[int, int]]:
@@ -923,6 +1110,9 @@ def main() -> int:
     duplicate_removed_total = 0
     close_pair_kept_total = 0
     raw_candidate_total = 0
+    fusion_added_point_total = 0
+    fusion_input_track_total = 0
+    fusion_output_track_total = 0
     filtered_det_sums: dict[str, float] = defaultdict(float)
     sample_count = 0
     csv_sample_count = 0
@@ -938,6 +1128,7 @@ def main() -> int:
         "pred_count",
         "duplicate_removed_count",
         "close_pair_kept_count",
+        "fusion_added_point_count",
         "max_objectness",
         "mean_objectness",
         "top_score",
@@ -1024,12 +1215,27 @@ def main() -> int:
                             diagnostics=conflict_diagnostics,
                         )
                         predictions = _filter_predictions_by_direction(predictions, str(args.prediction_direction_filter))
+                        fusion_diagnostics: dict[str, Any] = {}
+                        predictions, fusion_diagnostics = _apply_graph_fusion_to_predictions(
+                            predictions,
+                            x_cpu[b, 0],
+                            targets_cpu,
+                            b,
+                            fs=fs,
+                            dx_m=dx_m,
+                            time_downsample=time_downsample,
+                            args=args,
+                        )
                         raw_candidate_count = int(conflict_diagnostics.get("raw_candidate_count", len(predictions)))
                         duplicate_removed_count = int(conflict_diagnostics.get("duplicate_removed_count", 0))
                         close_pair_kept_count = int(conflict_diagnostics.get("close_pair_kept_count", 0))
+                        fusion_added_point_count = int(fusion_diagnostics.get("fusion_added_point_count", 0))
                         raw_candidate_total += raw_candidate_count
                         duplicate_removed_total += duplicate_removed_count
                         close_pair_kept_total += close_pair_kept_count
+                        fusion_added_point_total += fusion_added_point_count
+                        fusion_input_track_total += int(fusion_diagnostics.get("fusion_input_track_count", len(predictions)))
+                        fusion_output_track_total += int(fusion_diagnostics.get("fusion_output_track_count", len(predictions)))
                         for row in conflict_diagnostics.get("rows", []):
                             diag_writer.writerow(row)
                         gt_count = int(targets_cpu["gt_valid"][b].sum().item())
@@ -1076,6 +1282,7 @@ def main() -> int:
                                 "pred_count": pred_count,
                                 "duplicate_removed_count": duplicate_removed_count,
                                 "close_pair_kept_count": close_pair_kept_count,
+                                "fusion_added_point_count": fusion_added_point_count,
                                 "max_objectness": f"{float(obj_cpu[b].max().item()):.6f}",
                                 "mean_objectness": f"{float(obj_cpu[b].mean().item()):.6f}",
                                 "top_score": "" if not math.isfinite(top_score) else f"{top_score:.6f}",
@@ -1149,6 +1356,21 @@ def main() -> int:
             "viterbi_max_skip_channels": int(inference_config.viterbi_max_skip_channels),
             "viterbi_inertia_penalty": float(inference_config.viterbi_inertia_penalty),
             "viterbi_slope_memory": float(inference_config.viterbi_slope_memory),
+        },
+        "fusion": {
+            "fusion_mode": str(args.fusion_mode),
+            "fusion_min_seed_channels": int(args.fusion_min_seed_channels),
+            "fusion_extend_left": bool(args.fusion_extend_left),
+            "fusion_extend_right": bool(args.fusion_extend_right),
+            "fusion_graph_prominence": float(args.fusion_graph_prominence),
+            "fusion_graph_min_peak_distance": int(args.fusion_graph_min_peak_distance),
+            "fusion_graph_max_skip_channels": int(args.fusion_graph_max_skip_channels),
+            "fusion_min_added_channels": int(args.fusion_min_added_channels),
+            "fusion_nms_tolerance_samples": int(args.fusion_nms_tolerance_samples),
+            "fusion_bridge_search_radius_samples": int(args.fusion_bridge_search_radius_samples),
+            "fusion_input_track_count": int(fusion_input_track_total),
+            "fusion_output_track_count": int(fusion_output_track_total),
+            "fusion_added_point_count": int(fusion_added_point_total),
         },
         "filters": {
             "prediction_direction_filter": str(args.prediction_direction_filter),

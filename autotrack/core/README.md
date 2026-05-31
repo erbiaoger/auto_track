@@ -7,6 +7,8 @@ Core trajectory extraction and backend integration code.
 - `trajectory_deep_engine.py`: adapter that loads deep-learning checkpoints and
   exposes them through the backend extraction API. It supports `query_points`,
   `query_masks`, and `track_slot`.
+- `track_fusion.py`: optional PeakSlotNet post-processing helper that uses
+  graph search to extend detected track fragments and bridge small channel gaps.
 - `auto_track_backend.py`: data loading, tiling, deduplication, stitching, CSV
   export, and GUI-facing orchestration. It accepts SAC folders and direct real
   DAS `.npy` imports for the GUI.
@@ -14,3 +16,15 @@ Core trajectory extraction and backend integration code.
 
 The deep-learning adapter returns the same `Track` objects as the classic
 extractors, so GUI and CSV export code can remain shared.
+
+Enable PeakSlotNet graph fusion through `dl_extra_config` / advanced DL params:
+
+```json
+{
+  "fusion_mode": "graph_extend",
+  "fusion_graph_prominence": 0.18,
+  "fusion_graph_min_peak_distance": 120,
+  "fusion_graph_max_skip_channels": 8,
+  "fusion_min_seed_channels": 4
+}
+```

@@ -210,6 +210,25 @@ configuration (`OBJECTNESS_THRESHOLD=0.45`, `MIN_VISIBLE_CHANNELS=4`,
 `EXTRA_CANDIDATE_SLOTS=8`) while keeping cross-slot conflict suppression enabled
 with `GLOBAL_CONFLICT_PENALTY=2.0`.
 
+PeakSlotNet can optionally use graph-search fusion to extend detected fragments
+at their endpoints and bridge small channel gaps:
+
+```sh
+MODEL=models/peak_slot_profile_only_120s/checkpoint_best.pt \
+DATA_DIR=datasets/peak_slot_profile_only_120s/test \
+OUT_DIR=predicts/peak_slot_profile_only_120s/prediction_graph_extend \
+OBJECTNESS_THRESHOLD=0.35 \
+PEAK_THRESHOLD=0.25 \
+MIN_VISIBLE_CHANNELS=3 \
+EXTRA_CANDIDATE_SLOTS=16 \
+GLOBAL_CONFLICT_PENALTY=1.0 \
+FUSION_MODE=graph_extend \
+sh predict_peak_slot_dataset.sh
+```
+
+The fusion pass keeps PeakSlotNet as the seed detector and only uses the
+classic graph search to add physically plausible points to existing tracks.
+
 When synthetic validation is strong but real-data prediction is poor, compare
 the two domains explicitly:
 

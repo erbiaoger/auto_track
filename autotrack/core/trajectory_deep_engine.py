@@ -218,6 +218,44 @@ def extract_all_deep_learning(
         )
         if isinstance(diagnostics_sink, dict):
             diagnostics_sink.clear()
+    if model_family == "peak_slot" and str(cfg.get("fusion_mode", "off")).strip().lower() == "graph_extend":
+        from autotrack.core.track_fusion import extend_peakslot_tracks_with_graph
+
+        fusion_diagnostics: dict[str, object] = {}
+        target_tracks = [
+            track
+            for track in tracks
+            if str(getattr(track, "direction", "")).strip().lower() == requested_direction
+        ]
+        other_tracks = [
+            track
+            for track in tracks
+            if str(getattr(track, "direction", "")).strip().lower() != requested_direction
+        ]
+        tracks = extend_peakslot_tracks_with_graph(
+            data=arr,
+            fs=float(fs),
+            dx_m=float(dx_m),
+            tracks=list(target_tracks),
+            direction=requested_direction,
+            vmin_kmh=float(vmin_kmh),
+            vmax_kmh=float(vmax_kmh),
+            config=cfg,
+            diagnostics=fusion_diagnostics,
+        )
+        tracks = list(tracks) + list(other_tracks)
+        if isinstance(diagnostics_sink, dict):
+            diagnostics_sink.update(fusion_diagnostics)
+    elif model_family == "peak_slot" and isinstance(diagnostics_sink, dict):
+        diagnostics_sink.update(
+            {
+                "fusion_enabled": False,
+                "fusion_input_track_count": int(len(tracks)),
+                "fusion_output_track_count": int(len(tracks)),
+                "fusion_added_point_count": 0,
+                "fusion_tracks": [],
+            }
+        )
     return [
         track
         for track in tracks

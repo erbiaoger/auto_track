@@ -59,7 +59,9 @@ Deep-learning code for DAS vehicle trajectory recognition.
 - `predict_peak_slot_dataset.py`: predicts selected peak candidates, writes
   CSV files, and draws overlay figures where predictions lie on detected peaks.
   Its default thresholds favor recall, but cross-slot conflict suppression
-  remains enabled to reduce duplicate tracks.
+  remains enabled to reduce duplicate tracks. It also supports
+  `--fusion-mode graph_extend` to extend PeakSlotNet fragments with the classic
+  graph search before writing metrics and plots.
 
 ## Legacy / Compatible Files
 
