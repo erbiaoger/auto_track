@@ -168,6 +168,56 @@ DL_ADVANCED_PARAM_SPECS = [
         "default": 0.75,
         "tooltip": "斜率记忆系数。",
     },
+    {
+        "key": "boundary_completion_mode",
+        "label": "Boundary completion mode",
+        "type": "choice",
+        "default": "strict",
+        "choices": ["off", "repair", "strict"],
+        "tooltip": "边界感知轨迹装配模式：repair 优先补全，strict 只保留完整过境轨迹。",
+    },
+    {
+        "key": "boundary_max_gap_channels",
+        "label": "Boundary max gap channels",
+        "type": "int",
+        "default": 12,
+        "tooltip": "边界补全和断片连接允许的最大通道缺口。",
+    },
+    {
+        "key": "boundary_fit_residual_s",
+        "label": "Boundary fit residual (s)",
+        "type": "float",
+        "default": 0.8,
+        "tooltip": "边界补全直线拟合允许的中位时间残差。",
+    },
+    {
+        "key": "boundary_margin_channels",
+        "label": "Boundary margin channels",
+        "type": "int",
+        "default": 2,
+        "tooltip": "距离左右通道边界多少道以内算已有边界支撑。",
+    },
+    {
+        "key": "boundary_margin_seconds",
+        "label": "Boundary margin seconds",
+        "type": "float",
+        "default": 3.0,
+        "tooltip": "距离时间窗上下边界多少秒以内算已有边界支撑。",
+    },
+    {
+        "key": "boundary_dt_slack_ratio",
+        "label": "Boundary dt slack ratio",
+        "type": "float",
+        "default": 0.35,
+        "tooltip": "边界连接物理速度窗口的时间松弛比例。",
+    },
+    {
+        "key": "boundary_min_seed_channels",
+        "label": "Boundary min seed channels",
+        "type": "int",
+        "default": 4,
+        "tooltip": "尝试边界延长时要求的最少已有通道点数。",
+    },
 ]
 
 
@@ -195,6 +245,13 @@ def _peak_slot_recommended_advanced_params() -> dict[str, object]:
         "viterbi_max_skip_channels": 4,
         "viterbi_inertia_penalty": 2.5,
         "viterbi_slope_memory": 0.75,
+        "boundary_completion_mode": "strict",
+        "boundary_max_gap_channels": 12,
+        "boundary_fit_residual_s": 0.8,
+        "boundary_margin_channels": 2,
+        "boundary_margin_seconds": 3.0,
+        "boundary_dt_slack_ratio": 0.35,
+        "boundary_min_seed_channels": 4,
     }
 
 

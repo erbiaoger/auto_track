@@ -1036,6 +1036,15 @@ class AutoTrackBackend:
             }
             extract_config.update(dict(dl_extra_config or {}))
 
+        tile_extract_config: ExtractorConfig | dict = extract_config
+        final_boundary_mode = "off"
+        if engine == "deep_learning" and isinstance(extract_config, dict) and not current_window_only:
+            final_boundary_mode = str(extract_config.get("boundary_completion_mode", "strict")).strip().lower()
+            if final_boundary_mode == "strict":
+                tile_cfg = dict(extract_config)
+                tile_cfg["boundary_completion_mode"] = "repair"
+                tile_extract_config = tile_cfg
+
         if current_window_only:
             if self.data_view.size == 0:
                 self.update_view_window()
@@ -1094,7 +1103,7 @@ class AutoTrackBackend:
                             direction=direction,
                             vmin_kmh=float(speed_min_kmh),
                             vmax_kmh=float(speed_max_kmh),
-                            config=extract_config,
+                            config=tile_extract_config,
                         )
                         futures[fut] = int(start)
                     done = 0
@@ -1117,7 +1126,7 @@ class AutoTrackBackend:
                         direction=direction,
                         vmin_kmh=float(speed_min_kmh),
                         vmax_kmh=float(speed_max_kmh),
-                        config=extract_config,
+                        config=tile_extract_config,
                     )
                     all_tracks.extend(self._to_global_track(tr, start) for tr in tile_tracks)
                     if progress_cb:
@@ -1140,6 +1149,29 @@ class AutoTrackBackend:
                 speed_max_kmh=float(speed_max_kmh),
                 tol_samples=nms_samples,
             )
+            if final_boundary_mode == "strict":
+                if progress_cb:
+                    progress_cb(96, f"[{engine_text}] Boundary validation...")
+                from autotrack.core.boundary_completion import complete_tracks_to_boundaries
+
+                final_boundary_diagnostics: dict[str, object] = {}
+                final_boundary_config = dict(extract_config)
+                final_boundary_config["boundary_completion_mode"] = "strict"
+                final_boundary_config["boundary_validation_only"] = True
+                dedup = complete_tracks_to_boundaries(
+                    data=self.data_all,
+                    fs=float(self.fs),
+                    dx_m=float(self.dx_m),
+                    tracks=list(dedup),
+                    direction=str(direction),
+                    vmin_kmh=float(speed_min_kmh),
+                    vmax_kmh=float(speed_max_kmh),
+                    config=final_boundary_config,
+                    diagnostics=final_boundary_diagnostics,
+                )
+                self.last_peak_slot_diagnostics.update(
+                    {f"global_{key}": value for key, value in final_boundary_diagnostics.items()}
+                )
             dedup = self._deduplicate_tracks(dedup, tol_samples=nms_samples)
             dedup = sorted(dedup, key=lambda tr: tr.total_score, reverse=True)
 
@@ -1216,6 +1248,38 @@ class AutoTrackBackend:
                 },
             },
         }
+        if engine == "deep_learning" and self.last_peak_slot_diagnostics:
+            diagnostic_keys = (
+                "boundary_completion_enabled",
+                "boundary_completion_mode",
+                "boundary_input_track_count",
+                "boundary_output_track_count",
+                "boundary_completed_count",
+                "boundary_linked_fragment_count",
+                "boundary_extended_point_count",
+                "boundary_rejected_fragment_count",
+                "boundary_incomplete_after_count",
+                "boundary_validation_only",
+                "global_boundary_completion_enabled",
+                "global_boundary_completion_mode",
+                "global_boundary_input_track_count",
+                "global_boundary_output_track_count",
+                "global_boundary_completed_count",
+                "global_boundary_linked_fragment_count",
+                "global_boundary_extended_point_count",
+                "global_boundary_rejected_fragment_count",
+                "global_boundary_incomplete_after_count",
+                "global_boundary_validation_only",
+                "fusion_enabled",
+                "fusion_input_track_count",
+                "fusion_output_track_count",
+                "fusion_added_point_count",
+            )
+            self.last_summary["peak_slot_postprocess"] = {
+                key: self.last_peak_slot_diagnostics[key]
+                for key in diagnostic_keys
+                if key in self.last_peak_slot_diagnostics
+            }
         if progress_cb:
             progress_cb(100, f"[{engine_text}] Extraction completed")
         return self.last_summary

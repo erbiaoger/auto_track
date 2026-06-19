@@ -256,6 +256,34 @@ def extract_all_deep_learning(
                 "fusion_tracks": [],
             }
         )
+    if model_family == "peak_slot":
+        from autotrack.core.boundary_completion import complete_tracks_to_boundaries
+
+        boundary_diagnostics: dict[str, object] = {}
+        target_tracks = [
+            track
+            for track in tracks
+            if str(getattr(track, "direction", "")).strip().lower() == requested_direction
+        ]
+        other_tracks = [
+            track
+            for track in tracks
+            if str(getattr(track, "direction", "")).strip().lower() != requested_direction
+        ]
+        tracks = complete_tracks_to_boundaries(
+            data=arr,
+            fs=float(fs),
+            dx_m=float(dx_m),
+            tracks=list(target_tracks),
+            direction=requested_direction,
+            vmin_kmh=float(vmin_kmh),
+            vmax_kmh=float(vmax_kmh),
+            config=cfg,
+            diagnostics=boundary_diagnostics,
+        )
+        tracks = list(tracks) + list(other_tracks)
+        if isinstance(diagnostics_sink, dict):
+            diagnostics_sink.update(boundary_diagnostics)
     return [
         track
         for track in tracks
