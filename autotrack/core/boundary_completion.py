@@ -24,6 +24,8 @@ class BoundaryCompletionConfig:
     boundary_margin_seconds: float = 3.0
     boundary_dt_slack_ratio: float = 0.35
     boundary_min_seed_channels: int = 4
+    boundary_projected_completion_enabled: bool = True
+    boundary_projected_min_span_channels: int = 18
     boundary_graph_prominence: float = 0.18
     boundary_graph_min_peak_distance: int = 120
     boundary_graph_max_skip_channels: int = 8
@@ -58,6 +60,13 @@ def _as_config(config: Optional[BoundaryCompletionConfig | dict[str, Any]]) -> B
             boundary_margin_seconds=float(config.get("boundary_margin_seconds", defaults.boundary_margin_seconds)),
             boundary_dt_slack_ratio=float(config.get("boundary_dt_slack_ratio", defaults.boundary_dt_slack_ratio)),
             boundary_min_seed_channels=int(config.get("boundary_min_seed_channels", defaults.boundary_min_seed_channels)),
+            boundary_projected_completion_enabled=_bool_value(
+                config.get("boundary_projected_completion_enabled"),
+                defaults.boundary_projected_completion_enabled,
+            ),
+            boundary_projected_min_span_channels=int(
+                config.get("boundary_projected_min_span_channels", defaults.boundary_projected_min_span_channels)
+            ),
             boundary_graph_prominence=float(
                 config.get("boundary_graph_prominence", config.get("fusion_graph_prominence", defaults.boundary_graph_prominence))
             ),
@@ -87,6 +96,19 @@ def _as_config(config: Optional[BoundaryCompletionConfig | dict[str, Any]]) -> B
             ),
         )
     raise TypeError("config must be BoundaryCompletionConfig / dict / None")
+
+
+def _bool_value(value: Any, default: bool) -> bool:
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return bool(value)
+    raw = str(value).strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return bool(default)
 
 
 def _graph_config(cfg: BoundaryCompletionConfig) -> ExtractorConfig:
@@ -262,6 +284,26 @@ def _edge_supported(track: Track, fit: _FitInfo, *, n_channels: int, duration_s:
     return len(supported_edges) >= 2
 
 
+def _projected_completion_supported(track: Track, fit: _FitInfo, *, n_channels: int, cfg: BoundaryCompletionConfig) -> bool:
+    if not bool(cfg.boundary_projected_completion_enabled):
+        return False
+    if not fit.valid or fit.residual_s > float(cfg.boundary_fit_residual_s):
+        return False
+    if len(fit.edges) < 2 or len(fit.supported_edges) < 1:
+        return False
+    if len(track.points) < int(cfg.boundary_min_seed_channels):
+        return False
+    channels = [int(p.ch_idx) for p in track.points]
+    if not channels:
+        return False
+    span = int(max(channels) - min(channels) + 1)
+    required_span = min(
+        int(max(1, n_channels)),
+        int(max(cfg.boundary_min_seed_channels, cfg.boundary_projected_min_span_channels)),
+    )
+    return span >= required_span
+
+
 def _track_complete(
     track: Track,
     *,
@@ -285,7 +327,7 @@ def _track_complete(
     )
     supported_edges = _supported_fit_edges(track, fit, n_channels=n_channels, duration_s=duration_s, cfg=cfg)
     fit = _with_supported_edges(fit, supported_edges)
-    complete = len(supported_edges) >= 2
+    complete = len(supported_edges) >= 2 or _projected_completion_supported(track, fit, n_channels=n_channels, cfg=cfg)
     return bool(complete), fit
 
 
@@ -313,6 +355,12 @@ def _edge_missing_channels(track: Track, edge: str, *, n_channels: int) -> int:
 
 def _track_diag_row(track: Track, before: int, after: int, complete: bool, status: str, fit: _FitInfo, n_channels: int) -> dict[str, Any]:
     entry_edge, exit_edge = _entry_exit_edges(fit)
+    if complete and len(fit.supported_edges) >= 2:
+        completion_reason = "supported_two_boundaries"
+    elif complete:
+        completion_reason = "projected_boundary_completion"
+    else:
+        completion_reason = "missing_supported_boundary"
     return {
         "track_id": int(track.track_id),
         "before_points": int(before),
@@ -328,7 +376,7 @@ def _track_diag_row(track: Track, before: int, after: int, complete: bool, statu
         "exit_edge": exit_edge,
         "missing_to_entry_channels": int(_edge_missing_channels(track, entry_edge, n_channels=n_channels)),
         "missing_to_exit_channels": int(_edge_missing_channels(track, exit_edge, n_channels=n_channels)),
-        "completion_reason": "supported_two_boundaries" if complete else "missing_supported_boundary",
+        "completion_reason": completion_reason,
     }
 
 

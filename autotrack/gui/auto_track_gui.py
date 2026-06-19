@@ -218,6 +218,20 @@ DL_ADVANCED_PARAM_SPECS = [
         "default": 4,
         "tooltip": "尝试边界延长时要求的最少已有通道点数。",
     },
+    {
+        "key": "boundary_projected_completion_enabled",
+        "label": "Boundary projected completion",
+        "type": "bool",
+        "default": True,
+        "tooltip": "允许一侧有真实边界支撑且物理投影穿过另一侧边界的长轨迹进入最终结果。",
+    },
+    {
+        "key": "boundary_projected_min_span_channels",
+        "label": "Boundary projected min span",
+        "type": "int",
+        "default": 18,
+        "tooltip": "投影补全进入最终结果所需的最小通道跨度，防止短碎片被当作完整车辆。",
+    },
 ]
 
 
@@ -252,6 +266,8 @@ def _peak_slot_recommended_advanced_params() -> dict[str, object]:
         "boundary_margin_seconds": 3.0,
         "boundary_dt_slack_ratio": 0.35,
         "boundary_min_seed_channels": 4,
+        "boundary_projected_completion_enabled": True,
+        "boundary_projected_min_span_channels": 18,
     }
 
 

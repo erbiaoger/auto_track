@@ -223,6 +223,58 @@ class BoundaryCompletionTest(unittest.TestCase):
 
         self.assertEqual(completed, [])
 
+    def test_strict_accepts_long_one_sided_projected_boundary_track(self) -> None:
+        fs = 100.0
+        dx_m = 10.0
+        step = 45
+        data = np.zeros((50, 3000), dtype=np.float32)
+        seed = _track(1, list(range(28, 50)), fs=fs, dx_m=dx_m, step_samples=step)
+
+        completed = complete_tracks_to_boundaries(
+            data,
+            fs,
+            dx_m,
+            [seed],
+            "forward",
+            60.0,
+            100.0,
+            {
+                "boundary_completion_mode": "strict",
+                "boundary_validation_only": True,
+                "boundary_margin_channels": 2,
+                "boundary_projected_completion_enabled": True,
+                "boundary_projected_min_span_channels": 18,
+            },
+        )
+
+        self.assertEqual(len(completed), 1)
+
+    def test_strict_rejects_short_one_sided_projected_fragment(self) -> None:
+        fs = 100.0
+        dx_m = 10.0
+        step = 45
+        data = np.zeros((50, 3000), dtype=np.float32)
+        seed = _track(1, list(range(44, 50)), fs=fs, dx_m=dx_m, step_samples=step)
+
+        completed = complete_tracks_to_boundaries(
+            data,
+            fs,
+            dx_m,
+            [seed],
+            "forward",
+            60.0,
+            100.0,
+            {
+                "boundary_completion_mode": "strict",
+                "boundary_validation_only": True,
+                "boundary_margin_channels": 2,
+                "boundary_projected_completion_enabled": True,
+                "boundary_projected_min_span_channels": 18,
+            },
+        )
+
+        self.assertEqual(completed, [])
+
 
 if __name__ == "__main__":
     unittest.main()
