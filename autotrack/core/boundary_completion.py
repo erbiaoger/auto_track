@@ -19,7 +19,7 @@ from autotrack.core.track_extractor_graph import ExtractorConfig, Track, TrackPo
 class BoundaryCompletionConfig:
     boundary_completion_mode: str = "strict"
     boundary_max_gap_channels: int = 12
-    boundary_fit_residual_s: float = 0.8
+    boundary_fit_residual_s: float = 1.0
     boundary_margin_channels: int = 2
     boundary_margin_seconds: float = 3.0
     boundary_dt_slack_ratio: float = 0.35

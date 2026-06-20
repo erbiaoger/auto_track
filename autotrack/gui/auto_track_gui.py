@@ -187,7 +187,7 @@ DL_ADVANCED_PARAM_SPECS = [
         "key": "boundary_fit_residual_s",
         "label": "Boundary fit residual (s)",
         "type": "float",
-        "default": 0.8,
+        "default": 1.0,
         "tooltip": "边界补全直线拟合允许的中位时间残差。",
     },
     {
@@ -261,7 +261,7 @@ def _peak_slot_recommended_advanced_params() -> dict[str, object]:
         "viterbi_slope_memory": 0.75,
         "boundary_completion_mode": "strict",
         "boundary_max_gap_channels": 12,
-        "boundary_fit_residual_s": 0.8,
+        "boundary_fit_residual_s": 1.0,
         "boundary_margin_channels": 2,
         "boundary_margin_seconds": 3.0,
         "boundary_dt_slack_ratio": 0.35,
