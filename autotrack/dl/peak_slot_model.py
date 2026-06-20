@@ -54,6 +54,7 @@ class PeakDetectionConfig:
     prior_prominence: float = 0.02
     merge_tolerance_s: float = 0.20
     prior_score_scale: float = 0.85
+    return_candidate_stats: bool = False
 
 
 @dataclass

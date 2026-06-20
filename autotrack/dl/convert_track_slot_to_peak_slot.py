@@ -111,15 +111,17 @@ def _convert_one_sample(
     time_downsample: int,
     window_samples: int,
     peak_cfg: PeakDetectionConfig,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int] | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int, dict[str, int | float | str]]:
     heatmap = x[0].to(torch.float32)
-    peak_time, peak_amp, peak_valid, peak_index = detect_peak_candidates_from_input(
+    detected = detect_peak_candidates_from_input(
         x.to(torch.float32),
         fs=float(fs),
         time_downsample=int(time_downsample),
         window_samples=int(window_samples),
         config=peak_cfg,
+        return_stats=True,
     )
+    peak_time, peak_amp, peak_valid, peak_index, candidate_stats = detected
     k_count = int(peak_valid.shape[1])
     gt_peak_index = torch.full_like(time_label, fill_value=k_count, dtype=torch.long)
     injected = 0
@@ -167,6 +169,8 @@ def _convert_one_sample(
             min_pos = int(torch.argmin(diffs).item())
             if float(diffs[min_pos].item()) <= max(tolerance_norm, 1.0 / float(max(1, window_samples - 1))):
                 gt_peak_index[g, ch] = int(valid[min_pos].item())
+    if bool(getattr(peak_cfg, "return_candidate_stats", False)):
+        return peak_time, peak_amp, peak_valid, peak_index, gt_peak_index, int(matched), int(injected), dict(candidate_stats)
     return peak_time, peak_amp, peak_valid, peak_index, gt_peak_index, int(matched), int(injected)
 
 
