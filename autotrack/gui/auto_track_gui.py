@@ -44,8 +44,44 @@ DL_ADVANCED_PARAM_SPECS = [
         "key": "peak_threshold",
         "label": "Peak threshold",
         "type": "float",
-        "default": 0.4,
+        "default": 0.35,
         "tooltip": "PeakSlotNet 点级峰选择阈值。",
+    },
+    {
+        "key": "candidate_source",
+        "label": "Candidate source",
+        "type": "choice",
+        "default": "checkpoint",
+        "choices": ["checkpoint", "raw", "prior", "raw_prior_union"],
+        "tooltip": "PeakSlot v5 可从 checkpoint meta 继承 raw/prior union 候选来源。",
+    },
+    {
+        "key": "unet_checkpoint",
+        "label": "U-Net checkpoint",
+        "type": "str",
+        "default": "",
+        "tooltip": "2 通道 PeakSlot 模型需要的 waveform-line U-Net checkpoint；留空则使用模型 meta。",
+    },
+    {
+        "key": "waveform_task_dir",
+        "label": "Waveform task dir",
+        "type": "str",
+        "default": "/csim2/zhangzhiyu/MyProjects/waveform_line_task",
+        "tooltip": "包含 waveform_line_task model/ 和 render.py 的目录。",
+    },
+    {
+        "key": "prior_device",
+        "label": "Prior device",
+        "type": "str",
+        "default": "",
+        "tooltip": "U-Net prior 推理设备；留空则跟随 DL device。",
+    },
+    {
+        "key": "prior_batch_size",
+        "label": "Prior batch size",
+        "type": "int",
+        "default": 1,
+        "tooltip": "GUI 逐窗口 U-Net prior 推理 batch size。",
     },
     {
         "key": "max_tracks",
@@ -58,14 +94,14 @@ DL_ADVANCED_PARAM_SPECS = [
         "key": "extra_candidate_slots",
         "label": "Extra candidate slots",
         "type": "int",
-        "default": 8,
+        "default": 48,
         "tooltip": "额外解码的低 objectness slot 数。",
     },
     {
         "key": "candidate_objectness_floor",
         "label": "Candidate objectness floor",
         "type": "float",
-        "default": 0.20,
+        "default": 0.01,
         "tooltip": "额外候选 slot 的最低 objectness。",
     },
     {
@@ -123,8 +159,36 @@ DL_ADVANCED_PARAM_SPECS = [
         "key": "viterbi_topk",
         "label": "Viterbi top-k",
         "type": "int",
-        "default": 16,
+        "default": 24,
         "tooltip": "每道保留多少候选峰。",
+    },
+    {
+        "key": "prior_peak_min_height",
+        "label": "Prior peak min height",
+        "type": "float",
+        "default": 0.08,
+        "tooltip": "Ponytail prior 候选峰最低概率。",
+    },
+    {
+        "key": "prior_peak_prominence",
+        "label": "Prior peak prominence",
+        "type": "float",
+        "default": 0.02,
+        "tooltip": "Ponytail prior 候选峰显著性阈值。",
+    },
+    {
+        "key": "candidate_merge_tolerance_s",
+        "label": "Candidate merge tolerance (s)",
+        "type": "float",
+        "default": 0.20,
+        "tooltip": "同一道 raw/prior 候选在多少秒内合并。",
+    },
+    {
+        "key": "prior_score_scale",
+        "label": "Prior score scale",
+        "type": "float",
+        "default": 0.85,
+        "tooltip": "raw_prior_union 中 prior 候选分数缩放。",
     },
     {
         "key": "viterbi_candidate_threshold",
@@ -241,10 +305,15 @@ def _default_dl_advanced_params() -> dict[str, object]:
 
 def _peak_slot_recommended_advanced_params() -> dict[str, object]:
     return {
-        "peak_threshold": 0.4,
+        "peak_threshold": 0.35,
+        "candidate_source": "checkpoint",
+        "unet_checkpoint": "",
+        "waveform_task_dir": "/csim2/zhangzhiyu/MyProjects/waveform_line_task",
+        "prior_device": "",
+        "prior_batch_size": 1,
         "max_tracks": 96,
-        "extra_candidate_slots": 8,
-        "candidate_objectness_floor": 0.20,
+        "extra_candidate_slots": 48,
+        "candidate_objectness_floor": 0.01,
         "decoder_mode": "beam_global",
         "viterbi_beam_size": 8,
         "time_prior_weight": 2.0,
@@ -252,7 +321,11 @@ def _peak_slot_recommended_advanced_params() -> dict[str, object]:
         "conflict_mode": "soft",
         "duplicate_overlap_ratio": 0.70,
         "min_unique_support_channels": 4,
-        "viterbi_topk": 16,
+        "viterbi_topk": 24,
+        "prior_peak_min_height": 0.08,
+        "prior_peak_prominence": 0.02,
+        "candidate_merge_tolerance_s": 0.20,
+        "prior_score_scale": 0.85,
         "viterbi_candidate_threshold": 0.01,
         "viterbi_speed_min_kmh": 60.0,
         "viterbi_speed_max_kmh": 100.0,
@@ -383,6 +456,8 @@ class DeepLearningParamsDialog(QDialog):
 
         if float(values["peak_threshold"]) < 0.0 or float(values["peak_threshold"]) > 1.0:
             raise ValueError("Peak threshold must be in [0, 1].")
+        if int(values["prior_batch_size"]) < 1:
+            raise ValueError("Prior batch size must be >= 1.")
         if int(values["max_tracks"]) < 1:
             raise ValueError("Max predicted tracks must be >= 1.")
         if int(values["extra_candidate_slots"]) < 0:
@@ -397,6 +472,14 @@ class DeepLearningParamsDialog(QDialog):
             raise ValueError("Min unique support channels must be >= 0.")
         if int(values["viterbi_topk"]) < 1:
             raise ValueError("Viterbi top-k must be >= 1.")
+        if float(values["prior_peak_min_height"]) < 0.0:
+            raise ValueError("Prior peak min height must be >= 0.")
+        if float(values["prior_peak_prominence"]) < 0.0:
+            raise ValueError("Prior peak prominence must be >= 0.")
+        if float(values["candidate_merge_tolerance_s"]) < 0.0:
+            raise ValueError("Candidate merge tolerance must be >= 0.")
+        if float(values["prior_score_scale"]) < 0.0:
+            raise ValueError("Prior score scale must be >= 0.")
         if float(values["viterbi_candidate_threshold"]) < 0.0 or float(values["viterbi_candidate_threshold"]) > 1.0:
             raise ValueError("Viterbi candidate threshold must be in [0, 1].")
         if float(values["viterbi_speed_min_kmh"]) <= 0.0 or float(values["viterbi_speed_max_kmh"]) <= 0.0:

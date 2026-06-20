@@ -1770,15 +1770,27 @@ def _predict_tracks_from_window_impl(
     x_axis_m: np.ndarray,
     config: Optional[InferenceConfig] = None,
     device: Optional[str] = None,
+    input_tensor: Optional[torch.Tensor] = None,
 ) -> tuple[list[Track], dict[str, Any]]:
     cfg = config or InferenceConfig()
     arr = np.asarray(data_window, dtype=np.float32)
-    x = prepare_window_input(
-        arr,
-        int(cfg.time_downsample),
-        clip_ratio=float(cfg.clip_ratio),
-        input_mode="raw" if int(model.config.in_channels) == 1 else "raw_abs",
-    )
+    if input_tensor is None:
+        if int(model.config.in_channels) == 2 and str(cfg.candidate_source).strip().lower() in {"prior", "raw_prior_union"}:
+            raise ValueError("PeakSlot in_channels=2 with prior/union candidates requires a prepared raw+prior input tensor")
+        x = prepare_window_input(
+            arr,
+            int(cfg.time_downsample),
+            clip_ratio=float(cfg.clip_ratio),
+            input_mode="raw" if int(model.config.in_channels) == 1 else "raw_abs",
+        )
+    else:
+        x = input_tensor.detach().cpu().to(torch.float32)
+        if x.ndim != 3:
+            raise ValueError(f"input_tensor must have shape [in_channels,C,T], got {tuple(x.shape)}")
+        if int(x.shape[0]) != int(model.config.in_channels):
+            raise ValueError(f"input_tensor in_channels={int(x.shape[0])} does not match model in_channels={int(model.config.in_channels)}")
+        if int(x.shape[1]) != int(arr.shape[0]):
+            raise ValueError(f"input_tensor channel count={int(x.shape[1])} does not match data_window channels={int(arr.shape[0])}")
     peak_cfg = PeakDetectionConfig(
         candidates_per_channel=int(model.config.peak_candidates),
         min_distance_s=float(cfg.peak_min_distance_s),
@@ -1988,6 +2000,8 @@ def _predict_tracks_from_window_impl(
         final_candidate_ids.append(int(item["candidate_id"]))
         final_tracks.append(_track_stats(int(new_id), item["track"].direction, item["track"].points))
     diagnostics["final_candidate_ids"] = final_candidate_ids
+    diagnostics["raw_candidate_count"] = int(len(diagnostics["candidates"]))
+    diagnostics["final_candidate_count"] = int(len(final_candidate_ids))
     return final_tracks, diagnostics
 
 
@@ -1999,6 +2013,7 @@ def predict_tracks_from_window(
     config: Optional[InferenceConfig] = None,
     device: Optional[str] = None,
     return_diagnostics: bool = False,
+    input_tensor: Optional[torch.Tensor] = None,
 ) -> list[Track] | tuple[list[Track], dict[str, Any]]:
     tracks, diagnostics = _predict_tracks_from_window_impl(
         model=model,
@@ -2007,6 +2022,7 @@ def predict_tracks_from_window(
         x_axis_m=x_axis_m,
         config=config,
         device=device,
+        input_tensor=input_tensor,
     )
     if return_diagnostics:
         return tracks, diagnostics

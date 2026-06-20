@@ -1250,6 +1250,10 @@ class AutoTrackBackend:
         }
         if engine == "deep_learning" and self.last_peak_slot_diagnostics:
             diagnostic_keys = (
+                "candidate_source",
+                "peak_candidate_stats",
+                "raw_candidate_count",
+                "final_candidate_count",
                 "boundary_completion_enabled",
                 "boundary_completion_mode",
                 "boundary_input_track_count",

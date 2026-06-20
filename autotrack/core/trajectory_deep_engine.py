@@ -8,16 +8,17 @@ as another extraction engine.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import torch
 
 from autotrack.core.track_extractor_graph import Track
-from autotrack.dl.trajectory_set_model import auto_torch_device
+from autotrack.dl.trajectory_set_model import auto_torch_device, prepare_window_input
 
 
 _MODEL_CACHE: dict[tuple[str, str, str], tuple[object, dict, str]] = {}
+_PRIOR_CACHE: dict[tuple[str, str, str, int, int, float, float], dict[str, Any]] = {}
 
 
 def _resolve_model_family(model_path: str, requested_family: Optional[str]) -> str:
@@ -71,6 +72,129 @@ def _resolve_device(device: Optional[str]) -> str:
     return auto_torch_device() if raw_device in {"", "auto", "None"} else raw_device
 
 
+def _build_peak_slot_prior_input(
+    data: np.ndarray,
+    *,
+    cfg: dict,
+    model: object,
+    checkpoint: dict,
+    device: str,
+    time_downsample: int,
+    clip_ratio: float,
+) -> torch.Tensor:
+    in_channels = int(getattr(getattr(model, "config", None), "in_channels", 1))
+    if in_channels != 2:
+        return prepare_window_input(
+            np.asarray(data, dtype=np.float32),
+            int(time_downsample),
+            clip_ratio=float(clip_ratio),
+            input_mode="raw",
+        )
+    dataset_meta = dict(checkpoint.get("dataset_meta", {}))
+    prior_meta = dict(dataset_meta.get("prior_channel", {}))
+    checkpoint_path = str(cfg.get("unet_checkpoint", cfg.get("prior_unet_checkpoint", ""))).strip()
+    if not checkpoint_path:
+        checkpoint_path = str(prior_meta.get("unet_checkpoint", "")).strip()
+    if not checkpoint_path:
+        raise ValueError("PeakSlot in_channels=2 requires unet_checkpoint/prior_unet_checkpoint in dl_extra_config")
+    waveform_task_dir = str(
+        cfg.get(
+            "waveform_task_dir",
+            prior_meta.get("waveform_task_dir", "/csim2/zhangzhiyu/MyProjects/waveform_line_task"),
+        )
+    ).strip()
+    image_size = int(cfg.get("image_size", prior_meta.get("image_size", 512)))
+    waveform_line_width = int(cfg.get("waveform_line_width", prior_meta.get("waveform_line_width", 1)))
+    wiggle_fraction = float(cfg.get("wiggle_fraction", prior_meta.get("wiggle_fraction", 0.28)))
+    robust_percentile = float(cfg.get("robust_percentile", prior_meta.get("robust_percentile", 99.5)))
+    prior_threshold = float(cfg.get("prior_threshold", prior_meta.get("prior_threshold", 0.0)))
+    prior_scale = float(cfg.get("prior_scale", prior_meta.get("prior_scale", 1.0)))
+    prior_batch_size = int(cfg.get("prior_batch_size", 1))
+    prior_device = str(cfg.get("prior_device", "")).strip() or str(device)
+    raw_x = prepare_window_input(
+        np.asarray(data, dtype=np.float32),
+        int(time_downsample),
+        clip_ratio=float(clip_ratio),
+        input_mode="raw",
+    )
+    context = _load_prior_context(
+        checkpoint_path=checkpoint_path,
+        waveform_task_dir=waveform_task_dir,
+        device=prior_device,
+        image_size=image_size,
+        waveform_line_width=waveform_line_width,
+        wiggle_fraction=wiggle_fraction,
+        robust_percentile=robust_percentile,
+    )
+    from autotrack.dl.add_unet_prior_to_peak_slot import _build_prior_channel
+
+    prior = _build_prior_channel(
+        raw_x[0].unsqueeze(0).to(torch.float32),
+        unet=context["unet"],
+        device=context["device"],
+        render_config=context["render_config"],
+        channel_x_positions=context["channel_x_positions"],
+        render_waveform_image=context["render_waveform_image"],
+        batch_size=int(max(1, prior_batch_size)),
+        prior_threshold=float(prior_threshold),
+        prior_scale=float(prior_scale),
+    )[0]
+    return torch.stack([raw_x[0].to(torch.float32), prior.to(torch.float32)], dim=0).contiguous()
+
+
+def _load_prior_context(
+    *,
+    checkpoint_path: str,
+    waveform_task_dir: str,
+    device: str,
+    image_size: int,
+    waveform_line_width: int,
+    wiggle_fraction: float,
+    robust_percentile: float,
+) -> dict[str, Any]:
+    key = (
+        str(Path(checkpoint_path).expanduser().resolve()),
+        str(Path(waveform_task_dir).expanduser().resolve()),
+        str(device),
+        int(image_size),
+        int(waveform_line_width),
+        float(wiggle_fraction),
+        float(robust_percentile),
+    )
+    cached = _PRIOR_CACHE.get(key)
+    if cached is not None:
+        return cached
+    from autotrack.dl.add_unet_prior_to_peak_slot import _install_waveform_task_imports, _load_unet
+
+    waveform_path = Path(waveform_task_dir).expanduser().resolve()
+    _install_waveform_task_imports(waveform_path)
+    from model.network import UNetConfig, WaveformLineUNet  # type: ignore
+    from render import RenderConfig, channel_x_positions, render_waveform_image  # type: ignore
+
+    torch_device = torch.device(str(device))
+    render_config = RenderConfig(
+        image_size=int(image_size),
+        waveform_line_width=int(waveform_line_width),
+        robust_percentile=float(robust_percentile),
+        wiggle_fraction=float(wiggle_fraction),
+    )
+    unet = _load_unet(
+        Path(checkpoint_path).expanduser(),
+        device=torch_device,
+        UNetConfig=UNetConfig,
+        WaveformLineUNet=WaveformLineUNet,
+    )
+    context = {
+        "device": torch_device,
+        "unet": unet,
+        "render_config": render_config,
+        "channel_x_positions": channel_x_positions,
+        "render_waveform_image": render_waveform_image,
+    }
+    _PRIOR_CACHE[key] = context
+    return context
+
+
 def extract_all_deep_learning(
     data: np.ndarray,
     fs: float,
@@ -99,6 +223,9 @@ def extract_all_deep_learning(
         from autotrack.dl import peak_slot_model as pk
 
         peak_detection = dict(checkpoint.get("dataset_meta", {}).get("peak_detection", {}))
+        candidate_source = str(cfg.get("candidate_source", "checkpoint")).strip().lower()
+        if candidate_source in {"", "checkpoint", "auto"}:
+            candidate_source = str(peak_detection.get("candidate_source", "raw")).strip().lower()
         inference_cfg = pk.InferenceConfig(
             time_downsample=int(cfg.get("time_downsample", dataset_cfg.get("time_downsample", 10))),
             objectness_threshold=float(cfg.get("objectness_threshold", 0.35)),
@@ -112,6 +239,13 @@ def extract_all_deep_learning(
             peak_min_distance_s=float(cfg.get("peak_min_distance_s", 0.15)),
             peak_min_height=float(peak_detection.get("min_height", 0.02)),
             peak_prominence=float(peak_detection.get("prominence", 0.02)),
+            candidate_source=candidate_source,
+            prior_peak_min_height=float(cfg.get("prior_peak_min_height", peak_detection.get("prior_min_height", 0.08))),
+            prior_peak_prominence=float(cfg.get("prior_peak_prominence", peak_detection.get("prior_prominence", 0.02))),
+            candidate_merge_tolerance_s=float(
+                cfg.get("candidate_merge_tolerance_s", peak_detection.get("merge_tolerance_s", 0.20))
+            ),
+            prior_score_scale=float(cfg.get("prior_score_scale", peak_detection.get("prior_score_scale", 0.85))),
             use_viterbi_decoder=bool(cfg.get("use_viterbi_decoder", True)),
             decoder_mode=str(cfg.get("decoder_mode", "beam_global")),
             viterbi_beam_size=int(cfg.get("viterbi_beam_size", 8)),
@@ -183,6 +317,17 @@ def extract_all_deep_learning(
         predict_fn = pm.predict_tracks_from_window
     arr = np.asarray(data, dtype=np.float32)
     x_axis_m = np.arange(arr.shape[0], dtype=np.float64) * float(dx_m)
+    peak_input_tensor: torch.Tensor | None = None
+    if model_family == "peak_slot" and int(getattr(getattr(model, "config", None), "in_channels", 1)) == 2:
+        peak_input_tensor = _build_peak_slot_prior_input(
+            arr,
+            cfg=cfg,
+            model=model,
+            checkpoint=checkpoint,
+            device=resolved_device,
+            time_downsample=int(getattr(inference_cfg, "time_downsample", 10)),
+            clip_ratio=float(getattr(inference_cfg, "clip_ratio", 1.35)),
+        )
     if model_family == "peak_slot" and isinstance(diagnostics_sink, dict):
         tracks, diagnostics = predict_fn(
             model=model,
@@ -192,6 +337,7 @@ def extract_all_deep_learning(
             config=inference_cfg,
             device=resolved_device,
             return_diagnostics=True,
+            input_tensor=peak_input_tensor,
         )
         diagnostics_sink.clear()
         diagnostics_sink.update(diagnostics)
@@ -208,14 +354,25 @@ def extract_all_deep_learning(
                     "and vehicle-count prior may all be miscalibrated."
                 )
     else:
-        tracks = predict_fn(
-            model=model,
-            data_window=arr,
-            fs=float(fs),
-            x_axis_m=x_axis_m,
-            config=inference_cfg,
-            device=resolved_device,
-        )
+        if model_family == "peak_slot":
+            tracks = predict_fn(
+                model=model,
+                data_window=arr,
+                fs=float(fs),
+                x_axis_m=x_axis_m,
+                config=inference_cfg,
+                device=resolved_device,
+                input_tensor=peak_input_tensor,
+            )
+        else:
+            tracks = predict_fn(
+                model=model,
+                data_window=arr,
+                fs=float(fs),
+                x_axis_m=x_axis_m,
+                config=inference_cfg,
+                device=resolved_device,
+            )
         if isinstance(diagnostics_sink, dict):
             diagnostics_sink.clear()
     if model_family == "peak_slot" and str(cfg.get("fusion_mode", "off")).strip().lower() == "graph_extend":
