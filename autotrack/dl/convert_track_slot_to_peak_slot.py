@@ -39,7 +39,7 @@ from typing import Any
 
 import torch
 
-from autotrack.dl.peak_slot_model import PeakDetectionConfig, detect_peak_candidates_from_tensor
+from autotrack.dl.peak_slot_model import PeakDetectionConfig, detect_peak_candidates_from_input
 
 
 def parse_args() -> argparse.Namespace:
@@ -113,8 +113,8 @@ def _convert_one_sample(
     peak_cfg: PeakDetectionConfig,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
     heatmap = x[0].to(torch.float32)
-    peak_time, peak_amp, peak_valid, peak_index = detect_peak_candidates_from_tensor(
-        heatmap,
+    peak_time, peak_amp, peak_valid, peak_index = detect_peak_candidates_from_input(
+        x.to(torch.float32),
         fs=float(fs),
         time_downsample=int(time_downsample),
         window_samples=int(window_samples),

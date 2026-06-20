@@ -49,6 +49,11 @@ class PeakDetectionConfig:
     min_height: float = 0.02
     prominence: float = 0.02
     match_tolerance_s: float = 0.25
+    candidate_source: str = "raw"
+    prior_min_height: float = 0.08
+    prior_prominence: float = 0.02
+    merge_tolerance_s: float = 0.20
+    prior_score_scale: float = 0.85
 
 
 @dataclass
@@ -80,6 +85,11 @@ class InferenceConfig:
     peak_min_distance_s: float = 0.15
     peak_min_height: float = 0.02
     peak_prominence: float = 0.02
+    candidate_source: str = "raw"
+    prior_peak_min_height: float = 0.08
+    prior_peak_prominence: float = 0.02
+    candidate_merge_tolerance_s: float = 0.20
+    prior_score_scale: float = 0.85
     use_viterbi_decoder: bool = True
     viterbi_topk: int = 16
     viterbi_candidate_threshold: float = 0.01
@@ -172,6 +182,174 @@ def detect_peak_candidates_from_tensor(
         peak_amp[ch, :take] = torch.as_tensor(amps[:take], dtype=torch.float32)
         peak_valid[ch, :take] = True
     return peak_time, peak_amp, peak_valid, peak_index
+
+
+def detect_peak_candidates_from_input(
+    x: torch.Tensor,
+    *,
+    fs: float,
+    time_downsample: int,
+    window_samples: int,
+    config: PeakDetectionConfig,
+    return_stats: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, int | float | str]]:
+    """Detect PeakSlot candidates from raw, prior, or raw/prior union input."""
+    source = str(config.candidate_source or "raw").strip().lower()
+    if source not in {"raw", "prior", "raw_prior_union"}:
+        raise ValueError(f"Unsupported candidate_source={config.candidate_source!r}")
+    if x.ndim == 2:
+        if source != "raw":
+            raise ValueError(f"candidate_source={source!r} requires x with shape [in_channels,C,T]")
+        result = detect_peak_candidates_from_tensor(
+            x,
+            fs=float(fs),
+            time_downsample=int(time_downsample),
+            window_samples=int(window_samples),
+            config=config,
+        )
+        if return_stats:
+            valid = int(result[2].sum().item())
+            return (*result, {"candidate_source": "raw", "raw_candidate_count": valid, "prior_candidate_count": 0, "merged_candidate_count": valid})
+        return result
+    if x.ndim != 3:
+        raise ValueError("x must have shape [C,T] or [in_channels,C,T]")
+    raw = x[0].to(torch.float32)
+    if source == "raw":
+        result = detect_peak_candidates_from_tensor(
+            raw,
+            fs=float(fs),
+            time_downsample=int(time_downsample),
+            window_samples=int(window_samples),
+            config=config,
+        )
+        if return_stats:
+            valid = int(result[2].sum().item())
+            return (*result, {"candidate_source": "raw", "raw_candidate_count": valid, "prior_candidate_count": 0, "merged_candidate_count": valid})
+        return result
+    if int(x.shape[0]) < 2:
+        raise ValueError(f"candidate_source={source!r} requires x with at least two channels: raw + prior")
+    prior = x[1].to(torch.float32)
+    prior_cfg = PeakDetectionConfig(
+        candidates_per_channel=int(config.candidates_per_channel),
+        min_distance_s=float(config.min_distance_s),
+        min_height=float(config.prior_min_height),
+        prominence=float(config.prior_prominence),
+        match_tolerance_s=float(config.match_tolerance_s),
+        candidate_source="prior",
+        prior_min_height=float(config.prior_min_height),
+        prior_prominence=float(config.prior_prominence),
+        merge_tolerance_s=float(config.merge_tolerance_s),
+        prior_score_scale=float(config.prior_score_scale),
+    )
+    if source == "prior":
+        result = detect_peak_candidates_from_tensor(
+            prior,
+            fs=float(fs),
+            time_downsample=int(time_downsample),
+            window_samples=int(window_samples),
+            config=prior_cfg,
+        )
+        if return_stats:
+            valid = int(result[2].sum().item())
+            return (*result, {"candidate_source": "prior", "raw_candidate_count": 0, "prior_candidate_count": valid, "merged_candidate_count": valid})
+        return result
+
+    raw_result = detect_peak_candidates_from_tensor(
+        raw,
+        fs=float(fs),
+        time_downsample=int(time_downsample),
+        window_samples=int(window_samples),
+        config=config,
+    )
+    prior_result = detect_peak_candidates_from_tensor(
+        prior,
+        fs=float(fs),
+        time_downsample=int(time_downsample),
+        window_samples=int(window_samples),
+        config=prior_cfg,
+    )
+    merged = _merge_candidate_tables(
+        raw_result,
+        prior_result,
+        candidates_per_channel=int(config.candidates_per_channel),
+        merge_tolerance_s=float(config.merge_tolerance_s),
+        prior_score_scale=float(config.prior_score_scale),
+        fs=float(fs),
+        time_downsample=int(time_downsample),
+        window_samples=int(window_samples),
+    )
+    if return_stats:
+        stats = {
+            "candidate_source": "raw_prior_union",
+            "raw_candidate_count": int(raw_result[2].sum().item()),
+            "prior_candidate_count": int(prior_result[2].sum().item()),
+            "merged_candidate_count": int(merged[2].sum().item()),
+            "merge_tolerance_s": float(config.merge_tolerance_s),
+            "prior_score_scale": float(config.prior_score_scale),
+        }
+        return (*merged, stats)
+    return merged
+
+
+def _merge_candidate_tables(
+    raw_result: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    prior_result: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    *,
+    candidates_per_channel: int,
+    merge_tolerance_s: float,
+    prior_score_scale: float,
+    fs: float,
+    time_downsample: int,
+    window_samples: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    raw_time, raw_amp, raw_valid, raw_index = raw_result
+    prior_time, prior_amp, prior_valid, prior_index = prior_result
+    n_ch = int(raw_time.shape[0])
+    k_count = int(candidates_per_channel)
+    out_time = torch.zeros((n_ch, k_count), dtype=torch.float32)
+    out_amp = torch.zeros((n_ch, k_count), dtype=torch.float32)
+    out_valid = torch.zeros((n_ch, k_count), dtype=torch.bool)
+    out_index = torch.full((n_ch, k_count), -1, dtype=torch.long)
+    merge_distance = int(max(0, round(float(merge_tolerance_s) * float(fs) / float(max(1, time_downsample)))))
+    denom = float(max(1, int(window_samples) - 1))
+    downsample = float(max(1, int(time_downsample)))
+    for ch in range(n_ch):
+        rows: list[dict[str, float | int]] = []
+        for src_idx, (times, amps, valids, indices, scale) in enumerate(
+            (
+                (raw_time, raw_amp, raw_valid, raw_index, 1.0),
+                (prior_time, prior_amp, prior_valid, prior_index, float(prior_score_scale)),
+            )
+        ):
+            valid_pos = torch.where(valids[ch])[0]
+            for pos in valid_pos.tolist():
+                idx = int(indices[ch, int(pos)].item())
+                if idx < 0:
+                    continue
+                score = float(abs(float(amps[ch, int(pos)].item())) * float(scale))
+                rows.append({"idx": idx, "score": score, "source": int(src_idx)})
+        groups: list[dict[str, float | int]] = []
+        for row in sorted(rows, key=lambda item: float(item["score"]), reverse=True):
+            match_idx = -1
+            for group_idx, group in enumerate(groups):
+                if abs(int(row["idx"]) - int(group["idx"])) <= merge_distance:
+                    match_idx = int(group_idx)
+                    break
+            if match_idx < 0:
+                groups.append(dict(row))
+            elif float(row["score"]) > float(groups[match_idx]["score"]):
+                groups[match_idx] = dict(row)
+        if len(groups) > k_count:
+            groups = sorted(groups, key=lambda item: float(item["score"]), reverse=True)[:k_count]
+        groups = sorted(groups, key=lambda item: int(item["idx"]))
+        for out_pos, group in enumerate(groups[:k_count]):
+            idx = int(group["idx"])
+            out_index[ch, out_pos] = idx
+            out_time[ch, out_pos] = (float(idx) * downsample / denom)
+            out_amp[ch, out_pos] = float(group["score"])
+            out_valid[ch, out_pos] = True
+    out_time.clamp_(0.0, 1.0)
+    return out_time, out_amp, out_valid, out_index
 
 
 class PeakSlotPredictor(nn.Module):
@@ -1605,13 +1783,19 @@ def _predict_tracks_from_window_impl(
         min_distance_s=float(cfg.peak_min_distance_s),
         min_height=float(cfg.peak_min_height),
         prominence=float(cfg.peak_prominence),
+        candidate_source=str(cfg.candidate_source),
+        prior_min_height=float(cfg.prior_peak_min_height),
+        prior_prominence=float(cfg.prior_peak_prominence),
+        merge_tolerance_s=float(cfg.candidate_merge_tolerance_s),
+        prior_score_scale=float(cfg.prior_score_scale),
     )
-    peak_time, peak_amp, peak_valid, peak_index = detect_peak_candidates_from_tensor(
-        x[0],
+    peak_time, peak_amp, peak_valid, peak_index, peak_stats = detect_peak_candidates_from_input(
+        x,
         fs=float(fs),
         time_downsample=int(cfg.time_downsample),
         window_samples=int(arr.shape[1]),
         config=peak_cfg,
+        return_stats=True,
     )
     resolved_device = device or next(model.parameters()).device
     model.eval()
@@ -1659,6 +1843,8 @@ def _predict_tracks_from_window_impl(
         "extra_slots": list(extra_slots),
         "ranked_slots": list(ranked_slots),
         "objectness": np.asarray(obj, dtype=np.float32),
+        "candidate_source": str(peak_stats.get("candidate_source", cfg.candidate_source)),
+        "peak_candidate_stats": dict(peak_stats),
         "candidates": [],
     }
 
