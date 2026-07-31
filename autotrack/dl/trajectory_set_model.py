@@ -9,19 +9,24 @@ vehicle and directly regresses a polyline-like point set for that vehicle.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
 import numpy as np
 import torch
-from obspy import read
 from scipy.optimize import linear_sum_assignment
 from torch import nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 
+from autotrack.core.single_vehicle_tracker import SingleVehicleTrackerConfig, extract_single_vehicle_track
 from autotrack.core.track_extractor_graph import Track, TrackPoint
+
+try:  # optional dependency for SAC dataset loading
+    from obspy import read
+except ModuleNotFoundError:  # pragma: no cover - exercised only when SAC support is unused
+    read = None
 
 
 DIRECTION_TO_LABEL = {"forward": 0, "reverse": 1, "primary": 0, "secondary": 1}
@@ -67,9 +72,14 @@ class InferenceConfig:
     dedup_tolerance_samples: int = 180
     speed_norm_kmh: float = 150.0
     clip_ratio: float = 1.35
+    graph_refine: bool = False
+    graph_prior_weight: float = 1.0
+    single_vehicle_tracker: SingleVehicleTrackerConfig = field(default_factory=SingleVehicleTrackerConfig)
 
 
 def load_sac_matrix(folder: str | Path) -> tuple[np.ndarray, float, np.ndarray, float]:
+    if read is None:
+        raise ImportError("obspy is required to load SAC data for trajectory-set training")
     folder_path = Path(folder).expanduser()
     sac_files = sorted(folder_path.glob("*.sac"))
     if not sac_files:
@@ -1363,6 +1373,116 @@ def _track_stats(track_id: int, direction: str, points: list[TrackPoint]) -> Tra
     )
 
 
+def _track_line_fit(track: Track) -> tuple[float, float] | None:
+    if len(track.points) < 2:
+        return None
+    ch = np.asarray([int(p.ch_idx) for p in track.points], dtype=np.float64)
+    t = np.asarray([float(p.time_s) for p in track.points], dtype=np.float64)
+    if np.ptp(ch) < 1e-9:
+        return None
+    slope, intercept = np.polyfit(ch, t, deg=1)
+    return float(slope), float(intercept)
+
+
+def _track_line_distance(a: Track, b: Track) -> float:
+    fa = _track_line_fit(a)
+    fb = _track_line_fit(b)
+    if fa is None or fb is None:
+        return float("inf")
+    slope_a, intercept_a = fa
+    slope_b, intercept_b = fb
+    center_a = 0.5 * (float(min(int(p.ch_idx) for p in a.points)) + float(max(int(p.ch_idx) for p in a.points)))
+    center_b = 0.5 * (float(min(int(p.ch_idx) for p in b.points)) + float(max(int(p.ch_idx) for p in b.points)))
+    center_ch = 0.5 * (center_a + center_b)
+    pred_a = slope_a * center_ch + intercept_a
+    pred_b = slope_b * center_ch + intercept_b
+    return abs(pred_a - pred_b) + 0.2 * abs(slope_a - slope_b)
+
+
+def _build_track_prior_heatmap(
+    points: list[TrackPoint],
+    *,
+    n_channels: int,
+    n_samples: int,
+    time_sigma_samples: float = 90.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    prior = np.zeros((int(n_channels), int(n_samples)), dtype=np.float32)
+    time_hint = np.full((int(n_channels),), np.nan, dtype=np.float32)
+    if not points:
+        return prior, time_hint
+
+    ordered = sorted(points, key=lambda p: int(p.ch_idx))
+    chs = np.asarray([int(p.ch_idx) for p in ordered], dtype=np.float64)
+    ts = np.asarray([float(p.time_s) for p in ordered], dtype=np.float64)
+    t_idx = np.asarray([int(p.t_idx) for p in ordered], dtype=np.float64)
+
+    if chs.size >= 2 and np.ptp(chs) > 0:
+        slope, intercept = np.polyfit(chs, t_idx, deg=1)
+        fit_t = slope * np.arange(int(n_channels), dtype=np.float64) + intercept
+        fit_t = np.clip(fit_t, 0.0, float(max(0, int(n_samples) - 1)))
+        time_hint[:] = fit_t / float(max(1.0, float(n_samples) - 1.0))
+        for ch in range(int(n_channels)):
+            center = float(fit_t[ch])
+            left = max(0, int(np.floor(center - 4.0 * float(time_sigma_samples))))
+            right = min(int(n_samples) - 1, int(np.ceil(center + 4.0 * float(time_sigma_samples))))
+            if right < left:
+                continue
+            xs = np.arange(left, right + 1, dtype=np.float32)
+            band = np.exp(-0.5 * ((xs - center) / float(max(1e-6, time_sigma_samples))) ** 2)
+            prior[ch, left : right + 1] = np.maximum(prior[ch, left : right + 1], band.astype(np.float32, copy=False))
+        return prior, time_hint
+
+    # Fallback for sparse predictions: stamp each point directly and leave a
+    # per-channel time hint at the observed channel positions.
+    for point in ordered:
+        ch = int(point.ch_idx)
+        t = int(point.t_idx)
+        if 0 <= ch < int(n_channels):
+            time_hint[ch] = float(t) / float(max(1.0, int(n_samples) - 1))
+            left = max(0, t - int(round(4.0 * float(time_sigma_samples))))
+            right = min(int(n_samples) - 1, t + int(round(4.0 * float(time_sigma_samples))))
+            xs = np.arange(left, right + 1, dtype=np.float32)
+            band = np.exp(-0.5 * ((xs - float(t)) / float(max(1e-6, time_sigma_samples))) ** 2)
+            prior[ch, left : right + 1] = np.maximum(prior[ch, left : right + 1], band.astype(np.float32, copy=False))
+    return prior, time_hint
+
+
+def _refine_track_with_graph(
+    raw: np.ndarray,
+    track: Track,
+    *,
+    fs: float,
+    dx_m: float,
+    direction: str,
+    vmin_kmh: float,
+    vmax_kmh: float,
+    cfg: InferenceConfig,
+) -> Track:
+    if not bool(cfg.graph_refine) or not track.points:
+        return track
+    prior_heatmap, prior_time_hint = _build_track_prior_heatmap(
+        track.points,
+        n_channels=int(raw.shape[0]),
+        n_samples=int(raw.shape[1]),
+        time_sigma_samples=max(18.0, float(cfg.refine_radius_samples) * 0.45),
+    )
+    refined = extract_single_vehicle_track(
+        raw,
+        float(fs),
+        float(dx_m),
+        str(direction),
+        float(vmin_kmh),
+        float(vmax_kmh),
+        config=cfg.single_vehicle_tracker,
+        prior_heatmap=prior_heatmap,
+        prior_weight=float(cfg.graph_prior_weight),
+        prior_time_hint=prior_time_hint * float(max(1.0, raw.shape[1] - 1) / max(1e-6, fs)),
+    )
+    if refined:
+        return refined[0]
+    return track
+
+
 def _refine_t_idx(data: np.ndarray, ch: int, t_idx: int, radius: int) -> int:
     n_samples = int(data.shape[1])
     center = int(max(0, min(n_samples - 1, t_idx)))
@@ -1394,7 +1514,11 @@ def _deduplicate_tracks(tracks: list[Track], tol_samples: int) -> list[Track]:
         for existing in kept:
             overlap = _track_overlap(existing, track, tol_samples)
             ratio = overlap / max(1, min(len(existing.points), len(track.points)))
-            if ratio >= 0.6:
+            common_channels = len({int(p.ch_idx) for p in existing.points} & {int(p.ch_idx) for p in track.points})
+            channel_ratio = common_channels / float(max(1, min(len(existing.points), len(track.points))))
+            line_distance = _track_line_distance(existing, track)
+            speed_diff = abs(float(existing.mean_speed_kmh) - float(track.mean_speed_kmh))
+            if ratio >= 0.6 or (channel_ratio >= 0.45 and line_distance < 6.0 and speed_diff < 20.0):
                 duplicate = True
                 break
         if not duplicate:
@@ -1438,7 +1562,7 @@ def _predict_tracks_from_polyline_outputs(
             point = TrackPoint(
                 ch_idx=ch,
                 t_idx=int(t_idx),
-                time_s=float(t_idx) / float(fs),
+                time_s=float(t_idx) / float(max(1e-9, fs)),
                 offset_m=float(x_axis_m[ch]),
                 amp=amp,
                 score=score,
@@ -1451,7 +1575,19 @@ def _predict_tracks_from_polyline_outputs(
         if len(points) < int(cfg.min_visible_channels):
             continue
         direction = LABEL_TO_DIRECTION.get(int(direction_label[q_idx]), "forward")
-        tracks.append(_track_stats(len(tracks), direction, points))
+        raw_track = _track_stats(len(tracks), direction, points)
+        tracks.append(
+            _refine_track_with_graph(
+                arr,
+                raw_track,
+                fs=float(fs),
+                dx_m=float(x_axis_m[1] - x_axis_m[0]) if len(x_axis_m) > 1 else 100.0,
+                direction=direction,
+                vmin_kmh=float(cfg.speed_norm_kmh) * 0.4,
+                vmax_kmh=float(cfg.speed_norm_kmh) * 1.2,
+                cfg=cfg,
+            )
+        )
     return tracks
 
 
@@ -1486,7 +1622,7 @@ def _predict_tracks_from_dense_outputs(
                 TrackPoint(
                     ch_idx=int(ch),
                     t_idx=int(t_idx),
-                    time_s=float(t_idx) / float(fs),
+                    time_s=float(t_idx) / float(max(1e-9, fs)),
                     offset_m=float(x_axis_m[int(ch)]),
                     amp=amp,
                     score=score,
@@ -1495,7 +1631,19 @@ def _predict_tracks_from_dense_outputs(
         if len(points) < int(cfg.min_visible_channels):
             continue
         direction = LABEL_TO_DIRECTION.get(int(direction_label[q_idx]), "forward")
-        tracks.append(_track_stats(len(tracks), direction, points))
+        raw_track = _track_stats(len(tracks), direction, points)
+        tracks.append(
+            _refine_track_with_graph(
+                arr,
+                raw_track,
+                fs=float(fs),
+                dx_m=float(x_axis_m[1] - x_axis_m[0]) if len(x_axis_m) > 1 else 100.0,
+                direction=direction,
+                vmin_kmh=float(cfg.speed_norm_kmh) * 0.4,
+                vmax_kmh=float(cfg.speed_norm_kmh) * 1.2,
+                cfg=cfg,
+            )
+        )
     return tracks
 
 

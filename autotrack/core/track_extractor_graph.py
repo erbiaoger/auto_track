@@ -179,6 +179,8 @@ def _extract_best_track(
     n_samples: int,
     config: ExtractorConfig,
     track_id: int,
+    prior_time_hint: Optional[np.ndarray] = None,
+    prior_channel_weight: float = 0.0,
 ) -> Optional[Track]:
     n_ch = len(nodes)
     k_best = int(max(1, config.k_best_per_node))
@@ -198,6 +200,11 @@ def _extract_best_track(
     pred_lambda = float(max(0.0, config.lambda_prediction))
     pred_tol_ratio = float(max(0.0, config.prediction_tolerance_ratio))
     pred_tol_min_s = float(max(0.0, config.prediction_tolerance_min_seconds))
+    prior_time_arr = None
+    if prior_time_hint is not None:
+        prior_time_arr = np.asarray(prior_time_hint, dtype=np.float64)
+        if prior_time_arr.ndim != 1 or prior_time_arr.shape[0] != n_ch:
+            raise ValueError("prior_time_hint must have shape [n_channels]")
 
     for ch in range(n_ch):
         t_curr = nodes[ch]["t"]
@@ -306,7 +313,17 @@ def _extract_best_track(
                             dt_tol = max(pred_tol_min_s, pred_tol_ratio * abs(dt_pred))
                             pred_pen = pred_lambda * max(0.0, dt_err - dt_tol) / max(1e-6, dt_tol)
 
-                        cand_score = prev_score_val + float(s_curr[j]) - speed_pen - pred_pen - skip_penalty
+                        prior_pen = 0.0
+                        if prior_time_arr is not None and float(prior_channel_weight) > 0.0:
+                            prior_time = float(prior_time_arr[ch])
+                            if np.isfinite(prior_time):
+                                prior_tol = max(pred_tol_min_s, 0.10)
+                                abs_time = float(t_curr[j]) / float(fs)
+                                prior_pen = float(prior_channel_weight) * max(
+                                    0.0, abs(abs_time - prior_time) - prior_tol
+                                ) / max(1e-6, prior_tol)
+
+                        cand_score = prev_score_val + float(s_curr[j]) - speed_pen - pred_pen - prior_pen - skip_penalty
                         cand_len = int(prev_len[prev_idx, prev_slot]) + 1
                         cand_speed = 0.7 * speed_ref + 0.3 * speed_curr
                         cand_tmin = min(int(prev_tmin[prev_idx, prev_slot]), int(t_curr[j]))

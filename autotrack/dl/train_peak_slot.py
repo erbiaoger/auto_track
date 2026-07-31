@@ -194,6 +194,72 @@ def _resolve_resume_path(args: argparse.Namespace) -> Optional[Path]:
     return None
 
 
+def _model_config_from_meta(args: argparse.Namespace, meta: dict) -> ModelConfig:
+    return ModelConfig(
+        n_channels=int(meta["n_channels"]),
+        in_channels=int(meta["in_channels"]),
+        max_tracks=max(int(args.max_tracks), int(meta.get("max_gt", 0))),
+        peak_candidates=int(meta["peak_candidates_per_channel"]),
+        hidden_dim=int(args.hidden_dim),
+        num_heads=int(args.num_heads),
+        decoder_layers=int(args.decoder_layers),
+        pooled_channels=int(args.pooled_channels),
+        pooled_time=int(args.pooled_time),
+        dropout=float(args.dropout),
+    )
+
+
+def _resume_config_with_dataset_input(checkpoint_config: ModelConfig, args: argparse.Namespace, meta: dict) -> ModelConfig:
+    if not bool(args.resume_model_only):
+        return checkpoint_config
+    target_in_channels = int(meta["in_channels"])
+    target_n_channels = int(meta["n_channels"])
+    target_peak_candidates = int(meta["peak_candidates_per_channel"])
+    if (
+        int(checkpoint_config.in_channels) == target_in_channels
+        and int(checkpoint_config.n_channels) == target_n_channels
+        and int(checkpoint_config.peak_candidates) == target_peak_candidates
+    ):
+        return checkpoint_config
+    cfg = ModelConfig(**asdict(checkpoint_config))
+    cfg.in_channels = target_in_channels
+    cfg.n_channels = target_n_channels
+    cfg.peak_candidates = target_peak_candidates
+    cfg.max_tracks = max(int(checkpoint_config.max_tracks), int(args.max_tracks), int(meta.get("max_gt", 0)))
+    return cfg
+
+
+def _adapt_resume_state_dict(model: PeakSlotPredictor, checkpoint_state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    target_state = model.state_dict()
+    adapted: dict[str, torch.Tensor] = {}
+    skipped: list[str] = []
+    for key, value in checkpoint_state.items():
+        if key not in target_state:
+            adapted[key] = value
+            continue
+        target = target_state[key]
+        if tuple(value.shape) == tuple(target.shape):
+            adapted[key] = value
+            continue
+        if key == "backbone.0.net.0.weight" and value.ndim == 4 and target.ndim == 4:
+            new_value = target.detach().clone()
+            common_in = min(int(value.shape[1]), int(target.shape[1]))
+            new_value[:, :common_in] = value[:, :common_in].to(dtype=new_value.dtype)
+            if int(target.shape[1]) > int(value.shape[1]):
+                new_value[:, int(value.shape[1]) :] = 0.0
+            adapted[key] = new_value
+            print(
+                f"Adapted {key} from shape={tuple(value.shape)} to shape={tuple(target.shape)}; "
+                "new input channels initialized to 0.",
+                flush=True,
+            )
+            continue
+        skipped.append(f"{key}: checkpoint={tuple(value.shape)} target={tuple(target.shape)}")
+    if skipped:
+        print(f"Skipped incompatible resume tensors: {skipped}", flush=True)
+    return adapted
+
+
 def _resolve_x_transfer_dtype(args: argparse.Namespace, *, device: str, use_amp: bool) -> str:
     requested = str(args.input_transfer_dtype).lower()
     if requested != "auto":
@@ -682,21 +748,18 @@ def main() -> int:
     if resume_path is not None:
         resume_checkpoint = torch.load(str(resume_path), map_location="cpu", weights_only=False)
         resume_epoch = int(resume_checkpoint.get("epoch", 0))
-        model_config = ModelConfig(**dict(resume_checkpoint.get("model_config", {})))
-        print(f"Resuming from checkpoint: {resume_path} at epoch={resume_epoch}", flush=True)
-    else:
-        model_config = ModelConfig(
-            n_channels=int(meta["n_channels"]),
-            in_channels=int(meta["in_channels"]),
-            max_tracks=max(int(args.max_tracks), int(meta.get("max_gt", 0))),
-            peak_candidates=int(meta["peak_candidates_per_channel"]),
-            hidden_dim=int(args.hidden_dim),
-            num_heads=int(args.num_heads),
-            decoder_layers=int(args.decoder_layers),
-            pooled_channels=int(args.pooled_channels),
-            pooled_time=int(args.pooled_time),
-            dropout=float(args.dropout),
+        checkpoint_config = ModelConfig(**dict(resume_checkpoint.get("model_config", {})))
+        model_config = _resume_config_with_dataset_input(checkpoint_config, args, meta)
+        print(
+            f"Resuming from checkpoint: {resume_path} at epoch={resume_epoch}; "
+            f"checkpoint_in_channels={checkpoint_config.in_channels}, target_in_channels={model_config.in_channels}",
+            flush=True,
         )
+        if bool(args.resume_model_only):
+            print("Resume-model-only requested; resetting training epoch counter to 0.", flush=True)
+            resume_epoch = 0
+    else:
+        model_config = _model_config_from_meta(args, meta)
     dataset_config = WindowDatasetConfig(
         window_seconds=float(meta["window_seconds"]),
         time_downsample=int(meta["time_downsample"]),
@@ -711,7 +774,8 @@ def main() -> int:
     if bool(args.channels_last) and str(device).startswith("cuda"):
         model = model.to(memory_format=torch.channels_last)
     if resume_checkpoint is not None:
-        missing, unexpected = model.load_state_dict(resume_checkpoint["model_state"], strict=False)
+        resume_state = _adapt_resume_state_dict(model, resume_checkpoint["model_state"])
+        missing, unexpected = model.load_state_dict(resume_state, strict=False)
         if missing:
             print(f"Resume checkpoint missing newly initialized keys: {missing}", flush=True)
         if unexpected:
@@ -775,7 +839,7 @@ def main() -> int:
         f"amp={use_amp}, matcher={args.matcher}, x_transfer_dtype={x_transfer_dtype}"
     )
     best_loss = float("inf")
-    if resume_checkpoint is not None:
+    if resume_checkpoint is not None and not bool(args.resume_model_only):
         metrics = dict(resume_checkpoint.get("metrics", {}))
         best_loss = float(metrics.get("val_loss", metrics.get("loss", best_loss)))
     start_epoch = resume_epoch + 1 if resume_checkpoint is not None else 1

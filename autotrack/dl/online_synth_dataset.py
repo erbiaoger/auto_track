@@ -58,6 +58,28 @@ class OnlineSyntheticTrajectoryDataset(Dataset):
         cache_dir: Optional[Path] = None,
         cache_rebuild: bool = False,
         disk_cache_only: bool = True,
+        return_raw_window: bool = False,
+        background_npy: Optional[Path] = None,
+        background_layout: str = "time_channel",
+        background_channel_start: int = 0,
+        background_scale: float = 1.0,
+        artifact_dropout_ratio: float = 0.0,
+        artifact_dropout_min_channels: int = 2,
+        artifact_dropout_max_channels: int = 6,
+        artifact_decoy_ratio: float = 0.0,
+        artifact_decoy_min_points: int = 1,
+        artifact_decoy_max_points: int = 3,
+        artifact_decoy_amp_scale_min: float = 1.1,
+        artifact_decoy_amp_scale_max: float = 2.2,
+        artifact_decoy_time_jitter_s: float = 0.18,
+        artifact_competing_ratio: float = 0.0,
+        artifact_competing_time_jitter_s: float = 0.8,
+        artifact_competing_amp_scale_min: float = 0.8,
+        artifact_competing_amp_scale_max: float = 1.6,
+        artifact_competing_speed_ratio_min: float = 0.88,
+        artifact_competing_speed_ratio_max: float = 1.12,
+        artifact_competing_channel_offset_max: int = 5,
+        artifact_competing_opposite_direction_ratio: float = 0.0,
     ):
         self.length = int(length)
         self.n_channels = int(n_channels)
@@ -94,6 +116,33 @@ class OnlineSyntheticTrajectoryDataset(Dataset):
         self.cache_build_workers = int(max(0, cache_build_workers))
         self.cache_rebuild = bool(cache_rebuild)
         self.disk_cache_only = bool(disk_cache_only)
+        self.return_raw_window = bool(return_raw_window)
+        self.background_npy = Path(background_npy).expanduser() if background_npy is not None else None
+        self.background_layout = str(background_layout).lower()
+        self.background_channel_start = int(background_channel_start)
+        self.background_scale = float(background_scale)
+        self.artifact_dropout_ratio = float(min(1.0, max(0.0, artifact_dropout_ratio)))
+        self.artifact_dropout_min_channels = int(max(1, artifact_dropout_min_channels))
+        self.artifact_dropout_max_channels = int(max(self.artifact_dropout_min_channels, artifact_dropout_max_channels))
+        self.artifact_decoy_ratio = float(min(1.0, max(0.0, artifact_decoy_ratio)))
+        self.artifact_decoy_min_points = int(max(0, artifact_decoy_min_points))
+        self.artifact_decoy_max_points = int(max(self.artifact_decoy_min_points, artifact_decoy_max_points))
+        self.artifact_decoy_amp_scale_min = float(max(1.0, artifact_decoy_amp_scale_min))
+        self.artifact_decoy_amp_scale_max = float(max(self.artifact_decoy_amp_scale_min, artifact_decoy_amp_scale_max))
+        self.artifact_decoy_time_jitter_s = float(max(0.0, artifact_decoy_time_jitter_s))
+        self.artifact_competing_ratio = float(min(1.0, max(0.0, artifact_competing_ratio)))
+        self.artifact_competing_time_jitter_s = float(max(0.0, artifact_competing_time_jitter_s))
+        self.artifact_competing_amp_scale_min = float(max(1.0, artifact_competing_amp_scale_min))
+        self.artifact_competing_amp_scale_max = float(max(self.artifact_competing_amp_scale_min, artifact_competing_amp_scale_max))
+        self.artifact_competing_speed_ratio_min = float(max(0.05, artifact_competing_speed_ratio_min))
+        self.artifact_competing_speed_ratio_max = float(
+            max(self.artifact_competing_speed_ratio_min, artifact_competing_speed_ratio_max)
+        )
+        self.artifact_competing_channel_offset_max = int(max(0, artifact_competing_channel_offset_max))
+        self.artifact_competing_opposite_direction_ratio = float(
+            min(1.0, max(0.0, artifact_competing_opposite_direction_ratio))
+        )
+        self._background_array: Optional[np.ndarray] = None
         self._cache: Optional[list[tuple[torch.Tensor, dict[str, torch.Tensor]]]] = None
 
         self.cache_root: Optional[Path] = None
@@ -233,6 +282,28 @@ class OnlineSyntheticTrajectoryDataset(Dataset):
             "mask_sigma_ch": float(self.mask_sigma_ch),
             "mask_sigma_t": float(self.mask_sigma_t),
             "cache_dtype": str(self.cache_dtype),
+            "return_raw_window": bool(self.return_raw_window),
+            "background_npy": str(self.background_npy) if self.background_npy is not None else None,
+            "background_layout": str(self.background_layout),
+            "background_channel_start": int(self.background_channel_start),
+            "background_scale": float(self.background_scale),
+            "artifact_dropout_ratio": float(self.artifact_dropout_ratio),
+            "artifact_dropout_min_channels": int(self.artifact_dropout_min_channels),
+            "artifact_dropout_max_channels": int(self.artifact_dropout_max_channels),
+            "artifact_decoy_ratio": float(self.artifact_decoy_ratio),
+            "artifact_decoy_min_points": int(self.artifact_decoy_min_points),
+            "artifact_decoy_max_points": int(self.artifact_decoy_max_points),
+            "artifact_decoy_amp_scale_min": float(self.artifact_decoy_amp_scale_min),
+            "artifact_decoy_amp_scale_max": float(self.artifact_decoy_amp_scale_max),
+            "artifact_decoy_time_jitter_s": float(self.artifact_decoy_time_jitter_s),
+            "artifact_competing_ratio": float(self.artifact_competing_ratio),
+            "artifact_competing_time_jitter_s": float(self.artifact_competing_time_jitter_s),
+            "artifact_competing_amp_scale_min": float(self.artifact_competing_amp_scale_min),
+            "artifact_competing_amp_scale_max": float(self.artifact_competing_amp_scale_max),
+            "artifact_competing_speed_ratio_min": float(self.artifact_competing_speed_ratio_min),
+            "artifact_competing_speed_ratio_max": float(self.artifact_competing_speed_ratio_max),
+            "artifact_competing_channel_offset_max": int(self.artifact_competing_channel_offset_max),
+            "artifact_competing_opposite_direction_ratio": float(self.artifact_competing_opposite_direction_ratio),
         }
         text = json.dumps(payload, sort_keys=True, ensure_ascii=True)
         return hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
@@ -267,6 +338,28 @@ class OnlineSyntheticTrajectoryDataset(Dataset):
             "mask_sigma_ch": self.mask_sigma_ch,
             "mask_sigma_t": self.mask_sigma_t,
             "cache_dtype": self.cache_dtype,
+            "return_raw_window": self.return_raw_window,
+            "background_npy": str(self.background_npy) if self.background_npy is not None else None,
+            "background_layout": self.background_layout,
+            "background_channel_start": self.background_channel_start,
+            "background_scale": self.background_scale,
+            "artifact_dropout_ratio": self.artifact_dropout_ratio,
+            "artifact_dropout_min_channels": self.artifact_dropout_min_channels,
+            "artifact_dropout_max_channels": self.artifact_dropout_max_channels,
+            "artifact_decoy_ratio": self.artifact_decoy_ratio,
+            "artifact_decoy_min_points": self.artifact_decoy_min_points,
+            "artifact_decoy_max_points": self.artifact_decoy_max_points,
+            "artifact_decoy_amp_scale_min": self.artifact_decoy_amp_scale_min,
+            "artifact_decoy_amp_scale_max": self.artifact_decoy_amp_scale_max,
+            "artifact_decoy_time_jitter_s": self.artifact_decoy_time_jitter_s,
+            "artifact_competing_ratio": self.artifact_competing_ratio,
+            "artifact_competing_time_jitter_s": self.artifact_competing_time_jitter_s,
+            "artifact_competing_amp_scale_min": self.artifact_competing_amp_scale_min,
+            "artifact_competing_amp_scale_max": self.artifact_competing_amp_scale_max,
+            "artifact_competing_speed_ratio_min": self.artifact_competing_speed_ratio_min,
+            "artifact_competing_speed_ratio_max": self.artifact_competing_speed_ratio_max,
+            "artifact_competing_channel_offset_max": self.artifact_competing_channel_offset_max,
+            "artifact_competing_opposite_direction_ratio": self.artifact_competing_opposite_direction_ratio,
         }
 
     def _render_instance_mask(self, center_idx: torch.Tensor, visible: torch.Tensor) -> torch.Tensor:
@@ -281,6 +374,54 @@ class OnlineSyntheticTrajectoryDataset(Dataset):
             mask = torch.maximum(mask, gc * gt)
         return mask.clamp(0.0, 1.0)
 
+    def _background_array_view(self) -> Optional[np.ndarray]:
+        if self.background_npy is None:
+            return None
+        if self._background_array is None:
+            self._background_array = np.load(str(self.background_npy), mmap_mode="r")
+        return self._background_array
+
+    def _background_window(self, index: int, gen: torch.Generator) -> tuple[torch.Tensor, dict[str, float]]:
+        if self.background_npy is None:
+            return (
+                torch.normal(
+                    mean=0.0,
+                    std=self.noise_std,
+                    size=(self.n_channels, self.window_samples),
+                    generator=gen,
+                    dtype=torch.float32,
+                ),
+                {"source": 0.0},
+            )
+        arr = self._background_array_view()
+        if arr is None:
+            raise RuntimeError("background array unexpectedly unavailable")
+        if arr.ndim != 2:
+            raise ValueError(f"background_npy must be 2-D, got shape={arr.shape}")
+        layout = self.background_layout
+        if layout not in {"time_channel", "channel_time"}:
+            raise ValueError("background_layout must be time_channel or channel_time")
+        n_time = int(arr.shape[0] if layout == "time_channel" else arr.shape[1])
+        n_channels_all = int(arr.shape[1] if layout == "time_channel" else arr.shape[0])
+        start_ch = int(self.background_channel_start)
+        end_ch = int(start_ch + self.n_channels)
+        if start_ch < 0 or end_ch > n_channels_all:
+            raise ValueError(
+                f"background channel slice [{start_ch}, {end_ch}) outside source shape {arr.shape}"
+            )
+        max_start = int(n_time - self.window_samples)
+        if max_start < 0:
+            raise ValueError(f"background_npy is shorter than one window: n_time={n_time}, window={self.window_samples}")
+        start_t = int(torch.randint(0, max_start + 1, (1,), generator=gen).item()) if max_start > 0 else 0
+        if layout == "time_channel":
+            window = np.array(arr[start_t : start_t + self.window_samples, start_ch:end_ch], dtype=np.float32, copy=True).T
+        else:
+            window = np.array(arr[start_ch:end_ch, start_t : start_t + self.window_samples], dtype=np.float32, copy=True)
+        window = np.nan_to_num(window, copy=False)
+        if float(self.background_scale) != 1.0:
+            window *= float(self.background_scale)
+        return torch.from_numpy(window), {"source": 1.0, "start_t": float(start_t)}
+
     def _cache_x(self, x: torch.Tensor) -> torch.Tensor:
         if self.cache_dtype in {"float16", "fp16", "half"}:
             return x.to(torch.float16).contiguous()
@@ -292,7 +433,7 @@ class OnlineSyntheticTrajectoryDataset(Dataset):
         gen = torch.Generator(device="cpu")
         gen.manual_seed(self.seed + int(index) * 1000003)
 
-        data = torch.normal(mean=0.0, std=self.noise_std, size=(self.n_channels, self.window_samples), generator=gen, dtype=torch.float32)
+        data, background_meta = self._background_window(index, gen)
         n_veh = int(torch.randint(self.vehicles_min, self.vehicles_max + 1, (1,), generator=gen).item())
         time_rows: list[torch.Tensor] = []
         vis_rows: list[torch.Tensor] = []
@@ -300,8 +441,93 @@ class OnlineSyntheticTrajectoryDataset(Dataset):
         speed_rows: list[float] = []
         track_ids: list[int] = []
         mask_rows: list[torch.Tensor] = []
+        artifact_dropout_total = 0
+        artifact_decoy_total = 0
+        artifact_competing_total = 0
+        artifact_competing_direction = -1
 
         channel_index = torch.arange(self.n_channels, dtype=torch.float32)
+
+        def _draw_vehicle(
+            *,
+            direction_label: int,
+            speed_kmh: float,
+            sigma_s: float,
+            amp: float,
+            label_track: bool,
+            anchor_time: float | None = None,
+            anchor_ch: int | None = None,
+            amp_scale: float = 1.0,
+            time_jitter_s: float = 0.0,
+            allow_dropout: bool = True,
+        ) -> tuple[torch.Tensor, torch.Tensor, int, torch.Tensor, torch.Tensor] | None:
+            speed_mps = float(speed_kmh) / 3.6
+            if speed_mps <= 1e-6:
+                return None
+            is_primary = int(direction_label) == 0
+            dist_m = channel_index * self.dx_m if is_primary else (self.n_channels - 1 - channel_index) * self.dx_m
+            if anchor_ch is None:
+                local_anchor_ch = int(torch.randint(0, self.n_channels, (1,), generator=gen).item())
+            else:
+                local_anchor_ch = int(max(0, min(self.n_channels - 1, int(anchor_ch))))
+            if anchor_time is None:
+                local_anchor_time = float(torch.rand((), generator=gen).item() * self.window_seconds)
+            else:
+                local_anchor_time = float(anchor_time)
+            local_anchor_time = float(local_anchor_time)
+            if time_jitter_s > 0.0:
+                local_anchor_time += float(2.0 * torch.rand((), generator=gen).item() - 1.0) * float(time_jitter_s)
+            t_entry = local_anchor_time - float(dist_m[local_anchor_ch].item()) / speed_mps
+            t_center = t_entry + dist_m / speed_mps
+            visible = (t_center >= 0.0) & (t_center < self.window_seconds)
+            if int(visible.sum().item()) < self.min_visible_channels:
+                return None
+
+            if allow_dropout and self.artifact_dropout_ratio > 0.0 and int(visible.sum().item()) > self.min_visible_channels + 1:
+                if float(torch.rand((), generator=gen).item()) < self.artifact_dropout_ratio:
+                    vis_idx = torch.where(visible)[0]
+                    drop_cap = min(int(vis_idx.numel()) - self.min_visible_channels, int(self.artifact_dropout_max_channels))
+                    if drop_cap >= int(self.artifact_dropout_min_channels):
+                        dropout_count = int(
+                            torch.randint(
+                                int(self.artifact_dropout_min_channels),
+                                int(drop_cap) + 1,
+                                (1,),
+                                generator=gen,
+                            ).item()
+                        )
+                        start_offset = int(torch.randint(0, int(vis_idx.numel()) - dropout_count + 1, (1,), generator=gen).item())
+                        visible[vis_idx[start_offset : start_offset + dropout_count]] = False
+                        if int(visible.sum().item()) < self.min_visible_channels:
+                            return None
+                        nonlocal artifact_dropout_total
+                        artifact_dropout_total += int(dropout_count)
+
+            center_idx = torch.round(t_center * self.fs).to(torch.long).clamp(0, self.window_samples - 1)
+            half_width = int(max(1, round(4.0 * sigma_s * self.fs)))
+            for ch in torch.where(visible)[0].tolist():
+                center = int(center_idx[ch].item())
+                left = max(0, center - half_width)
+                right = min(self.window_samples - 1, center + half_width)
+                idx = torch.arange(left, right + 1, dtype=torch.float32)
+                dt = idx / self.fs - float(t_center[ch].item())
+                pulse = float(amp) * float(amp_scale) * torch.exp(-0.5 * (dt / sigma_s) ** 2)
+                data[int(ch), left : right + 1] += pulse
+
+            time_norm = torch.zeros((self.n_channels,), dtype=torch.float32)
+            vis_float = visible.to(torch.float32)
+            time_norm[visible] = (center_idx[visible].to(torch.float32) / float(max(1, self.window_samples - 1))).clamp(0, 1)
+            if not label_track:
+                return visible, center_idx, int(visible.sum().item()), time_norm, vis_float
+
+            time_rows.append(time_norm)
+            vis_rows.append(vis_float)
+            dir_rows.append(int(direction_label))
+            speed_rows.append(float(speed_kmh) / max(1e-6, self.speed_norm_kmh))
+            track_ids.append(track_id)
+            mask_rows.append(self._render_instance_mask(center_idx=center_idx, visible=visible))
+            return visible, center_idx, int(visible.sum().item()), time_norm, vis_float
+
         track_id = 0
         attempts = 0
         max_attempts = max(32, n_veh * 64)
@@ -320,37 +546,143 @@ class OnlineSyntheticTrajectoryDataset(Dataset):
             speed_mps = speed_kmh / 3.6
             sigma_s = float(self.sigma_min_s + torch.rand((), generator=gen).item() * (self.sigma_max_s - self.sigma_min_s))
             amp = float(self.amp_min + torch.rand((), generator=gen).item() * (self.amp_max - self.amp_min))
-
-            dist_m = channel_index * self.dx_m if is_primary else (self.n_channels - 1 - channel_index) * self.dx_m
             anchor_ch = int(torch.randint(0, self.n_channels, (1,), generator=gen).item())
             anchor_time = float(torch.rand((), generator=gen).item() * self.window_seconds)
-            t_entry = anchor_time - float(dist_m[anchor_ch].item()) / max(1e-6, speed_mps)
-            t_center = t_entry + dist_m / max(1e-6, speed_mps)
-            visible = (t_center >= 0.0) & (t_center < self.window_seconds)
-            if int(visible.sum().item()) < self.min_visible_channels:
+            rendered = _draw_vehicle(
+                direction_label=direction_label,
+                speed_kmh=speed_kmh,
+                sigma_s=sigma_s,
+                amp=amp,
+                label_track=True,
+                anchor_time=anchor_time,
+                anchor_ch=anchor_ch,
+                amp_scale=1.0,
+                allow_dropout=True,
+            )
+            if rendered is None:
                 continue
+            visible, center_idx, _, _, _ = rendered
 
-            center_idx = torch.round(t_center * self.fs).to(torch.long).clamp(0, self.window_samples - 1)
-            half_width = int(max(1, round(4.0 * sigma_s * self.fs)))
-            for ch in torch.where(visible)[0].tolist():
-                center = int(center_idx[ch].item())
-                left = max(0, center - half_width)
-                right = min(self.window_samples - 1, center + half_width)
-                idx = torch.arange(left, right + 1, dtype=torch.float32)
-                dt = idx / self.fs - float(t_center[ch].item())
-                pulse = amp * torch.exp(-0.5 * (dt / sigma_s) ** 2)
-                data[int(ch), left : right + 1] += pulse
-
-            time_norm = torch.zeros((self.n_channels,), dtype=torch.float32)
-            vis_float = visible.to(torch.float32)
-            time_norm[visible] = (center_idx[visible].to(torch.float32) / float(max(1, self.window_samples - 1))).clamp(0, 1)
-            time_rows.append(time_norm)
-            vis_rows.append(vis_float)
-            dir_rows.append(direction_label)
-            speed_rows.append(speed_kmh / max(1e-6, self.speed_norm_kmh))
-            track_ids.append(track_id)
-            mask_rows.append(self._render_instance_mask(center_idx=center_idx, visible=visible))
+            decoy_points = 0
+            if self.artifact_decoy_ratio > 0.0 and float(torch.rand((), generator=gen).item()) < self.artifact_decoy_ratio:
+                decoy_points = int(
+                    torch.randint(
+                        int(self.artifact_decoy_min_points),
+                        int(self.artifact_decoy_max_points) + 1,
+                        (1,),
+                        generator=gen,
+                    ).item()
+                )
+                decoy_amp_scale = float(
+                    self.artifact_decoy_amp_scale_min
+                    + torch.rand((), generator=gen).item() * (self.artifact_decoy_amp_scale_max - self.artifact_decoy_amp_scale_min)
+                )
+                decoy_anchor = int(torch.randint(0, self.n_channels, (1,), generator=gen).item())
+                decoy_direction = 1 if torch.rand((), generator=gen).item() < 0.5 else -1
+                decoy_base_time = float(torch.rand((), generator=gen).item() * self.window_seconds)
+                decoy_slope = float(
+                    (self.dx_m / max(1e-6, speed_mps))
+                    * (1.0 + 0.25 * (2.0 * torch.rand((), generator=gen).item() - 1.0))
+                )
+                for step in range(int(decoy_points)):
+                    ch = int(decoy_anchor + decoy_direction * step)
+                    if ch < 0 or ch >= self.n_channels:
+                        continue
+                    t_c = decoy_base_time + float(decoy_direction * step) * decoy_slope
+                    if self.artifact_decoy_time_jitter_s > 0.0:
+                        t_c += float(2.0 * torch.rand((), generator=gen).item() - 1.0) * float(self.artifact_decoy_time_jitter_s)
+                    if not (0.0 <= t_c < self.window_seconds):
+                        continue
+                    center = int(round(t_c * self.fs))
+                    half = int(max(1, round(3.0 * sigma_s * self.fs)))
+                    left = max(0, center - half)
+                    right = min(self.window_samples - 1, center + half)
+                    idx = torch.arange(left, right + 1, dtype=torch.float32)
+                    dt = idx / self.fs - float(t_c)
+                    pulse = (amp * decoy_amp_scale) * torch.exp(-0.5 * (dt / (sigma_s * 0.9)) ** 2)
+                    data[ch, left : right + 1] += pulse
+                artifact_decoy_total += int(decoy_points)
             track_id += 1
+
+        target_info: tuple[int, float, float, torch.Tensor, torch.Tensor] | None = None
+        if time_rows:
+            # Use the first labeled trajectory as the anchor for an unlabeled competitor.
+            target_speed_kmh = float(speed_rows[0]) * float(self.speed_norm_kmh)
+            target_direction = int(dir_rows[0])
+            target_anchor_ch = int(torch.argmax(vis_rows[0]).item())
+            target_anchor_time = float(time_rows[0][target_anchor_ch].item() * float(self.window_samples - 1) / float(self.fs))
+            target_info = (target_direction, target_speed_kmh, target_anchor_time, vis_rows[0], time_rows[0])
+
+        if target_info is not None and self.artifact_competing_ratio > 0.0:
+            if float(torch.rand((), generator=gen).item()) < self.artifact_competing_ratio:
+                target_direction, target_speed_kmh, target_anchor_time, _, _ = target_info
+                competitor_direction = target_direction
+                if float(torch.rand((), generator=gen).item()) < self.artifact_competing_opposite_direction_ratio:
+                    competitor_direction = 1 - int(target_direction)
+                comp_speed_kmh = max(
+                    1e-3,
+                    float(target_speed_kmh)
+                    * (
+                        float(self.artifact_competing_speed_ratio_min)
+                        + float(torch.rand((), generator=gen).item())
+                        * (float(self.artifact_competing_speed_ratio_max) - float(self.artifact_competing_speed_ratio_min))
+                    ),
+                )
+                comp_sigma_s = float(self.sigma_min_s + torch.rand((), generator=gen).item() * (self.sigma_max_s - self.sigma_min_s))
+                comp_amp = float(self.amp_min + torch.rand((), generator=gen).item() * (self.amp_max - self.amp_min))
+                comp_amp_scale = float(
+                    self.artifact_competing_amp_scale_min
+                    + torch.rand((), generator=gen).item() * (self.artifact_competing_amp_scale_max - self.artifact_competing_amp_scale_min)
+                )
+                comp_anchor_time = float(target_anchor_time)
+                if self.artifact_competing_time_jitter_s > 0.0:
+                    comp_anchor_time += float(2.0 * torch.rand((), generator=gen).item() - 1.0) * float(
+                        self.artifact_competing_time_jitter_s
+                    )
+                comp_anchor_ch = int(torch.argmax(vis_rows[0]).item())
+                if self.artifact_competing_channel_offset_max > 0:
+                    comp_anchor_ch = int(
+                        max(
+                            0,
+                            min(
+                                self.n_channels - 1,
+                                int(
+                                    comp_anchor_ch
+                                    + torch.randint(
+                                        -int(self.artifact_competing_channel_offset_max),
+                                        int(self.artifact_competing_channel_offset_max) + 1,
+                                        (1,),
+                                        generator=gen,
+                                    ).item()
+                                ),
+                            ),
+                        )
+                    )
+                comp_rendered = _draw_vehicle(
+                    direction_label=competitor_direction,
+                    speed_kmh=comp_speed_kmh,
+                    sigma_s=comp_sigma_s,
+                    amp=comp_amp,
+                    label_track=False,
+                    anchor_time=comp_anchor_time,
+                    anchor_ch=comp_anchor_ch,
+                    amp_scale=comp_amp_scale,
+                    time_jitter_s=0.0,
+                    allow_dropout=False,
+                )
+                if comp_rendered is not None:
+                    _, _, _, comp_time_norm, comp_vis_float = comp_rendered
+                    artifact_competing_direction = int(competitor_direction)
+                else:
+                    comp_time_norm = torch.zeros((self.n_channels,), dtype=torch.float32)
+                    comp_vis_float = torch.zeros((self.n_channels,), dtype=torch.float32)
+                artifact_competing_total += 1
+            else:
+                comp_time_norm = torch.zeros((self.n_channels,), dtype=torch.float32)
+                comp_vis_float = torch.zeros((self.n_channels,), dtype=torch.float32)
+        else:
+            comp_time_norm = torch.zeros((self.n_channels,), dtype=torch.float32)
+            comp_vis_float = torch.zeros((self.n_channels,), dtype=torch.float32)
 
         x = self._prepare_input(data)
         if cache_x:
@@ -373,6 +705,16 @@ class OnlineSyntheticTrajectoryDataset(Dataset):
                 "track_id": torch.zeros((0,), dtype=torch.long),
                 "gt_masks": torch.zeros((0, self.n_channels, self.ds_samples), dtype=torch.float32),
             }
+        if self.return_raw_window:
+            target["raw_window"] = data.to(torch.float32)
+        target["background_meta"] = torch.tensor([background_meta.get("source", 0.0), background_meta.get("start_t", 0.0)], dtype=torch.float32)
+        target["artifact_meta"] = torch.tensor(
+            [float(artifact_dropout_total), float(artifact_decoy_total), float(artifact_competing_total)],
+            dtype=torch.float32,
+        )
+        target["artifact_competing_time"] = comp_time_norm
+        target["artifact_competing_visibility"] = comp_vis_float
+        target["artifact_competing_direction"] = torch.tensor([float(artifact_competing_direction)], dtype=torch.float32)
         return x, target
 
     def _prepare_input(self, data: torch.Tensor) -> torch.Tensor:
