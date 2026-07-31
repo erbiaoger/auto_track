@@ -229,6 +229,21 @@ sh predict_peak_slot_dataset.sh
 The fusion pass keeps PeakSlotNet as the seed detector and only uses the
 classic graph search to add physically plausible points to existing tracks.
 
+For the new single-vehicle line, build a fixed benchmark with same-direction
+hard cases and compare target, competitor, and prediction directly:
+
+```sh
+uv run python -m autotrack.dl.build_single_vehicle_benchmark --out-file /tmp/sv_same_dir_hard.pt --samples 64 --background-npy datasets/03gauss_large.npy --background-layout time_channel --background-channel-start 0 --artifact-competing-ratio 1.0 --artifact-competing-opposite-direction-ratio 0.0
+uv run python -m autotrack.dl.plot_single_vehicle_benchmark_compare --benchmark-file /tmp/sv_same_dir_hard.pt --model /tmp/sv_competing_mixed_model/checkpoint_best.pt --sample-index 6 --out-file /tmp/sv_same_dir_hard_compare.png
+```
+
+For the clean synthetic upper-bound check, use the exact workflow instead of
+the robustness benchmark:
+
+```sh
+uv run python -m autotrack.dl.run_single_vehicle_exact --out-dir /tmp/sv_exact_run --samples 64 --epochs 8 --batch-size 1 --hidden-dim 32 --device cpu
+```
+
 When synthetic validation is strong but real-data prediction is poor, compare
 the two domains explicitly:
 

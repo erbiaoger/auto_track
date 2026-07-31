@@ -12,6 +12,14 @@ Design and algorithm notes for the project.
 - `track_slot_method_complete.md`: complete TrackSlotNet method note covering
   physical model, math formulation, network structure, training, inference, and
   visualization.
+- `compact_slot_model.md`: lightweight replacement mainline for the 50-channel
+  task, centered on a channel-first encoder and slot attention. Use the new
+  compact slot CLI entrypoints for this branch.
+- `single_vehicle_tracking.md`: new one-vehicle tracking direction with a
+  dense heatmap scorer, Hungarian gap bridging, and Kalman smoothing.
+- `compact_slot_model.md`: compact slot mainline for the 50-channel task.
+- `compact_slot_model.md` and `build_single_vehicle_benchmark_realistic.py`
+  together define the new narrow single-vehicle training path.
 - `realbg_profile_workflow.md`: profile-driven real-background generation,
   calibration, and PeakSlotNet data-production workflow.
 - `real_data_label_gui.md`: real-data auto-label + manual calibration GUI

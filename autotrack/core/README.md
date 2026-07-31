@@ -9,6 +9,8 @@ Core trajectory extraction and backend integration code.
   `query_masks`, and `track_slot`.
 - `track_fusion.py`: optional PeakSlotNet post-processing helper that uses
   graph search to extend detected track fragments and bridge small channel gaps.
+- `single_vehicle_tracker.py`: one-vehicle candidate decoder, Hungarian gap
+  matching, and Kalman smoothing for the redesigned single-track pipeline.
 - `auto_track_backend.py`: data loading, tiling, deduplication, stitching, CSV
   export, and GUI-facing orchestration. It accepts SAC folders and direct real
   DAS `.npy` imports for the GUI.

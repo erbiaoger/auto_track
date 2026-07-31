@@ -160,10 +160,10 @@ samples:
 ```
 
 The interaction time is sampled across the full window, not only the middle.
-The difficult cases include opposite-direction crossings, same-direction
-overtakes, near-parallel close tracks, and isolated Gaussian peaks that may be
-stronger than nearby vehicle peaks. Missing channel-time blocks are applied
-after Gaussian windows are drawn, so they can remove both vehicle points and
+The difficult cases include same-direction crossings with different speeds,
+near-parallel close tracks, and isolated Gaussian peaks that may be stronger
+than nearby vehicle peaks. Missing channel-time blocks are applied after
+Gaussian windows are drawn, so they can remove both vehicle points and
 isolated Gaussian interference, matching real Gaussian-window output dropouts.
 
 ## Data Flow
