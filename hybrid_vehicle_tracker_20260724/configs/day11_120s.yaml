@@ -1,0 +1,44 @@
+data:
+  raw_path: /csim2/zhangzhiyu/MyProjects/auto_track/datasets/peaks_20260723/converted_50ch/arrays/raw_DAY11.npy
+  pre_path: /csim2/zhangzhiyu/MyProjects/auto_track/datasets/peaks_20260723/converted_50ch/arrays/pre_DAY11.npy
+  gauss_path: /csim2/zhangzhiyu/MyProjects/auto_track/datasets/peaks_20260723/converted_50ch_station_fallback_q65_s8/gauss_station_fallback_DAY11.npy
+  mapping_path: /csim2/zhangzhiyu/MyProjects/auto_track/datasets/peaks_20260723/converted_50ch/arrays/raw_DAY11.mapping.json
+  sample_rate_hz: 1000.0
+  feature_rate_hz: 20.0
+  start_s: 0.0
+  duration_s: 120.0
+
+model:
+  base_channels: 12
+  embedding_dim: 32
+  hough_slopes: 17
+  hough_intercept_step_s: 0.5
+  motion_direction: -1
+  hough_top_k: 64
+  checkpoint: checkpoints/v6_peakset_long_exact/hybrid_final.pt
+
+association:
+  speed_min_kmh: 60.0
+  speed_max_kmh: 90.0
+  edge_time_tolerance_s: 0.3
+  seed_time_tolerance_s: 0.4
+  max_gap_m: 600.0
+  min_observations: 5
+  min_span_m: 500.0
+  max_median_residual_s: 0.3
+  beam_width: 24
+  paths_per_seed: 4
+  max_candidates: 1200
+  strong_gauss_threshold: 0.50
+  weak_pre_quantile: 0.997
+  candidate_min_distance_s: 1.25
+  min_track_score: 0.0
+  null_quantile: 0.995
+  min_dense_seed_score: 0.20
+  dense_support_threshold: 0.45
+  motion_direction: -1
+
+runtime:
+  device: cuda
+  seed: 20260724
+  output_dir: runs/day11_0_120_v6_modal_hough

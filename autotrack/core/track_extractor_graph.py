@@ -155,7 +155,7 @@ def _dt_bounds(direction: str, delta_x_m: float, vmin_mps: float, vmax_mps: floa
     raise ValueError("direction must be either forward or reverse")
 
 
-def _mean_speed_kmh(points: list[TrackPoint], dx_m: float) -> float:
+def _mean_speed_kmh(points: list[TrackPoint], dx_m: float, x_axis_m: Optional[np.ndarray] = None) -> float:
     if len(points) < 2:
         return float("nan")
     ts = np.array([p.time_s for p in points], dtype=np.float64)
@@ -165,7 +165,12 @@ def _mean_speed_kmh(points: list[TrackPoint], dx_m: float) -> float:
     valid = np.abs(dt) > 1e-9
     if not np.any(valid):
         return float("nan")
-    speed_mps = np.abs(dch[valid]) * dx_m / np.abs(dt[valid])
+    if x_axis_m is None:
+        distance_m = np.abs(dch[valid]) * dx_m
+    else:
+        indices = chs.astype(np.int64)
+        distance_m = np.abs(np.diff(np.asarray(x_axis_m, dtype=np.float64)[indices]))[valid]
+    speed_mps = distance_m / np.abs(dt[valid])
     return float(3.6 * np.mean(speed_mps))
 
 
@@ -181,6 +186,7 @@ def _extract_best_track(
     track_id: int,
     prior_time_hint: Optional[np.ndarray] = None,
     prior_channel_weight: float = 0.0,
+    x_axis_m: Optional[np.ndarray] = None,
 ) -> Optional[Track]:
     n_ch = len(nodes)
     k_best = int(max(1, config.k_best_per_node))
@@ -281,7 +287,10 @@ def _extract_best_track(
             prev_speed = dp_speed[pch]
             prev_tmin = dp_tmin[pch]
             prev_tmax = dp_tmax[pch]
-            delta_x = float(dch * dx_m)
+            if x_axis_m is None:
+                delta_x = float(dch * dx_m)
+            else:
+                delta_x = abs(float(x_axis_m[ch]) - float(x_axis_m[pch]))
             dt_low, dt_high = _dt_bounds(direction, delta_x, vmin_mps, vmax_mps)
             skip_penalty = float(config.lambda_skip * max(0, dch - 1))
 
@@ -411,13 +420,13 @@ def _extract_best_track(
                 ch_idx=pch,
                 t_idx=t_idx,
                 time_s=float(t_idx) / float(fs),
-                offset_m=float(pch) * float(dx_m),
+                offset_m=(float(x_axis_m[pch]) if x_axis_m is not None else float(pch) * float(dx_m)),
                 amp=amp,
                 score=score,
             )
         )
 
-    mean_speed = _mean_speed_kmh(points, dx_m)
+    mean_speed = _mean_speed_kmh(points, dx_m, x_axis_m=x_axis_m)
     total_score = float(dp_score[best[0]][best[1], best[2]])
     return Track(
         track_id=track_id,
@@ -452,6 +461,7 @@ def extract_all(
     vmin_kmh: float,
     vmax_kmh: float,
     config: Optional[ExtractorConfig | dict] = None,
+    x_axis_m: Optional[np.ndarray] = None,
 ) -> list[Track]:
     cfg = _as_config(config)
     arr = np.asarray(data, dtype=np.float32)
@@ -461,6 +471,13 @@ def extract_all(
         raise ValueError("fs must be > 0")
     if dx_m <= 0:
         raise ValueError("dx_m must be > 0")
+    axis = None
+    if x_axis_m is not None:
+        axis = np.asarray(x_axis_m, dtype=np.float64)
+        if axis.ndim != 1 or axis.shape[0] != arr.shape[0]:
+            raise ValueError("x_axis_m must have shape [n_channel]")
+        if not np.all(np.isfinite(axis)) or np.any(np.diff(axis) <= 0):
+            raise ValueError("x_axis_m must be finite and strictly increasing")
     if vmin_kmh <= 0 or vmax_kmh <= 0:
         raise ValueError("speed range must be > 0")
     if vmin_kmh > vmax_kmh:
@@ -493,6 +510,7 @@ def extract_all(
             n_samples=arr.shape[1],
             config=cfg,
             track_id=tid,
+            x_axis_m=axis,
         )
         if best is None:
             break

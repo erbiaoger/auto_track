@@ -148,6 +148,7 @@ def extract_all_gpu(
     vmin_kmh: float,
     vmax_kmh: float,
     config: Optional[ExtractorConfig | dict] = None,
+    x_axis_m: Optional[np.ndarray] = None,
 ) -> list[Track]:
     cfg = _as_config(config)
     arr = np.asarray(data, dtype=np.float32)
@@ -157,6 +158,13 @@ def extract_all_gpu(
         raise ValueError("fs must be > 0")
     if dx_m <= 0:
         raise ValueError("dx_m must be > 0")
+    axis = None
+    if x_axis_m is not None:
+        axis = np.asarray(x_axis_m, dtype=np.float64)
+        if axis.ndim != 1 or axis.shape[0] != arr.shape[0]:
+            raise ValueError("x_axis_m must have shape [n_channel]")
+        if not np.all(np.isfinite(axis)) or np.any(np.diff(axis) <= 0):
+            raise ValueError("x_axis_m must be finite and strictly increasing")
     if vmin_kmh <= 0 or vmax_kmh <= 0:
         raise ValueError("speed range must be > 0")
     if vmin_kmh > vmax_kmh:
@@ -181,6 +189,7 @@ def extract_all_gpu(
             n_samples=arr.shape[1],
             config=cfg,
             track_id=tid,
+            x_axis_m=axis,
         )
         if best is None:
             break

@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hybrid-vehicle-tracker"
+version = "0.1.0"
+description = "Physics-guided deep vehicle trajectory association for DAS station arrays"
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+license = { text = "Proprietary" }
+authors = [{ name = "auto_track contributors" }]
+dependencies = [
+  "fastapi>=0.115",
+  "matplotlib>=3.7",
+  "numpy>=1.24",
+  "PyYAML>=5.4",
+  "scipy>=1.11",
+  "torch==2.13.0+cu126",
+  "uvicorn[standard]>=0.34",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+hvt-train = "hybrid_vehicle_tracker.cli.train:main"
+hvt-predict = "hybrid_vehicle_tracker.cli.predict:main"
+hvt-evaluate = "hybrid_vehicle_tracker.cli.evaluate:main"
+hvt-report = "hybrid_vehicle_tracker.cli.report:main"
+hvt-web = "hybrid_vehicle_tracker.web.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hybrid_vehicle_tracker"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
