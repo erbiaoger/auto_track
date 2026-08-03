@@ -1,0 +1,6 @@
+method: hybrid
+entries:
+  - id: historical_bak_and_runs
+    status: legacy
+    path: bak/
+    notes: Historical snapshots remain in place and are not deleted or copied.

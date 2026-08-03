@@ -1,0 +1,17 @@
+method: peak_slot
+entries:
+  - id: peak_slot_predictions
+    status: legacy
+    role: inference_results
+    path: predicts
+    format: csv_and_png
+  - id: peak_slot_model_runs
+    status: active
+    role: training_results
+    path: models/peak_slot_v4_120s_noisy_badch_cuda
+    format: checkpoints_logs_plots
+  - id: web_sessions
+    status: active
+    role: web_exports
+    path: methods/peak_slot/results/web_sessions
+    format: jsonl_csv_manifest

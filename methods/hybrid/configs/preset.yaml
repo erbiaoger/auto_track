@@ -1,0 +1,11 @@
+id: hybrid_v9_morphology_16384
+label: Hybrid ResUNet + Hough + GNN/MILP
+config: hybrid_vehicle_tracker_20260724/configs/day11_120s_v9.yaml
+checkpoint: hybrid_vehicle_tracker_20260724/checkpoints/v9_synthetic_morphology_16384/hybrid_final.pt
+input: raw_pre_gauss
+window_s: 120
+stride_s: 60
+fs_hz: 1000
+direction: reverse
+speed_min_kmh: 60
+speed_max_kmh: 90

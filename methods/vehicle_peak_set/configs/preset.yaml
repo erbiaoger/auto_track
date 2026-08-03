@@ -1,0 +1,11 @@
+id: peakguided_crossing_curriculum_recall
+label: Vehicle Peak-Set Transformer
+checkpoint: repro_vehicle_pipeline_20260629/results/vehicle_peakset_run/peakguided_train_realshape_crossing_curriculum/checkpoint_best.pt
+input: gauss
+window_s: 120
+stride_s: 60
+fs_hz: 1000
+direction: reverse
+speed_min_kmh: 60
+speed_max_kmh: 90
+quality_profile: recall

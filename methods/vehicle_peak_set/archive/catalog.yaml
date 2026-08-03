@@ -1,0 +1,11 @@
+method: vehicle_peak_set
+entries:
+  - id: proposal_trace_pipeline
+    status: legacy
+    path: repro_vehicle_pipeline_20260629/src/autotrack/dl/vehicle_proposal_net.py
+  - id: proposal_trace_checkpoint_bundle
+    status: broken
+    path: repro_vehicle_pipeline_20260629/models
+  - id: legacy_benchmark_link
+    status: broken
+    path: /tmp/multi_vehicle_set_rich_bench.pt

@@ -1,0 +1,13 @@
+method: peak_slot
+entries:
+  - id: track_slot_predecessor
+    status: legacy
+    path: datasets/track_slot_v*
+    notes: TrackSlot data-generation and conversion history used by PeakSlot.
+  - id: lineonly_experiments
+    status: legacy
+    path: models/peak_slot_v5_*
+  - id: external_waveform_prior
+    status: external
+    path: /csim2/zhangzhiyu/MyProjects/waveform_line_task
+    notes: Required by the v5 line-only experiment; not exposed in the web selector.

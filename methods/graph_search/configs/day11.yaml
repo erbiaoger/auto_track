@@ -1,0 +1,15 @@
+id: graph_search_day11
+label: Classic Graph Search
+engine: gpu
+entrypoint: autotrack.cli.auto_track_gpu:extract_all_gpu
+input: gauss
+window_s: 120
+stride_s: 60
+fs_hz: 1000
+direction: reverse
+speed_min_kmh: 60
+speed_max_kmh: 90
+prominence: 0.4
+min_peak_distance_samples: 500
+min_track_channels: 12
+edge_min_track_channels: 4

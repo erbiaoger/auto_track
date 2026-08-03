@@ -1,0 +1,13 @@
+method: peak_slot
+entries:
+  - id: peak_slot_v4_noisy_badch
+    status: active
+    path: models/peak_slot_v4_120s_noisy_badch_cuda/checkpoint_best.pt
+    epoch: 295
+    model_family: peak_slot
+    input_channels: 1
+    window_s: 120
+  - id: peak_slot_v5_lineonly
+    status: legacy
+    path: models/peak_slot_v5_120s_lineonly_cuda/checkpoint_best.pt
+    notes: Requires an external waveform-line prior; not used by the web preset.

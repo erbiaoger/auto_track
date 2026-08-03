@@ -1,0 +1,7 @@
+method: vehicle_peak_set
+entries:
+  - id: vehicle_peakset_run
+    status: active
+    role: training_and_inference_results
+    path: repro_vehicle_pipeline_20260629/results/vehicle_peakset_run
+    format: checkpoints_jsonl_png
