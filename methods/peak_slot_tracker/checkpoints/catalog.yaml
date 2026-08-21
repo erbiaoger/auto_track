@@ -1,0 +1,10 @@
+method: peak_slot
+status: active
+entries:
+  - id: peak_slot_v4_noisy_badch
+    status: active
+    role: web_default
+    path: active/peak_slot_v4_120s_noisy_badch_cuda/checkpoint_best.pt
+    format: torch
+    device: cuda
+    epoch: 295

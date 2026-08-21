@@ -1,0 +1,8 @@
+method: graph_search
+status: active
+entries:
+  - id: none
+    status: external
+    role: algorithm
+    path: null
+    notes: GPU graph search has no learned checkpoint.

@@ -1,5 +1,0 @@
-method: graph_search
-entries:
-  - id: graph_search_history
-    status: legacy
-    path: bak/20260629_trajectory_energy_hough*

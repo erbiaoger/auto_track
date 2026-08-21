@@ -1,9 +1,9 @@
-# Vehicle recognition methods
+# Algorithm projects
 
-This directory is the method catalog for the AutoTrack project.  The large
-arrays and historical experiment folders remain in their existing locations;
-each method's `data/`, `checkpoints/`, and `results/` catalogs describe those
-artifacts without copying them.
+This directory is the single canonical home for all fifteen algorithm
+projects. Each child is independently installable and owns its code, scripts,
+assets, checkpoints, tests and results. Shared mapping, protocol and array
+utilities stay outside this directory in `common/`.
 
-The web application exposes only the four active entries registered in
-`web/backend/methods.yaml`.
+Short historical aliases are kept under `compatibility/methods/` so this
+directory remains an uncluttered list of canonical project names.

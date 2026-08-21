@@ -31,3 +31,42 @@ preview.png
 preview_abs.png
 prediction_plots/
 eval*.json
+
+# Workspace migration outputs and shared local assets
+.vscode/
+runs/
+shared_data/
+vehicle_replay_web/**/node_modules/
+vehicle_replay_web/**/dist/
+vehicle_replay_web/**/build/
+vehicle_replay_web/**/.tsbuild/
+
+# Per-method generated assets; keep their small catalog manifests
+methods/*/data/*
+!methods/*/data/catalog.yaml
+methods/*/checkpoints/*
+!methods/*/checkpoints/catalog.yaml
+methods/*/results/*
+!methods/*/results/catalog.yaml
+methods/*/archive/*
+!methods/*/archive/catalog.yaml
+methods/*/runs/
+methods/*/runs
+methods/*/.venv/
+methods/*/.venv
+
+# Historical archives retain source manifests, not environments or generated runs
+archive/legacy_envs/
+archive/**/.venv/
+archive/**/.venv
+archive/**/.pytest_cache/
+archive/**/__pycache__/
+archive/legacy_projects/**/bak/
+archive/legacy_projects/**/data/
+archive/legacy_projects/**/models/
+archive/legacy_projects/**/results/
+archive/legacy_projects/**/true_dataset/
+archive/legacy_root/logs/
+archive/legacy_root/plots/
+archive/legacy_root/results/
+archive/migration_manifests/legacy_*/

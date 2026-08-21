@@ -1,8 +1,0 @@
-method: hybrid
-entries:
-  - id: hybrid_v9_morphology_16384
-    status: active
-    path: hybrid_vehicle_tracker_20260724/checkpoints/v9_synthetic_morphology_16384/hybrid_final.pt
-    model_type: HybridPerceptionModel
-    input_channels: 3
-    window_s: 120

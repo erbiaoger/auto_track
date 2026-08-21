@@ -1,0 +1,13 @@
+method: vehicle_peak_set
+status: active
+entries:
+  - id: web_sessions
+    status: active
+    role: web_export
+    path: web_sessions
+    format: jsonl_csv_manifest
+  - id: vehicle_peakset_run
+    status: active
+    role: training
+    path: training/vehicle_peakset_run
+    format: mixed

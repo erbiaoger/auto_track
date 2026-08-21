@@ -1,0 +1,8 @@
+method: hungarian_assignment
+status: active
+entries:
+  - id: web_sessions
+    status: active
+    role: web_export
+    path: web_sessions
+    format: jsonl_csv_manifest

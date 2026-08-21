@@ -1,0 +1,11 @@
+{
+  "recorded": "2026-08-04",
+  "window": {"start_s": 0, "duration_s": 120, "sample_rate_hz": 1000, "station_count": 50},
+  "methods": {
+    "hybrid": {"track_count": 29, "direction": "increasing_time_with_decreasing_position", "device": "cuda"},
+    "peak_slot": {"track_count": 15, "candidate_source": "raw", "device": "cuda"},
+    "vehicle_peak_set": {"track_count": 0, "decoded_tracks": 7, "device": "cuda"},
+    "graph_search": {"track_count": 74, "direction": "reverse", "engine": "cupy_gpu"}
+  },
+  "note": "DAY11 has no manual vehicle truth; counts are regression fingerprints, not accuracy metrics."
+}

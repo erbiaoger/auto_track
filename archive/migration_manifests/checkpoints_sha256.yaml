@@ -1,0 +1,17 @@
+version: 1
+recorded: 2026-08-04
+environment: .venv
+entries:
+  - method: hybrid
+    path: hybrid_vehicle_tracker/checkpoints/active/v9_synthetic_morphology_16384/hybrid_final.pt
+    sha256: 918e10283ddcd2377f6b933ae53838921f3cc86542551d3f20d6b726fea71c88
+  - method: peak_slot
+    path: peak_slot_tracker/checkpoints/active/peak_slot_v4_120s_noisy_badch_cuda/checkpoint_best.pt
+    sha256: 9ffaf605a4b79cd607d7d59378b949a43cfb16f0b45d1080c65011549fa29578
+  - method: vehicle_peak_set
+    path: vehicle_peak_set_tracker/results/training/vehicle_peakset_run/peakguided_train_realshape_crossing_curriculum/checkpoint_best.pt
+    sha256: 5f17e24b4744d35260d37c3964487d751a652b0233dfe5c3e21ba20d7738dcdd
+  - method: graph_search
+    path: null
+    sha256: null
+    notes: Original GPU graph implementation; no checkpoint.

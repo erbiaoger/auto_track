@@ -1,0 +1,13 @@
+method: peak_slot
+status: active
+entries:
+  - id: web_sessions
+    status: active
+    role: web_export
+    path: web_sessions
+    format: jsonl_csv_manifest
+  - id: predictions
+    status: legacy
+    role: inference
+    path: prediction
+    format: mixed

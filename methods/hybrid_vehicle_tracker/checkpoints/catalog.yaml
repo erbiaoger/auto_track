@@ -1,0 +1,10 @@
+method: hybrid
+status: active
+entries:
+  - id: v9_synthetic_morphology_16384
+    status: active
+    role: web_default
+    path: active/v9_synthetic_morphology_16384/hybrid_final.pt
+    format: torch
+    device: cuda
+    notes: ResUNet + Hough + GNN/MILP checkpoint.

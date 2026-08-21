@@ -1,0 +1,12 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vehicle-replay-web"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = ["fastapi>=0.115", "PyYAML>=6.0", "uvicorn[standard]>=0.34"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["backend/vehicle_replay_web"]

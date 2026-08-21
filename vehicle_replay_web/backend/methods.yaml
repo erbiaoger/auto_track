@@ -1,0 +1,132 @@
+version: 1
+default_method: hybrid
+worker_protocol: method-worker/v1
+stitching:
+  duplicate_time_gate_s: 0.75
+  duplicate_line_gate_s: 0.75
+  duplicate_speed_gate_kmh: 8.0
+  match_overlap_gate_s: 1.5
+  match_disjoint_gate_s: 3.0
+  match_speed_gate_kmh: 12.0
+  max_extrapolation_gap_m: 800.0
+  max_missing_windows: 2
+  # Keep the reconnect horizon comparable when stride changes (2 s vs 5 s).
+  reconnect_horizon_s: 10.0
+  # Used only for offline fragments with no overlapping source window.
+  final_disjoint_gate_s: 1.5
+  confirmation_batches: 3
+  confirmation_hits: 2
+  merge_evidence_batches: 3
+  measurement_std_s: 0.25
+  process_time_std_s_per_100m: 0.15
+  process_slowness_std_s_per_100m: 0.001
+  max_station_samples: 64
+methods:
+  - id: hybrid
+    label: Hybrid：ResUNet + Hough + GNN/MILP
+    kind: deep_learning
+    preset_id: hybrid_v9_morphology_16384
+    interpreter: .venv/bin/python
+    workdir: .
+    pythonpath:
+      - common/src
+      - methods/hybrid_vehicle_tracker/src
+      - vehicle_replay_web/backend
+      - .
+    worker_module: hybrid_vehicle_tracker.worker
+    config: methods/hybrid_vehicle_tracker/configs/day11_120s_v9.yaml
+    checkpoint: methods/hybrid_vehicle_tracker/checkpoints/active/v9_synthetic_morphology_16384/hybrid_final.pt
+    input: raw_pre_gauss
+    output_root: methods/hybrid_vehicle_tracker/results/web_sessions
+    project: methods/hybrid_vehicle_tracker
+  - id: peak_slot
+    label: PeakSlotNet
+    kind: deep_learning
+    preset_id: peak_slot_v4_noisy_badch
+    interpreter: .venv/bin/python
+    workdir: .
+    pythonpath:
+      - common/src
+      - methods/peak_slot_tracker/src
+      - methods/trajectory_query_tracker/src
+      - vehicle_replay_web/backend
+      - .
+    worker_module: peak_slot_tracker.worker
+    checkpoint: methods/peak_slot_tracker/checkpoints/active/peak_slot_v4_120s_noisy_badch_cuda/checkpoint_best.pt
+    input: gauss
+    output_root: methods/peak_slot_tracker/results/web_sessions
+    project: methods/peak_slot_tracker
+  - id: vehicle_peak_set
+    label: Vehicle Peak-Set Transformer
+    kind: deep_learning
+    preset_id: peakguided_crossing_curriculum_recall
+    interpreter: .venv/bin/python
+    workdir: .
+    pythonpath:
+      - common/src
+      - methods/vehicle_peak_set_tracker/src
+      - vehicle_replay_web/backend
+      - .
+    worker_module: vehicle_peak_set_tracker.worker
+    checkpoint: methods/vehicle_peak_set_tracker/results/training/vehicle_peakset_run/peakguided_train_realshape_crossing_curriculum/checkpoint_best.pt
+    input: gauss
+    output_root: methods/vehicle_peak_set_tracker/results/web_sessions
+    project: methods/vehicle_peak_set_tracker
+  - id: graph_search
+    label: 传统物理：图搜索
+    description: GPU 图搜索与速度约束轨迹提取。
+    kind: classic_physics
+    preset_id: graph_search_day11
+    engine: cupy_gpu
+    device: cuda
+    entrypoint: graph_search_tracker.auto_track_gpu:extract_all_gpu
+    direction: reverse
+    interpreter: .venv/bin/python
+    workdir: .
+    pythonpath:
+      - common/src
+      - methods/graph_search_tracker/src
+      - vehicle_replay_web/backend
+      - .
+    worker_module: graph_search_tracker.worker
+    input: gauss
+    output_root: methods/graph_search_tracker/results/web_sessions
+    project: methods/graph_search_tracker
+  - id: hungarian_assignment
+    label: 传统物理：匈牙利逐站匹配
+    description: Per-station peak association with global one-to-one assignment.
+    kind: classic_physics
+    engine: scipy_cpu
+    device: cpu
+    preset_id: hungarian_day11
+    interpreter: .venv/bin/python
+    workdir: .
+    pythonpath:
+      - common/src
+      - methods/hungarian_assignment_tracker/src
+      - vehicle_replay_web/backend
+      - .
+    worker_module: hungarian_assignment_tracker.worker
+    config: methods/hungarian_assignment_tracker/configs/day11.yaml
+    input: gauss
+    output_root: methods/hungarian_assignment_tracker/results/web_sessions
+    project: methods/hungarian_assignment_tracker
+  - id: kalman_seed
+    label: 传统物理：卡尔曼滤波
+    description: Physical-unit Kalman filtering with gated greedy association.
+    kind: classic_physics
+    engine: numpy_cpu
+    device: cpu
+    preset_id: kalman_day11
+    interpreter: .venv/bin/python
+    workdir: .
+    pythonpath:
+      - common/src
+      - methods/kalman_seed_tracker/src
+      - vehicle_replay_web/backend
+      - .
+    worker_module: kalman_seed_tracker.worker
+    config: methods/kalman_seed_tracker/configs/day11.yaml
+    input: gauss
+    output_root: methods/kalman_seed_tracker/results/web_sessions
+    project: methods/kalman_seed_tracker

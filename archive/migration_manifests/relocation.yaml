@@ -1,0 +1,63 @@
+version: 1
+created: 2026-08-04
+policy: atomic_same_filesystem_move_with_compatibility_symlink
+entries:
+  - old: hybrid_vehicle_tracker_20260724/src/hybrid_vehicle_tracker
+    new: methods/hybrid_vehicle_tracker/src/hybrid_vehicle_tracker
+    owner: hybrid_vehicle_tracker
+    status: moved
+  - old: hybrid_vehicle_tracker_20260724/checkpoints/v9_synthetic_morphology_16384
+    new: methods/hybrid_vehicle_tracker/checkpoints/active/v9_synthetic_morphology_16384
+    owner: hybrid_vehicle_tracker
+    status: moved
+  - old: datasets/peaks_20260723/converted_50ch/arrays/raw_DAY11.npy
+    new: shared_data/day11/source/raw_DAY11.npy
+    owner: shared_data
+    status: moved_with_symlink
+  - old: datasets/peaks_20260723/converted_50ch/arrays/pre_DAY11.npy
+    new: shared_data/day11/source/pre_DAY11.npy
+    owner: shared_data
+    status: moved_with_symlink
+  - old: datasets/peaks_20260723/converted_50ch/arrays/gauss_DAY11.npy
+    new: shared_data/day11/source/gauss_DAY11.npy
+    owner: shared_data
+    status: moved_with_symlink
+  - old: datasets/peak_slot*
+    new: methods/peak_slot_tracker/data/active
+    owner: peak_slot_tracker
+    status: moved_with_symlink
+  - old: models/peak_slot*
+    new: methods/peak_slot_tracker/checkpoints/active
+    owner: peak_slot_tracker
+    status: moved_with_symlink
+  - old: datasets/track_slot*
+    new: methods/track_slot_tracker/data/active
+    owner: track_slot_tracker
+    status: moved_with_symlink
+  - old: datasets/<legacy_namespace>
+    new: shared_data/legacy_datasets/<legacy_namespace>
+    owner: shared_data
+    status: moved_with_compatibility_symlink
+  - old: models/* and predicts/*
+    new: compatibility/legacy_paths/{models,predicts}
+    owner: compatibility
+    status: moved_with_rewritten_symlinks
+  - old: repro_vehicle_pipeline_20260629/results/vehicle_peakset_run
+    new: methods/vehicle_peak_set_tracker/results/training/vehicle_peakset_run
+    owner: vehicle_peak_set_tracker
+    status: moved_with_symlink
+  - old: results/vehprop_*
+    new: methods/vehicle_proposal_trace_pipeline/results/training
+    owner: vehicle_proposal_trace_pipeline
+    status: moved
+  - old: web
+    new: vehicle_replay_web
+    owner: vehicle_replay_web
+    status: compatibility_symlink
+  - old: methods/*
+    new: <method_project>
+    owner: compatibility
+    status: compatibility_symlink
+notes:
+  - Historical logs, backups and manifests remain byte-for-byte unchanged.
+  - No large data, checkpoint or result directory was copied during relocation.

@@ -1,0 +1,15 @@
+version: 1
+created: 2026-08-04
+canonical_roots:
+  hybrid: methods/hybrid_vehicle_tracker/scripts
+  peak_slot: methods/peak_slot_tracker/scripts
+  track_slot: methods/track_slot_tracker/scripts
+  vehicle_peak_set: methods/vehicle_peak_set_tracker/scripts
+  web: vehicle_replay_web/scripts
+  workspace: tools
+compatibility:
+  root_shells: relative_symlinks
+  historical_bak_shells: preserved_in_archive
+notes:
+  - Historical snapshot scripts under bak/ and archive/ were not rewritten.
+  - Moved scripts now resolve the workspace root before using workspace-relative data paths.

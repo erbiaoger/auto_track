@@ -1,0 +1,13 @@
+method: hybrid
+status: active
+entries:
+  - id: web_sessions
+    status: active
+    role: web_export
+    path: web_sessions
+    format: jsonl_csv_manifest
+  - id: legacy_runs
+    status: legacy
+    role: training
+    path: training/legacy_runs
+    format: mixed

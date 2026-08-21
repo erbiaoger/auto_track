@@ -1,0 +1,10 @@
+method: vehicle_peak_set
+status: active
+entries:
+  - id: peakguided_crossing_curriculum_recall
+    status: active
+    role: web_default
+    path: ../results/training/vehicle_peakset_run/peakguided_train_realshape_crossing_curriculum/checkpoint_best.pt
+    format: torch
+    device: cuda
+    epoch: 236

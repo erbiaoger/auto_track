@@ -1,7 +1,0 @@
-method: graph_search
-entries:
-  - id: classic_predictions
-    status: active
-    role: future_web_exports
-    path: methods/graph_search/results/web_sessions
-    format: jsonl_csv

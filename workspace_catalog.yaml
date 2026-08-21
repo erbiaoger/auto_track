@@ -1,0 +1,28 @@
+version: 1
+workspace: auto_track
+single_environment: .venv
+web_methods:
+  - hybrid
+  - peak_slot
+  - vehicle_peak_set
+  - graph_search
+  - hungarian_assignment
+  - kalman_seed
+method_projects:
+  - methods/hybrid_vehicle_tracker
+  - methods/peak_slot_tracker
+  - methods/vehicle_peak_set_tracker
+  - methods/graph_search_tracker
+  - methods/track_slot_tracker
+  - methods/compact_slot_tracker
+  - methods/trajectory_query_tracker
+  - methods/query_mask_tracker
+  - methods/trajectory_energy_tracker
+  - methods/single_vehicle_trace_tracker
+  - methods/single_vehicle_focus_tracker
+  - methods/vehicle_proposal_trace_pipeline
+  - methods/vehicle_set_tracker
+  - methods/kalman_seed_tracker
+  - methods/hungarian_assignment_tracker
+shared_data_root: shared_data
+compatibility_root: compatibility
