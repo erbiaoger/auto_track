@@ -70,3 +70,9 @@ archive/legacy_root/logs/
 archive/legacy_root/plots/
 archive/legacy_root/results/
 archive/migration_manifests/legacy_*/
+
+# Python source packages may contain a module directory named data/
+!methods/*/src/**/data/
+!methods/*/src/**/data/**
+methods/*/src/**/data/**/__pycache__/
+methods/*/src/**/data/**/*.pyc
